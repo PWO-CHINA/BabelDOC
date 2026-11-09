@@ -582,7 +582,8 @@ fn merge_formulas(page: &Page, v: &mut View<'_>) -> Result<(), StageError> {
                     }
                     let ai = layout_cache[i].as_ref().unwrap();
                     let bi = layout_cache[j].as_ref().unwrap();
-                    if a.line_id(v)? == b.line_id(v)?
+                    if j == i + 1
+                        && a.line_id(v)? == b.line_id(v)?
                         && ((j == i + 1
                             && ((is_x_axis_contained(&aa, &bb)? && has_y_intersection(&aa, &bb)?)
                                 || (is_x_axis_adjacent(&aa, &bb, 2.)?
