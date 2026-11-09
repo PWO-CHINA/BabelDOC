@@ -355,7 +355,8 @@ fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
                 let b = character(next, v)?;
                 let bb = a.r#box.as_deref().unwrap();
                 let d = need(b.r#box.as_deref().unwrap().x, "x")? - need(bb.x2, "x2")?;
-                if d >= med || Layout::is_newline(Some(&a), &b) {
+                let newline = Layout::is_newline(Some(&a), &b);
+                if d >= med || newline {
                     let x = need(bb.x2, "x2")?;
                     dummy_indices.push(out.len());
                     out.push(dummy(
@@ -363,7 +364,7 @@ fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
                         B {
                             x: Some(x),
                             y: bb.y,
-                            x2: Some(x + d.abs().min(med)),
+                            x2: Some(if newline { x } else { x + d.min(med) }),
                             y2: bb.y2,
                         },
                         v,
@@ -993,3 +994,7 @@ fn fix_overlap(paras: &[P], page: &Page, v: &mut View<'_>) -> Result<(), StageEr
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/paragraph_spacing_cases.rs"]
+mod paragraph_spacing_cases;
