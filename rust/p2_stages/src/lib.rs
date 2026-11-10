@@ -2,6 +2,7 @@ pub use babeldoc_il_types as il_types;
 pub use babeldoc_il_types::schema::*;
 
 pub mod font_mapper;
+pub mod layout_audit;
 pub mod runtime;
 pub mod shared;
 pub mod stages;

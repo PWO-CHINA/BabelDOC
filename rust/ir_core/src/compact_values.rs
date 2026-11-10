@@ -56,7 +56,7 @@ impl Serialize for PathOp {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DataPdfPath {
     coordinates: [u64; 2],
     pub op: Option<PathOp>,

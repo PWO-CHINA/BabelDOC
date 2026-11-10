@@ -118,6 +118,7 @@ dependencies = [
  "rayon",
  "regex",
  "rtree_compat",
+ "serde",
  "serde_json",
  "tiktoken-rs",
 ]

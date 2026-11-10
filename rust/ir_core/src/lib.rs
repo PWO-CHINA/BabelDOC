@@ -73,6 +73,7 @@ fn next_generation() -> u64 {
     GENERATIONS.fetch_add(1, Ordering::Relaxed)
 }
 static IDENTITIES: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone)]
 pub struct Node {
     pub identity: u64,
     pub data: NodeData,
@@ -98,6 +99,7 @@ impl Edge {
     }
 }
 /// Payloads occupy only their schema type's size, in a page or shared table.
+#[derive(Clone)]
 struct StoredNode<D> {
     identity: u64,
     data: D,
@@ -123,7 +125,7 @@ struct Location {
 /// The directory keeps edges one word wide; it never contains schema payloads.
 /// Scope zero holds shared objects and newly attached values until the next
 /// stage boundary. Scope n + 1 holds objects reachable from only page n.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Table {
     nodes: Vec<Location>,
     shared: TypedTables,
@@ -398,6 +400,15 @@ pub struct Document {
     pub history: History,
 }
 impl Document {
+    pub fn fork(&self) -> Self {
+        Self {
+            generation: next_generation(),
+            root: self.root.clone(),
+            table: self.table.clone(),
+            history: self.history.clone(),
+        }
+    }
+
     #[cfg(feature = "memory-profile")]
     pub fn memory_profile(&self) -> serde_json::Value {
         self.table.memory_profile(None)
@@ -656,12 +667,13 @@ impl<P: Permission> TreeView<'_, P> {
         Ok(Cursor::new(ROOT, self.document_ref().generation))
     }
 }
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum HistoryArg {
     Text(String),
     CtmAware { value: String, ctm: PythonValue },
 }
+#[derive(Clone)]
 pub struct HistoryNode {
     pub parent: Option<usize>,
     pub op: String,
@@ -670,7 +682,7 @@ pub struct HistoryNode {
     pub version: u64,
     pub length: u64,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct History {
     nodes: Vec<HistoryNode>,
     base: usize,
