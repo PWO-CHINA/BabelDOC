@@ -104,7 +104,7 @@ class Monitor:
             self.on_end()
 
 
-def make_direct_document():
+def make_direct_document(split_following=True):
     pages = []
     for index in range(2):
         base_style = il.PdfStyle(font_id="regular", font_size=10.0)
@@ -122,10 +122,17 @@ def make_direct_document():
                 font_id="regular", font_size=10.0,
                 graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"),
             )
+            continued, separator, following = text.partition(". ") if split_following else (text, "", "")
+            continued = continued + ("." if separator else "")
             compositions = [il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
                 pdf_style=rich_style,
-                pdf_character=[il.PdfCharacter(pdf_style=rich_style, char_unicode=text)],
-            )), formula]
+                pdf_character=[il.PdfCharacter(pdf_style=rich_style, char_unicode=continued)],
+            ))]
+            if separator:
+                compositions.append(il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
+                    pdf_style=base_style, char_unicode=" " + following,
+                )))
+            compositions.append(formula)
         paragraph = il.PdfParagraph(
             box=il.Box(x=60, y=100 if index == 0 else 650, x2=540, y2=150 if index == 0 else 700),
             pdf_style=base_style, unicode=text, debug_id=f"p{index}", layout_label="text",
@@ -186,6 +193,14 @@ def test_direct_whole_sentence_success(tmp_path):
     assert document.parser_artifact_hash() != before
     tracking = json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))
     assert len(tracking["cross_page"]) == 1
+
+
+def test_same_style_following_sentence_avoids_dedicated_request(tmp_path):
+    document = make_direct_document(split_following=False)
+    service = DirectApplicationService()
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.requests
+    assert service.translator.cross_page_requests == 0
 
 
 def test_direct_whole_sentence_keeps_the_next_sentence_on_its_page(tmp_path, monkeypatch):

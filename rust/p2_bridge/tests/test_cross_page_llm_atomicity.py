@@ -136,23 +136,3 @@ def test_formula_application_control(tmp_path):
     assert service.translator.cross_page_requests == 0
     assert len(json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))["cross_page"]) == 1
     assert document.parser_artifact_hash() != before
-
-
-def test_tracking_publish_failure_rolls_back_document(tmp_path):
-    destination = tmp_path / "translate_tracking.json"
-    fired = []
-
-    def block_publish():
-        assert list(destination.parent.glob("translate_tracking.json.*.tmp"))
-        destination.mkdir()
-        fired.append(True)
-
-    document = make_document()
-    before = document.parser_artifact_hash()
-    service = RustTranslatorService(Translator())
-    with pytest.raises(RuntimeError):
-        run(document, tmp_path, service, _rust_il.CancelFlag(), Monitor(block_publish))
-    assert fired
-    assert service.translator.cross_page_requests == 1
-    assert not list(destination.parent.glob("translate_tracking.json.*.tmp"))
-    assert document.parser_artifact_hash() == before

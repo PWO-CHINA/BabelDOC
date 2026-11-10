@@ -40,12 +40,26 @@ fn fixture() -> (TranslateInput, TranslateInput, RegexService, [u64; 3]) {
         placeholders: vec![rich(1)], original_tokens: vec![],
     };
     let right = TranslateInput {
-        text: "<style id='2'>11 samples were checked (Fig. </style><style id='3'>6e</style><style id='4'> and Supplementary Fig. 60).</style>".into(),
+        text: "<style id='2'>11 samples were checked (Fig. 6e and Supplementary Fig. 60).</style><style id='3'> Additional observations</style><style id='4'> follow.</style>".into(),
         placeholders: vec![rich(2), rich(3), rich(4)], original_tokens: vec![],
     };
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     (left, right, regex, patterns)
+}
+
+fn separate_following(input: &mut TranslateInput, following: &str) {
+    let InputPlaceholder::Rich(first) = input.placeholders.first().unwrap() else { panic!("missing first style") };
+    let start = input.text.find(&first.left).unwrap() + first.left.len();
+    let close = start + input.text[start..].find(&first.right).unwrap();
+    let split = start + input.text[start..close].find(following).unwrap();
+    let suffix = input.text[split..close].to_owned();
+    input.text.replace_range(split..close, "");
+    let end = split + first.right.len();
+    let next = rich(9);
+    let InputPlaceholder::Rich(next_style) = &next else { unreachable!() };
+    input.text.insert_str(end, &format!("{}{suffix}{}", next_style.left, next_style.right));
+    input.placeholders.insert(1, next);
 }
 
 fn evidence(left: &mut TranslateInput, right: &mut TranslateInput) -> Value {
@@ -75,7 +89,7 @@ fn keeps_the_numeric_relationship_in_one_actual_input() {
     let plan = plan_whole_sentence_on_right(&left, &right, &[], &document, (0, 0), (1, 0), &patterns, &mut regex).unwrap().unwrap();
     assert_eq!(plan.sentence, "After analysis, 7 of the recovered 11 samples were checked (Fig. 6e and Supplementary Fig. 60).");
     assert_eq!(plan.inputs.left.text, "<style id='1'>Earlier work was described. </style>");
-    assert_eq!(plan.inputs.right.text, "<style id='2'>After analysis, 7 of the recovered 11 samples were checked (Fig. </style><style id='3'>6e</style><style id='4'> and Supplementary Fig. 60).</style>");
+    assert_eq!(plan.inputs.right.text, "<style id='2'>After analysis, 7 of the recovered 11 samples were checked (Fig. 6e and Supplementary Fig. 60).</style><style id='3'> Additional observations</style><style id='4'> follow.</style>");
     assert_eq!(plan.inputs.left.placeholders, left.placeholders);
     assert_eq!(plan.inputs.right.placeholders, right.placeholders);
 }
@@ -193,21 +207,21 @@ fn reflow_split_ignores_sentences_after_the_first() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let mut right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    separate_following(&mut right, " Further");
     let sentence = "The treatment improved outcomes across multiple independent groups.";
     let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
     let first_sentence = "Lane (see Fig. 2) reported significant improvements across multiple groups.";
     let mut splits = Vec::new();
-    for following in ["", " Another result.", " A much longer subsequent result describes unrelated findings and adds enough words to alter the target considerably."] {
-        let output = format!("<style id='2'>{first_sentence}{following}</style>");
+    for following in [" Another result.", " A much longer subsequent result describes unrelated findings and adds enough words to alter the target considerably."] {
+        let output = format!("<style id='2'>{first_sentence}</style><style id='9'>{following}</style>");
         let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
             &plan, "Earlier work was described.", &output, &left, &right, &patterns, &mut regex,
         ).unwrap().unwrap();
-        assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")), format!("Earlier work was described. {first_sentence}{following}"));
+        assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("<style id='9'>", "").replace("</style>", "")), format!("Earlier work was described. {first_sentence}{following}"));
         splits.push(first);
     }
     assert_eq!(splits[0], splits[1]);
-    assert_eq!(splits[0], splits[2]);
     assert!(splits[0].contains("Lane (see Fig. 2)"));
 }
 
@@ -226,7 +240,7 @@ fn reflow_rejects_first_style_without_sentence_ending() {
 #[test]
 fn reflow_rejects_missing_boundary_across_multiple_styles() {
     let (left, mut right, mut regex, patterns) = fixture();
-    right.text = "<style id='2'>11 samples were checked</style><style id='3'> successfully.</style><style id='4'> Another finding belongs here.</style>".into();
+    right.text = "<style id='2'>11 samples were checked successfully.</style><style id='3'> Another finding belongs</style><style id='4'> here.</style>".into();
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     let response = "<style id='2'>A later finding was moved ahead of the continued sentence</style><style id='3'> and the sentence ends.</style><style id='4'> More text stays here.</style>";
     assert!(cross_page_protocol::reflow_whole_sentence_response(
@@ -236,11 +250,21 @@ fn reflow_rejects_missing_boundary_across_multiple_styles() {
 }
 
 #[test]
+fn declines_when_source_sentence_ends_in_a_later_style() {
+    let (mut left, mut right, mut regex, patterns) = fixture();
+    left.text = "<style id='1'>Earlier work was described. The treatment improved outcomes across</style>".into();
+    right.text = "<style id='2'>multiple independent</style><style id='3'> groups.</style><style id='4'> Another finding follows.</style>".into();
+    assert!(cross_page_protocol::plan_whole_sentence_reflow(
+        &left, &right, &[], &patterns, &mut regex,
+    ).unwrap().is_none());
+}
+
+#[test]
 fn reflow_rejects_translated_boundary_before_later_styles() {
     let (left, mut right, mut regex, patterns) = fixture();
-    right.text = "<style id='2'>11 samples were checked</style><style id='3'> successfully.</style><style id='4'> Another finding belongs here.</style>".into();
+    right.text = "<style id='2'>11 samples were checked successfully.</style><style id='3'> Another finding belongs</style><style id='4'> here.</style>".into();
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
-    let response = "<style id='2'>Another finding was moved first.</style><style id='3'> Afterwards the continued sentence ends</style><style id='4'> here.</style>";
+    let response = "<style id='2'>Another finding was moved first. The continued sentence ends here.</style><style id='3'> Additional finding</style><style id='4'> remains.</style>";
     assert!(cross_page_protocol::reflow_whole_sentence_response(
         &plan, "<style id='1'>Earlier work was described.</style>", response,
         &left, &right, &patterns, &mut regex,
@@ -252,16 +276,15 @@ fn reflow_preserves_numeric_tokens_within_the_translated_sentence() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Earlier findings were clear. After analysis, 7 of the recovered".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "11 samples were checked successfully. Further results follow.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "11 samples were checked successfully.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
-    let valid = "检查后，7份来自回收的11份样本，通过了检查。进一步结果如下。";
+    let valid = "检查后，7份来自回收的11份样本，通过了检查。";
     let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
         &plan, "先前结果明确。", valid, &left, &right, &patterns, &mut regex,
     ).unwrap().unwrap();
     assert_eq!(format!("{first}{second}"), format!("先前结果明确。{valid}"));
     assert!(first.contains('7'));
     assert!(second.contains("11"));
-    assert!(second.contains("进一步结果如下。"));
     for response in ["检查后，回收的11份样本通过。", "检查后，回收的12份样本中有7份通过。", "检查后，回收的11份样本中有7份和7份通过。", "检查后，回收的11份样本中有7份通过。"] {
         assert!(cross_page_protocol::reflow_whole_sentence_response(
             &plan, "先前结果明确。", response, &left, &right, &patterns, &mut regex,
@@ -274,10 +297,10 @@ fn reflow_preserves_unicode_numbers_on_their_original_page() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Earlier findings were clear. After analysis, ７ of the recovered".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "samples were checked successfully. Further results follow.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "samples were checked successfully.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
-        &plan, "先前结果明确。", "分析后７份回收样本通过了检查。进一步结果如下。", &left, &right, &patterns, &mut regex,
+        &plan, "先前结果明确。", "分析后７份回收样本通过了检查。", &left, &right, &patterns, &mut regex,
     ).unwrap().unwrap();
     assert!(first.contains('７'));
     assert!(!second.contains('７'));
@@ -297,25 +320,26 @@ fn joins_plain_and_styled_boundaries_only_for_the_verified_sentence() {
         text: "Prior results showed improvements{v1}. Although it remains uncertain, treatment has potential for circadian".into(),
         placeholders: vec![formula(1)], original_tokens: vec![],
     };
-    let right = TranslateInput {
+    let mut right = TranslateInput {
         text: "<style id='2'>disorders and associated conditions. The next finding is supported</style>{v3}.".into(),
         placeholders: vec![rich(2), formula(3)], original_tokens: vec![],
     };
+    separate_following(&mut right, " The next");
     let start = left.text.find("{v1}").unwrap();
     let ranges = [start..start + 4];
     let sentence = "Although it remains uncertain, treatment has potential for circadian disorders and associated conditions.";
     let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &ranges, sentence, &patterns, &mut regex).unwrap().unwrap();
-    assert_eq!(plan.inputs.right.text, "<style id='2'>Although it remains uncertain, treatment has potential for circadian disorders and associated conditions. The next finding is supported</style>{v3}.");
+    assert_eq!(plan.inputs.right.text, "<style id='2'>Although it remains uncertain, treatment has potential for circadian disorders and associated conditions.</style><style id='9'> The next finding is supported</style>{v3}.");
     let left_output = "此前的结果显示改善{v1}。";
-    let right_output = "<style id='2'>虽然仍不确定，该疗法有望治疗昼夜节律障碍及相关疾病。下一发现得到支持</style>{v3}。";
+    let right_output = "<style id='2'>虽然仍不确定，该疗法有望治疗昼夜节律障碍及相关疾病。</style><style id='9'>下一发现得到支持</style>{v3}。";
     let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
         &plan, left_output, right_output, &left, &right, &patterns, &mut regex,
     ).unwrap().unwrap();
     assert!(!first.contains("<style"));
     assert!(second.starts_with("<style id='2'>"));
     assert!(second.contains("</style>{v3}。"));
-    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")),
-        format!("{left_output}{}", right_output.replace("<style id='2'>", "").replace("</style>", "")));
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("<style id='9'>", "").replace("</style>", "")),
+        format!("{left_output}{}", right_output.replace("<style id='2'>", "").replace("<style id='9'>", "").replace("</style>", "")));
     assert!(cross_page_protocol::plan_plain_to_styled_sentence(
         &left, &right, &ranges, "A different sentence ends here.", &patterns, &mut regex,
     ).unwrap().is_none());
@@ -348,13 +372,7 @@ fn reflow_does_not_move_following_sentence_to_the_previous_page() {
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Previous findings were clear. A continuation starts with several words from the previous".into(), placeholders: vec![], original_tokens: vec![] };
     let right = TranslateInput { text: "following page. The next sentence belongs entirely to this page.".into(), placeholders: vec![], original_tokens: vec![] };
-    let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
-    let result = cross_page_protocol::reflow_whole_sentence_response(
-        &plan, "先前的研究结果清楚。", "跨页的句子在这里结束。下一句话完全属于本页。", &left, &right, &patterns, &mut regex,
-    ).unwrap().unwrap();
-    assert!(!result.0.contains("下一句话"));
-    assert!(result.1.contains("下一句话完全属于本页。"));
-    assert_eq!(format!("{}{}", result.0, result.1), "先前的研究结果清楚。跨页的句子在这里结束。下一句话完全属于本页。");
+    assert!(cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().is_none());
 }
 
 #[test]
@@ -362,17 +380,15 @@ fn reflow_does_not_move_the_sentence_after_a_short_final_word() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Previous findings were clear. A continuation starts with several words from the previous".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "following page. The next sentence belongs entirely to this page.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "following page.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     let next_sentence = " Another sentence contains unrelated findings and must remain entirely on the following page.";
     for final_word in ["end", "use", "low", "ms"] {
         let first_sentence = format!("The first translated sentence ends with {final_word}.");
-        let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+        let result = cross_page_protocol::reflow_whole_sentence_response(
             &plan, "Earlier findings were clear.", &format!("{first_sentence}{next_sentence}"), &left, &right, &patterns, &mut regex,
-        ).unwrap().unwrap();
-        assert!(!first.contains("Another sentence"), "final word: {final_word}");
-        assert!(second.contains(next_sentence), "final word: {final_word}");
-        assert_eq!(format!("{first}{second}"), format!("Earlier findings were clear. {first_sentence}{next_sentence}"));
+        ).unwrap();
+        assert!(result.is_none(), "final word: {final_word}");
     }
 }
 
@@ -381,7 +397,7 @@ fn reflow_stops_at_quoted_multilingual_and_decimal_sentence_boundaries() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Previous findings were clear. A continuation starts with several words from the previous".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "following page. The next sentence belongs entirely to this page.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "following page.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     for (first_sentence, next_sentence) in [
         ("The first translated sentence ends here.\"", " Another sentence contains unrelated findings."),
@@ -398,13 +414,12 @@ fn reflow_stops_at_quoted_multilingual_and_decimal_sentence_boundaries() {
     ] {
         let without_next = cross_page_protocol::reflow_whole_sentence_response(
             &plan, "Earlier findings were clear.", first_sentence, &left, &right, &patterns, &mut regex,
-        ).unwrap().unwrap();
+        ).unwrap();
         let with_next = cross_page_protocol::reflow_whole_sentence_response(
             &plan, "Earlier findings were clear.", &format!("{first_sentence}{next_sentence}"), &left, &right, &patterns, &mut regex,
-        ).unwrap().unwrap();
-        assert_eq!(with_next.0, without_next.0, "first sentence: {first_sentence}");
-        assert!(with_next.1.contains(next_sentence), "next sentence: {next_sentence}");
-        if first_sentence.contains("3.14") { assert!(with_next.0.contains("3.14")); }
+        ).unwrap();
+        if !first_sentence.ends_with('"') { assert!(without_next.is_some(), "first sentence: {first_sentence}"); }
+        assert!(with_next.is_none(), "next sentence: {next_sentence}");
     }
 }
 
@@ -413,18 +428,19 @@ fn reflow_preserves_the_following_sentence_in_a_styled_output() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let mut right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    separate_following(&mut right, " Further");
     let sentence = "The treatment improved outcomes across multiple independent groups.";
     let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
     let first_sentence = "The first translated sentence has come to an end.";
     let next_sentence = " Another sentence contains unrelated findings and remains on this page.";
-    let output = format!("<style id='2'>{first_sentence}{next_sentence}</style>");
+    let output = format!("<style id='2'>{first_sentence}</style><style id='9'>{next_sentence}</style>");
     let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
         &plan, "Earlier work was described.", &output, &left, &right, &patterns, &mut regex,
     ).unwrap().unwrap();
     assert!(!first.contains("Another sentence"));
     assert!(second.contains(next_sentence));
-    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")),
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("<style id='9'>", "").replace("</style>", "")),
         format!("Earlier work was described. {first_sentence}{next_sentence}"));
 }
 
@@ -433,13 +449,24 @@ fn reflow_declines_missing_boundary_in_a_complete_first_style() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let mut right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    separate_following(&mut right, " Further");
     let sentence = "The treatment improved outcomes across multiple independent groups.";
     let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
-    let response = "<style id='2'>The first sentence lost its punctuation Another unrelated sentence follows</style>";
+    let response = "<style id='2'>The first sentence lost its punctuation</style><style id='9'>Another unrelated sentence follows</style>";
     assert!(cross_page_protocol::reflow_whole_sentence_response(
         &plan, "Earlier work was described.", response, &left, &right, &patterns, &mut regex,
     ).unwrap().is_none());
+}
+
+#[test]
+fn reflow_rejects_an_early_later_sentence_in_the_same_style() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent groups. A later finding follows.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    assert!(cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().is_none());
 }
 
 #[test]
@@ -447,14 +474,13 @@ fn reflow_handles_a_long_whitespace_run() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Previous findings were clear. A continuation starts with several words from the previous".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "following page. The next sentence belongs entirely to this page.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "following page.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     let translation = format!("alpha{}beta. Another sentence remains on its page.", " ".repeat(16_384));
-    let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+    let result = cross_page_protocol::reflow_whole_sentence_response(
         &plan, "Earlier findings were clear.", &translation, &left, &right, &patterns, &mut regex,
-    ).unwrap().unwrap();
-    assert_eq!(format!("{first}{second}"), format!("Earlier findings were clear. {translation}"));
-    assert!(second.contains("Another sentence remains on its page."));
+    ).unwrap();
+    assert!(result.is_none());
 }
 
 #[test]
@@ -462,7 +488,7 @@ fn reflow_declines_ambiguous_abbreviations_and_parenthesized_sentences() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
     let left = TranslateInput { text: "Previous findings were clear. A continuation starts with several words from the previous".into(), placeholders: vec![], original_tokens: vec![] };
-    let right = TranslateInput { text: "following page. The next sentence belongs entirely to this page.".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "following page.".into(), placeholders: vec![], original_tokens: vec![] };
     let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
     for translated in [
         "Dr. Another sentence contains unrelated findings and must remain on the following page.",

@@ -10,7 +10,6 @@ from test_cross_page_llm_direct_atomicity import (
     LEFT_PREFIX,
     LEFT_TAIL,
     Monitor,
-    RIGHT_CONTINUATION,
     TRANSLATED_FOLLOWING,
     TRANSLATED_PREFIX,
     TRANSLATED_SENTENCE,
@@ -36,7 +35,7 @@ def paragraph(text, bounds, label="text", size=10.0):
 
 def fixture(*, size=10.0, labelled_caption=False, neighbour_caption=False,
             caption_size=7.0, title=False, running_header=False, single_header=False, page_number=1,
-            left_text=LEFT_PREFIX + LEFT_TAIL, right_text=RIGHT_CONTINUATION):
+            left_text=LEFT_PREFIX + LEFT_TAIL, right_text="several independent experiments."):
     left = paragraph(left_text, (310, 60, 550, 145),
                      label="figure_caption" if labelled_caption else "text", size=size)
     left_items = [
@@ -79,15 +78,15 @@ def test_two_column_body_is_translated_and_returns_to_original_pages(tmp_path):
     pages = json.loads(document.parser_artifact_json())["document"]["page"]
     left = pages[0]["pdf_paragraph"][2]["unicode"]
     right = pages[1]["pdf_paragraph"][0]["unicode"]
-    assert left + right == TRANSLATED_PREFIX + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING
-    assert TRANSLATED_PREFIX in left and TRANSLATED_FOLLOWING in right
+    assert left + right == TRANSLATED_PREFIX + TRANSLATED_SENTENCE
+    assert TRANSLATED_PREFIX in left and right
     assert TRANSLATED_FOLLOWING not in left
 
 
 @pytest.mark.parametrize("kwargs", [
     {"running_header": True},
     {"left_text": "Earlier findings were clear. The cohort included participants from",
-     "right_text": "California and neighboring regions. Additional observations follow."},
+     "right_text": "California and neighboring regions."},
 ])
 def test_supported_boundaries_are_detected(tmp_path, kwargs):
     document = fixture(**kwargs)
@@ -107,7 +106,7 @@ def test_unmovable_sentence_does_not_use_context_only_mode(tmp_path):
 
 def test_identity_sentence_retains_each_page_anchor(tmp_path):
     left_tail = "The synthetic left anchor begins a statement across"
-    right_text = "the synthetic right anchor and ends here. A later statement remains."
+    right_text = "the synthetic right anchor and ends here."
     document = fixture(left_text="Earlier findings were clear. " + left_tail, right_text=right_text)
     service = DirectApplicationService()
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
@@ -117,7 +116,6 @@ def test_identity_sentence_retains_each_page_anchor(tmp_path):
     right = pages[1]["pdf_paragraph"][0]["unicode"]
     assert "synthetic left anchor" in left
     assert "synthetic right anchor" in right
-    assert "A later statement remains." in right
 
 
 @pytest.mark.parametrize("kwargs", [

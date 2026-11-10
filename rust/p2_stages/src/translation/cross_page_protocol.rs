@@ -144,6 +144,7 @@ pub fn plan_whole_sentence_reflow<R: PlaceholderRegex>(
         || !validate_response(regex, right, &right.text, patterns)? { return Ok(None); }
     if left.placeholders.is_empty() && right.placeholders.is_empty() {
         let Some((tail, continuation)) = super::cross_page::context_sentence_parts(&left.text, &right.text) else { return Ok(None) };
+        if right.text.strip_prefix(continuation).is_none_or(|remaining| !remaining.trim().is_empty()) { return Ok(None); }
         let Some(sentence) = super::cross_page::extract_context_sentence(&left.text, &right.text) else { return Ok(None) };
         if tail.ends_with('-') || right.text.starts_with(char::is_whitespace) { return Ok(None); }
         let Some(prefix) = left.text.trim_end().strip_suffix(tail) else { return Ok(None) };
@@ -207,6 +208,10 @@ pub fn plan_whole_sentence_reflow<R: PlaceholderRegex>(
     }
     let Some((tail, continuation)) = super::cross_page::context_sentence_parts(left_content, &right_plain) else { return Ok(None) };
     if !continuation.ends_with(['.', '!', '?', '。', '！', '？']) { return Ok(None); }
+    let Some(first_style_end) = right_content.find(&right_rich.right) else { return Ok(None) };
+    let first_style = &right_content[..first_style_end];
+    let Some(after_continuation) = first_style.strip_prefix(continuation) else { return Ok(None) };
+    if !after_continuation.trim().is_empty() { return Ok(None); }
     let Some(sentence) = super::cross_page::extract_context_sentence(left_content, &right_plain) else { return Ok(None) };
     if tail.ends_with('-') || tail.chars().chain(continuation.chars()).any(|character| matches!(character, '<' | '>' | '{' | '}' | '\n' | '\r')) {
         return Ok(None);
@@ -269,7 +274,7 @@ pub fn plan_plain_to_styled_sentence<R: PlaceholderRegex>(
     if tail.ends_with('-') || !continuation.ends_with(['.', '!', '?', '。', '！', '？']) {
         return Ok(None);
     }
-    if first_style[continuation.len()..].chars().next().is_some_and(|character| !character.is_whitespace()) {
+    if !first_style[continuation.len()..].trim().is_empty() {
         return Ok(None);
     }
     for pattern in patterns {
@@ -318,7 +323,7 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
         let Some(close) = right_content.find(&right_rich.right) else { return Ok(None) };
         (right_rich.left.as_str(), right_content, close)
     } else {
-        ( "", right_output, right_output.len())
+        ("", right_output, right_output.len())
     };
     let content = &right_content[..close];
     let Some(weight) = plan.left_weight.checked_add(plan.right_weight) else { return Ok(None) };
@@ -377,11 +382,7 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
         }
     }
     let Some(sentence_end) = sentence_end else { return Ok(None) };
-    if plan.right_styled {
-        let Some(InputPlaceholder::Rich(right_rich)) = original_right.placeholders.first() else { return Ok(None) };
-        let Some(trailing) = right_content[close..].strip_prefix(&right_rich.right) else { return Ok(None) };
-        if content[sentence_end..].trim().is_empty() && !trailing.trim().is_empty() { return Ok(None); }
-    }
+    if !content[sentence_end..].trim().is_empty() { return Ok(None); }
     let Some(source_boundary) = plan.sentence.char_indices().nth(plan.left_weight).map(|(offset, _)| offset) else { return Ok(None) };
     let source_spans = numeric_spans(&plan.sentence);
     let target_spans = numeric_spans(&content[..sentence_end]);
