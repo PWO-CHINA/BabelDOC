@@ -1,5 +1,22 @@
-use std::ops::Range;
+use std::{ops::Range, sync::LazyLock};
 use super::ordinary_translation::{InputPlaceholder, PlaceholderRegex, TranslateInput};
+
+static SENTENCE_TERMINATOR: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"[\p{Sentence_Terminal}…]").expect("literal sentence terminator regex"));
+
+fn numeric_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (offset, character) in text.char_indices() {
+        if character.is_numeric() {
+            start.get_or_insert(offset);
+        } else if let Some(begin) = start.take() {
+            spans.push(begin..offset);
+        }
+    }
+    if let Some(begin) = start { spans.push(begin..text.len()); }
+    spans
+}
 
 /// Checks exact token counts, translator-specific patterns, and rich-text pairing.
 /// Match offsets returned by PlaceholderRegex are Unicode character offsets.
@@ -309,17 +326,36 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
     let mut sentence_length = content.chars().count();
     let mut candidates = Vec::new();
     let mut depth = 0usize;
+    let mut sentence_end = None;
+    let Some((first_alphanumeric, _)) = content.char_indices().find(|(_, value)| value.is_alphanumeric()) else { return Ok(None) };
+    let Some((last_alphanumeric, _)) = content.char_indices().rfind(|(_, value)| value.is_alphanumeric()) else { return Ok(None) };
+    let mut terminators = SENTENCE_TERMINATOR.find_iter(content).peekable();
     for (position, (offset, character)) in content.char_indices().enumerate() {
-        if depth == 0 && matches!(character, '.' | '!' | '?' | '。' | '！' | '？') {
+        if terminators.peek().is_some_and(|found| found.start() == offset) {
+            terminators.next();
             let before = &content[..offset];
             let after = &content[offset + character.len_utf8()..];
-            let abbreviation = character == '.' && {
+            let decimal = character == '.'
+                && before.chars().next_back().is_some_and(|value| value.is_ascii_digit())
+                && after.chars().next().is_some_and(|value| value.is_ascii_digit());
+            if !decimal {
                 let word = before.rsplit(|value: char| !value.is_alphabetic()).next().unwrap_or("");
-                !word.is_empty() && (word.chars().count() <= 3 || matches!(word.to_ascii_lowercase().as_str(), "prof" | "assoc" | "dept" | "approx" | "figs" | "etc"))
-            };
-            if !abbreviation && (character != '.' || after.chars().next().is_none_or(char::is_whitespace)) {
-                sentence_length = position + 1;
-                break;
+                let figure_reference = character == '.'
+                    && matches!(word.to_ascii_lowercase().as_str(), "fig" | "figs")
+                    && after.starts_with(char::is_whitespace)
+                    && after.trim_start().chars().next().is_some_and(|value| value.is_ascii_digit());
+                let abbreviation = character == '.' && (word.chars().count() == 1
+                    || matches!(word, "Dr" | "Mr" | "Mrs" | "Ms" | "Prof")
+                    || matches!(word.to_ascii_lowercase().as_str(), "al" | "assoc" | "dept" | "approx" | "fig" | "figs" | "etc" | "vs"));
+                if depth > 0 {
+                    if !figure_reference { return Ok(None); }
+                } else if abbreviation {
+                    return Ok(None);
+                } else {
+                    sentence_length = position + 1;
+                    sentence_end = Some(offset + character.len_utf8());
+                    break;
+                }
             }
         }
         if position > 0 && depth == 0 {
@@ -330,8 +366,7 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
             let bad_end = matches!(previous, '(' | '[' | '{' | '（' | '【' | '“' | '‘');
             let inside_word = previous.is_ascii_alphanumeric() && character.is_ascii_alphanumeric();
             if word_boundary && !bad_start && !bad_end && !inside_word
-                && content[..offset].chars().any(char::is_alphanumeric)
-                && content[offset..].chars().any(char::is_alphanumeric) {
+                && first_alphanumeric < offset && last_alphanumeric >= offset {
                 candidates.push((position, offset));
             }
         }
@@ -341,9 +376,29 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
             _ => {},
         }
     }
+    let Some(sentence_end) = sentence_end else { return Ok(None) };
+    if plan.right_styled {
+        let Some(InputPlaceholder::Rich(right_rich)) = original_right.placeholders.first() else { return Ok(None) };
+        let Some(trailing) = right_content[close..].strip_prefix(&right_rich.right) else { return Ok(None) };
+        if content[sentence_end..].trim().is_empty() && !trailing.trim().is_empty() { return Ok(None); }
+    }
+    let Some(source_boundary) = plan.sentence.char_indices().nth(plan.left_weight).map(|(offset, _)| offset) else { return Ok(None) };
+    let source_spans = numeric_spans(&plan.sentence);
+    let target_spans = numeric_spans(&content[..sentence_end]);
+    let mut numeric_boundary = None;
+    if !source_spans.is_empty() {
+        if source_spans.iter().map(|span| &plan.sentence[span.clone()])
+            .ne(target_spans.iter().map(|span| &content[span.clone()])) { return Ok(None); }
+        let left_numbers = source_spans.iter().take_while(|span| span.end <= source_boundary).count();
+        if source_spans.iter().any(|span| span.start < source_boundary && span.end > source_boundary) { return Ok(None); }
+        let minimum = left_numbers.checked_sub(1).map_or(0, |index| target_spans[index].end);
+        let maximum = target_spans.get(left_numbers).map_or(sentence_end, |span| span.start);
+        numeric_boundary = Some(minimum..=maximum);
+    }
     let target = sentence_length.saturating_mul(plan.left_weight) / weight;
     candidates.sort_unstable_by_key(|(position, offset)| (position.abs_diff(target), *offset));
     for (_, offset) in candidates {
+        if numeric_boundary.as_ref().is_some_and(|range| !range.contains(&offset)) { continue; }
         let first = &content[..offset];
         let rest = &right_content[offset..];
         let separator = if left_prefix.chars().last().is_some_and(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '!' | '?' | ':' | ';' | ','))

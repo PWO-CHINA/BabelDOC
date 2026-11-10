@@ -113,6 +113,7 @@ impl FromPyValue for CurveDebugInfo {
 
 #[pymodule]
 fn _rust_il(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("CROSS_PAGE_SENTENCE_PROTOCOL_VERSION", 1_u8)?;
     module.add("ParserResourceLimitError", module.py().import("babeldoc.format.pdf.parser_resource")?.getattr("ParserResourceLimitError")?)?;
     callbacks::register(module)?;
     logging::register(module)?;

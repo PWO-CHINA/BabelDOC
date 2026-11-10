@@ -188,6 +188,130 @@ def test_direct_whole_sentence_success(tmp_path):
     assert len(tracking["cross_page"]) == 1
 
 
+def test_direct_whole_sentence_keeps_the_next_sentence_on_its_page(tmp_path, monkeypatch):
+    sentence = "经过充分分析，这些独立实验的结论最终到达 the end."
+    following = " Another unrelated finding must stay entirely on the next page."
+    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE", sentence)
+    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING", following)
+    document = make_direct_document()
+    service = DirectApplicationService()
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert_direct_request(service)
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    left = pages[0]["pdf_paragraph"][0]["unicode"]
+    right = pages[1]["pdf_paragraph"][0]["unicode"]
+    assert "Another unrelated finding" not in left
+    assert following in right
+
+
+def test_direct_ambiguous_sentence_boundary_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE", "Dr.")
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING",
+        " Another unrelated finding must stay entirely on the next page.",
+    )
+    document = make_direct_document()
+    service = DirectApplicationService()
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests >= 1
+    assert service.translator.fallback_requests >= 1
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    assert "Another unrelated finding" not in pages[0]["pdf_paragraph"][0]["unicode"]
+
+
+def test_numeric_multistyle_missing_boundary_fails_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "LEFT_TAIL",
+        "After analysis, 7 of the recovered",
+    )
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
+        "11 samples were checked successfully. Additional observations follow.",
+    )
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE",
+        "A later finding appears first and the numeric sentence ends",
+    )
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING", "",
+    )
+    document = make_direct_document()
+    before = document.parser_artifact_hash()
+    service = DirectApplicationService()
+    def malformed(prompt, rate_limit_params=None):
+        service.translator.requests.append(prompt)
+        service.translator.cross_page_requests += 1
+        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
+        for item in items:
+            item["output"] = item.pop("input").replace(
+                "After analysis, 7 of the recovered 11 samples were checked successfully.",
+                "A later finding appears first and the numeric sentence ends",
+            ).replace(" Additional observations follow.", "")
+            item.pop("layout_label", None)
+        return json.dumps(items)
+
+    service.translator.llm_translate = malformed
+    with pytest.raises(RuntimeError, match="跨页数值续句"):
+        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests >= 1
+    assert document.parser_artifact_hash() == before
+    assert not (tmp_path / "translate_tracking.json").exists()
+
+
+def test_numeric_sentence_is_present_once_across_original_pages(tmp_path, monkeypatch):
+    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "After analysis, 7 of the recovered")
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
+        "11 samples were checked successfully. Additional observations follow.",
+    )
+    document = make_direct_document()
+    service = DirectApplicationService()
+    def translate(prompt, rate_limit_params=None):
+        service.translator.requests.append(prompt)
+        service.translator.cross_page_requests += 1
+        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
+        for item in items:
+            output = item["input"].replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
+                "After analysis, 7 of the recovered 11 samples were checked successfully.",
+                "分析后，7份来自回收的11份样本，通过了检查。",
+            ).replace(" Additional observations follow.", TRANSLATED_FOLLOWING)
+            item["output"] = output
+            item.pop("input")
+            item.pop("layout_label", None)
+        return json.dumps(items)
+
+    service.translator.llm_translate = translate
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 1
+    assert service.translator.fallback_requests == 0
+    prompt = service.translator.requests[0]
+    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
+    assert any("After analysis, 7 of the recovered 11 samples were checked successfully." in item["input"] for item in items)
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    left = pages[0]["pdf_paragraph"][0]["unicode"]
+    right = pages[1]["pdf_paragraph"][0]["unicode"]
+    assert left.count("7") == 1 and "7" not in right
+    assert right.count("11") == 1 and "11" not in left
+    assert TRANSLATED_FOLLOWING in right
+    assert TRANSLATED_FOLLOWING not in left
+
+
+def test_numeric_sentence_with_a_dropped_number_fails_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "After analysis, 7 of the recovered")
+    monkeypatch.setitem(
+        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
+        "11 samples were checked successfully. Additional observations follow.",
+    )
+    document = make_direct_document()
+    before = document.parser_artifact_hash()
+    service = DirectApplicationService()
+    with pytest.raises(RuntimeError, match="跨页数值续句"):
+        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests >= 1
+    assert document.parser_artifact_hash() == before
+    assert not (tmp_path / "translate_tracking.json").exists()
+
+
 @pytest.mark.parametrize("failure", ["cancel", "second_output"])
 def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure):
     flag = _rust_il.CancelFlag()
@@ -257,3 +381,12 @@ def test_default_off_matches_explicit_false_in_production(tmp_path):
         assert after != before
         results.append((after, service.translator.requests))
     assert results[0] == results[1]
+
+
+def test_cross_page_protocol_versions_match():
+    from babeldoc.format.pdf.translation_config import CROSS_PAGE_SENTENCE_PROTOCOL_VERSION
+
+    assert type(CROSS_PAGE_SENTENCE_PROTOCOL_VERSION) is int
+    assert CROSS_PAGE_SENTENCE_PROTOCOL_VERSION == 1
+    assert type(_rust_il.CROSS_PAGE_SENTENCE_PROTOCOL_VERSION) is int
+    assert _rust_il.CROSS_PAGE_SENTENCE_PROTOCOL_VERSION == CROSS_PAGE_SENTENCE_PROTOCOL_VERSION

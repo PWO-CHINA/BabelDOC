@@ -17,6 +17,8 @@ from babeldoc.translator.translator import BaseTranslator
 
 logger = logging.getLogger(__name__)
 
+CROSS_PAGE_SENTENCE_PROTOCOL_VERSION = 1
+
 
 class WatermarkOutputMode(enum.Enum):
     Watermarked = "watermarked"

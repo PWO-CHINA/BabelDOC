@@ -363,6 +363,7 @@ pub fn process(
             if numeric && whole_sentence.is_none() {
                 return Err(py_error("跨页续句包含跨页数值，当前无法可靠翻译整句；请关闭实验选项并人工核对该处。"));
             }
+            if whole_sentence.is_none() { continue; }
             let request_inputs = whole_sentence.as_ref().map_or_else(|| pair_inputs.clone(), |plan| [plan.inputs.left.clone(), plan.inputs.right.clone()]);
             let aliases = cross_page_context::StyleAliases::prepare(
                 &request_inputs, &sentence, ids, &mut regex,

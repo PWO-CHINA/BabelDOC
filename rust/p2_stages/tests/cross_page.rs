@@ -28,6 +28,7 @@ fn context_sentence_evidence_is_conservative() {
         ("Earlier sentence. The unfinished portion", "• list item ends here."),
         ("Earlier sentence. The unfinished portion", "1. list item ends here."),
         ("Earlier sentence. The unfinished portion", "New paragraph begins here."),
+        ("Figure 4 presents the synthetic measurements", "across the selected study groups. Another finding follows."),
     ] { assert!(!accepts(left, right), "{left:?} {right:?}"); }
 }
 
@@ -36,8 +37,10 @@ fn numeric_continuation_requires_special_handling() {
     use cross_page::numeric_continuation_needs_review as needs_review;
     assert!(needs_review("Earlier results were clear. After analysis, 7 of the recovered", "11 samples were checked successfully."));
     assert!(needs_review("The first 3 examples include", "42 samples in the final analysis."));
-    assert!(!needs_review("Earlier results were clear. The recovered", "11 samples were checked successfully."));
-    assert!(!needs_review("Earlier results were clear. After analysis, 7 of the recovered", "samples were checked successfully."));
+    assert!(needs_review("Earlier results were clear. The recovered", "11 samples were checked successfully."));
+    assert!(needs_review("Earlier results were clear. After analysis, 7 of the recovered", "samples were checked successfully."));
+    assert!(needs_review("Earlier results were clear. After analysis, ７ of the recovered", "samples were checked successfully."));
+    assert!(!needs_review("Earlier results were clear. The recovered", "samples were checked successfully."));
     assert!(!needs_review("Earlier results were clear. After analysis, 7 of the recovered", "11 samples have no ending"));
     assert!(!needs_review("Earlier results were clear. After analysis, 7 of the recovered", "1. A new numbered section begins."));
 }
@@ -79,6 +82,27 @@ fn boundary_shapes_keep_complete_context_and_ambiguity() {
         ("The treatment was associated with improved", "survival (Smith et al. 2024) in the population."),
         ("The treatment was associated with improved", "survival (3.14) in the population."),
         ("The treatment was associated with improved", "survival (Fig. 3 in the population."),
+    ] {
+        assert_eq!(extract(left, right), None, "{left:?} {right:?}");
+    }
+}
+
+#[test]
+fn uppercase_acronyms_require_sentence_and_join_evidence() {
+    use cross_page::extract_context_sentence as extract;
+    assert_eq!(
+        extract("Earlier work was described. The cells respond to", "DNA damage after the treatment. Another finding follows."),
+        Some("The cells respond to DNA damage after the treatment.".into()),
+    );
+    assert_eq!(
+        extract("Earlier work was described. The cohort included participants from", "California and neighboring regions. Another finding follows."),
+        Some("The cohort included participants from California and neighboring regions.".into()),
+    );
+    for (left, right) in [
+        ("Earlier work was described. The cells respond rapidly", "DNA damage after the treatment."),
+        ("Earlier work was described. The cells respond to", "DNA Damage and Repair."),
+        ("Earlier work was described. The cells respond to", "New observations follow here."),
+        ("Earlier work was described. The cells respond to", "DNA damage without a sentence ending"),
     ] {
         assert_eq!(extract(left, right), None, "{left:?} {right:?}");
     }

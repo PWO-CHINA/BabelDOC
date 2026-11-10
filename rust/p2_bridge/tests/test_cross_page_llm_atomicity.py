@@ -1,4 +1,3 @@
-import asyncio
 import json
 import re
 import sys
@@ -12,7 +11,7 @@ from babeldoc.rust_run_context import PriorityServiceDispatcher
 from babeldoc.rust_translation_service import RustTranslatorService
 
 
-LEFT = "The results demonstrate a substantial improvement across"
+LEFT = "Earlier findings were clear. The results demonstrate a substantial improvement across"
 RIGHT = "several independent experiments. Additional observations follow."
 
 
@@ -38,32 +37,16 @@ class Translator:
         if marker not in prompt:
             self.fallback_requests += 1
             return prompt.rsplit("Now translate the following text:", 1)[1].strip()
-        assert "## Cross-page continuation" in prompt
-        self.cross_page_requests += 1
+        if "## Cross-page continuation" in prompt:
+            self.cross_page_requests += 1
         items = json.loads(prompt.rsplit(marker, 1)[1].strip())
         assert len(items) == 2
         return json.dumps([{"id": item["id"], "output": item["input"]} for item in items])
 
 
 class ApplicationService(RustTranslatorService):
-    def __init__(self, on_output=lambda side: None):
+    def __init__(self):
         super().__init__(Translator())
-        self.on_output = on_output
-        self.application_pattern = None
-        self.application_outputs = []
-
-    def regex_compile(self, pattern, flags=0):
-        result = super().regex_compile(pattern, flags)
-        if pattern == r"(\{v1\})":
-            self.application_pattern = result
-        return result
-
-    def regex_finditer(self, pattern_id, text):
-        if self.application_pattern == pattern_id and text in ("{v1}" + LEFT, "{v1}" + RIGHT):
-            side = "left" if text.endswith(LEFT) else "right"
-            self.application_outputs.append(side)
-            self.on_output(side)
-        return super().regex_finditer(pattern_id, text)
 
 
 def make_document(with_formula=False):
@@ -72,7 +55,15 @@ def make_document(with_formula=False):
         style = il.PdfStyle(font_id="regular", font_size=10.0)
         compositions = [il.PdfParagraphComposition(pdf_character=il.PdfCharacter(pdf_style=style, char_unicode=text))]
         if with_formula:
-            compositions.insert(0, il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[il.PdfCharacter(pdf_style=style, char_unicode="x")])))
+            formula = il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[il.PdfCharacter(pdf_style=style, char_unicode="x")]))
+            if index == 0:
+                compositions.insert(0, formula)
+            else:
+                rich_style = il.PdfStyle(font_id="regular", font_size=10.0,
+                                         graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"))
+                compositions = [il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
+                    pdf_style=rich_style, pdf_character=[il.PdfCharacter(pdf_style=rich_style, char_unicode=text)]
+                )), formula]
         paragraph = il.PdfParagraph(
             box=il.Box(x=60, y=100 if index == 0 else 650, x2=540, y2=150 if index == 0 else 700),
             pdf_style=style,
@@ -142,44 +133,9 @@ def test_formula_application_control(tmp_path):
     before = document.parser_artifact_hash()
     service = ApplicationService()
     run(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.application_outputs == ["left", "left", "right", "right"]
-    assert service.translator.cross_page_requests >= 1
-    assert service.translator.fallback_requests == 2
+    assert service.translator.cross_page_requests == 0
     assert len(json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))["cross_page"]) == 1
     assert document.parser_artifact_hash() != before
-
-
-@pytest.mark.parametrize("failure", ["cancel", "second_output"])
-def test_application_failure_rolls_back_document(tmp_path, failure):
-    flag = _rust_il.CancelFlag()
-    fired = []
-
-    def fail(side):
-        if fired:
-            return
-        if failure == "cancel" and side == "left":
-            fired.append(side)
-            flag.cancel()
-        elif failure == "second_output" and side == "right":
-            fired.append(side)
-            raise RuntimeError("injected failure in second output")
-
-    document = make_document(True)
-    before = document.parser_artifact_hash()
-    service = ApplicationService(fail)
-    expected = asyncio.CancelledError if failure == "cancel" else RuntimeError
-    with pytest.raises(expected) as error:
-        run(document, tmp_path, service, flag, Monitor())
-    if failure == "second_output":
-        assert str(error.value) == "injected failure in second output"
-    else:
-        assert flag.observation_delay() is not None
-    assert fired == ["left" if failure == "cancel" else "right"]
-    assert service.application_outputs == (["left", "left"] if failure == "cancel" else ["left", "left", "right"])
-    assert service.translator.fallback_requests == 2
-    assert service.translator.cross_page_requests >= 1
-    assert not (tmp_path / "translate_tracking.json").exists()
-    assert document.parser_artifact_hash() == before
 
 
 def test_tracking_publish_failure_rolls_back_document(tmp_path):

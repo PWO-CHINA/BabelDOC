@@ -50,8 +50,7 @@ pub fn has_context_sentence_evidence(left: &str, right: &str) -> bool {
 
 pub fn numeric_continuation_needs_review(left: &str, right: &str) -> bool {
     let Some((tail, continuation)) = context_sentence_parts(left, right) else { return false };
-    continuation.chars().next().is_some_and(|value| value.is_ascii_digit())
-        && tail.chars().any(|value| value.is_ascii_digit())
+    tail.chars().chain(continuation.chars()).any(char::is_numeric)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +64,26 @@ fn continuation_join(left: &str, right: &str) -> Option<ContinuationJoin> {
     let first = right.chars().next()?;
     if first.is_lowercase() && (last.is_alphanumeric() || matches!(last, ',' | ';')) {
         return Some(ContinuationJoin::Space);
+    }
+    if last.is_alphabetic() {
+        let preceding = left.split_whitespace().last()?;
+        let mut words = right.split_whitespace();
+        let first_word = words.next()?;
+        let next = words.next();
+        if matches!(preceding, "of" | "for" | "with" | "by" | "using" | "in" | "to" | "from")
+            && (2..=6).contains(&first_word.len())
+            && first_word.chars().all(|character| character.is_ascii_uppercase())
+            && next.and_then(|word| word.chars().next()).is_some_and(char::is_lowercase) {
+            return Some(ContinuationJoin::Space);
+        }
+        let mut letters = first_word.chars();
+        if matches!(preceding, "from" | "in" | "of") && first_word.chars().count() >= 4
+            && letters.next().is_some_and(char::is_uppercase)
+            && letters.clone().all(char::is_lowercase)
+            && next == Some("and")
+            && words.next().and_then(|word| word.chars().next()).is_some_and(char::is_lowercase) {
+            return Some(ContinuationJoin::Space);
+        }
     }
     if last.is_alphanumeric() && first.is_ascii_digit() {
         let digits = right.chars().take_while(char::is_ascii_digit).count();
@@ -121,6 +140,13 @@ pub(super) fn context_sentence_parts<'a>(left: &'a str, right: &'a str) -> Optio
                     || line.split_once('.').is_some_and(|(prefix, rest)| !prefix.is_empty() && prefix.chars().all(|value| value.is_ascii_digit()) && rest.starts_with(char::is_whitespace))
             })
     }
+    fn caption_label(text: &str) -> bool {
+        let lower = text.trim_start().to_ascii_lowercase();
+        ["figure", "fig.", "fig", "table"].iter().any(|prefix| {
+            lower.strip_prefix(prefix).is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace)
+                && rest.trim_start().chars().next().is_some_and(|character| character.is_ascii_digit()))
+        })
+    }
     let left = left.trim();
     let right = right.trim();
     let mut left_end = 0;
@@ -138,6 +164,7 @@ pub(super) fn context_sentence_parts<'a>(left: &'a str, right: &'a str) -> Optio
         if !plausible_fragment(&left[..left_end]) { return None; }
         left[left_end..].trim()
     };
+    if caption_label(tail) || caption_label(right) { return None; }
     if !plausible_fragment(tail) || continuation_join(tail, right).is_none() {
         return None;
     }
