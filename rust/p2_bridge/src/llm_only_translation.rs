@@ -45,6 +45,7 @@ struct Work {
     cross_page_context: bool,
     context_sentence: Option<String>,
     context_aliases: Option<cross_page_context::StyleAliases>,
+    partitioned_aliases: Option<cross_page_context::StyleAliases<3>>,
     whole_sentence: Option<babeldoc_p2_stages::translation::cross_page_protocol::WholeSentenceMove>,
     numeric_continuation: bool,
 }
@@ -266,7 +267,11 @@ pub fn process(
     } else {
         Vec::new()
     };
-    let mut plans = stage::plan_batches(&facts, min_length);
+    let mut plans = if context_enabled {
+        stage::plan_batches_page_local(&facts, min_length)
+    } else {
+        stage::plan_batches(&facts, min_length)
+    };
     let mut regex = RegexService {
         service: translator.clone(),
     };
@@ -284,28 +289,31 @@ pub fn process(
             }
         }
     }
-    let original_cross_page_pairs = stage::plan_batches(&facts, min_length)
-        .iter()
-        .filter(|plan| plan.kind == stage::GroupKind::CrossPage)
-        .filter_map(|plan| match plan.paragraphs.as_slice() {
-            [left, right] => Some([(left.page, left.index), (right.page, right.index)]),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    ordinary::rebuild_cross_page_inputs(
-        document,
-        &mut jobs,
-        &original_cross_page_pairs,
-        &translator,
-        &mut regex,
-        &patterns,
-        !disable_rich,
-        mapper,
-    )?;
+    if !context_enabled {
+        let original_cross_page_pairs = stage::plan_batches(&facts, min_length)
+            .iter()
+            .filter(|plan| plan.kind == stage::GroupKind::CrossPage)
+            .filter_map(|plan| match plan.paragraphs.as_slice() {
+                [left, right] => Some([(left.page, left.index), (right.page, right.index)]),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ordinary::rebuild_cross_page_inputs(
+            document,
+            &mut jobs,
+            &original_cross_page_pairs,
+            &translator,
+            &mut regex,
+            &patterns,
+            !disable_rich,
+            mapper,
+        )?;
+    }
     let mut accepted_pairs = Vec::new();
     let mut context_checklists = HashMap::new();
     let mut context_sentences = HashMap::new();
     let mut context_aliases = HashMap::new();
+    let mut partitioned_context_aliases = HashMap::new();
     let mut whole_sentences = HashMap::new();
     let mut numeric_pairs = std::collections::HashSet::new();
     if context_patterns.is_some() {
@@ -348,9 +356,15 @@ pub fn process(
             let ids = context_patterns.as_ref().expect("context patterns");
             let whole_sentence = match crate::cross_page::protected_ranges(&mut regex, &pair_inputs[0], ids)? {
                 Some(ranges) => {
-                    let plan = babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
-                        &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
+                    let plan = babeldoc_p2_stages::translation::cross_page_protocol::plan_partitioned_sentence(
+                        &pair_inputs[0], &pair_inputs[1], &ranges, &sentence, ids, &mut regex,
                     )?;
+                    let plan = match plan {
+                        Some(plan) => Some(plan),
+                        None => babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
+                            &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
+                        )?,
+                    };
                     match plan {
                         Some(plan) => Some(plan),
                         None => babeldoc_p2_stages::translation::cross_page_protocol::plan_plain_to_styled_sentence(
@@ -365,22 +379,35 @@ pub fn process(
             }
             if whole_sentence.is_none() { continue; }
             let request_inputs = whole_sentence.as_ref().map_or_else(|| pair_inputs.clone(), |plan| [plan.inputs.left.clone(), plan.inputs.right.clone()]);
-            let aliases = cross_page_context::StyleAliases::prepare(
-                &request_inputs, &sentence, ids, &mut regex,
-            ).unwrap_or(None);
-            let checklist_inputs = aliases.as_ref().map_or(&request_inputs, |value| &value.inputs);
-            let Some(mut checklist) = cross_page_context::placeholder_checklist(
-                checklist_inputs, context_patterns.as_ref().expect("context patterns"), &mut regex,
-            ).unwrap_or(None) else {
+            let following = whole_sentence.as_ref().and_then(|plan| plan.following.as_ref());
+            let aliases = if following.is_none() {
+                cross_page_context::StyleAliases::prepare(&request_inputs, &sentence, ids, &mut regex).unwrap_or(None)
+            } else { None };
+            let triple_inputs = following.map(|following| [request_inputs[0].clone(), request_inputs[1].clone(), following.clone()]);
+            let partitioned_aliases = triple_inputs.as_ref().and_then(|inputs| {
+                cross_page_context::StyleAliases::prepare(inputs, &sentence, ids, &mut regex).unwrap_or(None)
+            });
+            let checklist = if let Some(triple) = &triple_inputs {
+                let inputs = partitioned_aliases.as_ref().map_or(triple, |value| &value.inputs);
+                cross_page_context::placeholder_checklist(inputs, ids, &mut regex).unwrap_or(None)
+            } else {
+                let inputs = aliases.as_ref().map_or(&request_inputs, |value| &value.inputs);
+                cross_page_context::placeholder_checklist(inputs, ids, &mut regex).unwrap_or(None)
+            };
+            let Some(mut checklist) = checklist else {
                 if numeric { return Err(py_error("跨页数值续句无法校验占位符；请人工核对。")); }
                 continue
             };
-            if aliases.is_some() {
+            if aliases.is_some() || partitioned_aliases.is_some() {
                 checklist.push_str("\nSome numbered placeholders mark style boundaries. Preserve each one exactly and in order, and translate the human-readable text between them.");
             }
             let extra_tokens = count_tokens(&format!("{checklist}\n\n"));
             let sentence_tokens = count_tokens(&cross_page_context::read_only_sentence_block(&sentence));
-            let input_tokens = checklist_inputs.iter().map(|input| count_tokens(&input.text)).sum::<usize>();
+            let input_tokens = if let Some(triple) = &triple_inputs {
+                partitioned_aliases.as_ref().map_or(triple, |value| &value.inputs).iter().map(|input| count_tokens(&input.text)).sum::<usize>()
+            } else {
+                aliases.as_ref().map_or(&request_inputs, |value| &value.inputs).iter().map(|input| count_tokens(&input.text)).sum::<usize>()
+            };
             let mut trial_plans = plans.clone();
             crate::cross_page_llm::prioritize_context_pairs(
                 &mut trial_plans, &[(left, right)], &trial_jobs, min_length,
@@ -406,6 +433,7 @@ pub fn process(
                 if let Some(plan) = whole_sentence { whole_sentences.insert((left, right), plan); }
                 if numeric { numeric_pairs.insert((left, right)); }
                 if let Some(aliases) = aliases { context_aliases.insert((left, right), aliases); }
+                if let Some(aliases) = partitioned_aliases { partitioned_context_aliases.insert((left, right), aliases); }
             } else if numeric {
                 return Err(py_error("跨页数值续句无法安排成对翻译；请人工核对。"));
             }
@@ -492,6 +520,7 @@ pub fn process(
             && json_items.len() == 2
             && crate::cross_page_llm::is_context_pair(&accepted_pairs, &keys, &work_jobs, min_length);
         let aliases = if cross_page_context { context_aliases.get(&(keys[0], keys[1])).cloned() } else { None };
+        let partitioned_aliases = if cross_page_context { partitioned_context_aliases.get(&(keys[0], keys[1])).cloned() } else { None };
         let whole_sentence = if cross_page_context { whole_sentences.get(&(keys[0], keys[1])).cloned() } else { None };
         if let Some(plan) = &whole_sentence {
             for (item, input) in json_items.iter_mut().zip([&plan.inputs.left, &plan.inputs.right]) {
@@ -503,10 +532,24 @@ pub fn process(
                 item.0 = input.text.clone();
             }
         }
+        if let Some(plan) = &whole_sentence {
+            if let Some(following) = &plan.following {
+                json_items.push((following.text.clone(), work_jobs[1].layout_label.clone(), None));
+                if let Some(aliases) = &partitioned_aliases {
+                    for (item, input) in json_items.iter_mut().zip(&aliases.inputs) {
+                        item.0 = input.text.clone();
+                    }
+                }
+            }
+        }
         let serialized = stage::batch_json(&json_items, formula_hints);
         let prompt = if cross_page_context {
             let checklist = context_checklists.get(&(keys[0], keys[1])).expect("accepted context checklist");
-            if whole_sentence.is_some() {
+            if whole_sentence.as_ref().is_some_and(|plan| plan.following.is_some()) {
+                cross_page_context::render_partitioned_sentence_batch_prompt_with_checklist(
+                    &roles, &lang, &serialized, &matching_text, title, local_title, &glossaries, checklist,
+                )
+            } else if whole_sentence.is_some() {
                 cross_page_context::render_whole_sentence_batch_prompt_with_checklist(
                     &roles, &lang, &serialized, &matching_text, title, local_title, &glossaries, checklist,
                 )
@@ -546,6 +589,7 @@ pub fn process(
             cross_page_context,
             context_sentence: (cross_page_context && whole_sentence.is_none()).then(|| context_sentences.get(&(keys[0], keys[1])).cloned()).flatten(),
             context_aliases: aliases,
+            partitioned_aliases,
             numeric_continuation: cross_page_context && numeric_pairs.contains(&(keys[0], keys[1])),
             whole_sentence,
         });
@@ -816,7 +860,7 @@ pub fn process(
                         let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
                         let pair_inputs = [work.jobs[0].input.clone().expect("context input"), work.jobs[1].input.clone().expect("context input")];
                         if let Some(plan) = &work.whole_sentence {
-                            Ok(crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), &pair_inputs, &ids, &mut regex)?.is_some())
+                            Ok(crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), work.partitioned_aliases.as_ref(), &pair_inputs, &ids, &mut regex)?.is_some())
                         } else if let Some(aliases) = &work.context_aliases {
                             Ok(aliases.decode(&response, &ids, &mut regex)?.is_some())
                         } else {
@@ -858,7 +902,7 @@ pub fn process(
                             let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
                             let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
                             let pair_inputs = [work.jobs[0].input.clone().expect("context input"), work.jobs[1].input.clone().expect("context input")];
-                            crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), &pair_inputs, &ids, &mut regex)
+                            crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), work.partitioned_aliases.as_ref(), &pair_inputs, &ids, &mut regex)
                         })?.unwrap_or_default();
                     } else if let Some(aliases) = &work.context_aliases {
                         response = Python::attach(|py| -> PyResult<Option<String>> {

@@ -161,10 +161,18 @@ fn eligible(p: &ParagraphFacts, min_text_length: usize, body: bool) -> bool {
 /// Produces submissions in source order. `multi_paragraph_id` is assigned at
 /// submission time, before any worker can finish.
 pub fn plan_batches(pages: &[Vec<ParagraphFacts>], min_text_length: usize) -> Vec<BatchPlan> {
+    plan_batches_with_cross_page(pages, min_text_length, true)
+}
+
+pub fn plan_batches_page_local(pages: &[Vec<ParagraphFacts>], min_text_length: usize) -> Vec<BatchPlan> {
+    plan_batches_with_cross_page(pages, min_text_length, false)
+}
+
+fn plan_batches_with_cross_page(pages: &[Vec<ParagraphFacts>], min_text_length: usize, cross_page: bool) -> Vec<BatchPlan> {
     let mut translated = std::collections::HashSet::<ParagraphId>::new();
     let mut batches = Vec::new();
     let mut next_id = 1usize;
-    for page in 0..pages.len().saturating_sub(1) {
+    for page in 0..if cross_page { pages.len().saturating_sub(1) } else { 0 } {
         let left = pages[page]
             .iter()
             .enumerate()

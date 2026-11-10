@@ -133,6 +133,32 @@ fn style_aliases_round_trip_and_reject_damaged_responses() {
 }
 
 #[test]
+fn three_independent_items_reject_swapped_or_missing_following_text() {
+    let (inputs, mut regex, patterns) = fixture();
+    let third = TranslateInput { text: "A later sentence remains on this page.".into(), placeholders: vec![], original_tokens: vec![] };
+    let items = [inputs[0].clone(), inputs[1].clone(), third];
+    let aliases = cross_page_context::StyleAliases::prepare(&items, "context", &patterns, &mut regex).unwrap().unwrap();
+    let response = serde_json::json!([
+        {"id": 2, "output": "后续句子。"},
+        {"id": 1, "output": aliases.inputs[1].text},
+        {"id": 0, "output": aliases.inputs[0].text},
+    ]).to_string();
+    let decoded = aliases.decode(&response, &patterns, &mut regex).unwrap().unwrap();
+    assert!(cross_page_context::validate_items(&decoded, &items, &patterns, &mut regex).unwrap().is_some());
+    let missing = serde_json::json!([
+        {"id": 0, "output": aliases.inputs[0].text},
+        {"id": 1, "output": aliases.inputs[1].text},
+    ]).to_string();
+    assert!(aliases.decode(&missing, &patterns, &mut regex).unwrap().is_none());
+    let swapped = serde_json::json!([
+        {"id": 0, "output": aliases.inputs[0].text},
+        {"id": 1, "output": "后续句子。"},
+        {"id": 2, "output": aliases.inputs[1].text},
+    ]).to_string();
+    assert!(aliases.decode(&swapped, &patterns, &mut regex).unwrap().is_none());
+}
+
+#[test]
 fn style_aliases_require_compatible_formula_tokens() {
     let (inputs, mut regex, _) = fixture();
     let inputs = [inputs[1].clone(), TranslateInput { text: "Other paragraph".into(), placeholders: vec![], original_tokens: vec![] }];

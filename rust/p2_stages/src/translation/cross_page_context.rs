@@ -5,22 +5,22 @@ pub const MAX_CHECKLIST_BYTES: usize = 8192;
 pub const RETRY_INSTRUCTION: &str = "Return only the requested JSON. Preserve each item's placeholders exactly and in order.\n\n";
 
 #[derive(Clone, Debug)]
-pub struct StyleAliases {
-    pub inputs: [TranslateInput; 2],
-    originals: [TranslateInput; 2],
-    replacements: [Vec<(String, String)>; 2],
+pub struct StyleAliases<const N: usize = 2> {
+    pub inputs: [TranslateInput; N],
+    originals: [TranslateInput; N],
+    replacements: [Vec<(String, String)>; N],
 }
 
-impl StyleAliases {
+impl<const N: usize> StyleAliases<N> {
     pub fn prepare<R: PlaceholderRegex>(
-        inputs: &[TranslateInput; 2], context: &str, patterns: &[u64], regex: &mut R,
+        inputs: &[TranslateInput; N], context: &str, patterns: &[u64], regex: &mut R,
     ) -> Result<Option<Self>, R::Error> {
         if patterns.len() != 3 { return Ok(None); }
         for input in inputs {
             if !cross_page_protocol::validate_response(regex, input, &input.text, patterns)? { return Ok(None); }
         }
         let mut encoded = inputs.clone();
-        let mut replacements: [Vec<(String, String)>; 2] = std::array::from_fn(|_| Vec::new());
+        let mut replacements: [Vec<(String, String)>; N] = std::array::from_fn(|_| Vec::new());
         let mut next_id = 0u64;
         let mut original_patterns = Vec::new();
         for input in inputs {
@@ -87,17 +87,16 @@ impl StyleAliases {
     pub fn decode<R: PlaceholderRegex>(
         &self, response: &str, patterns: &[u64], regex: &mut R,
     ) -> Result<Option<String>, R::Error> {
-        let Some(mut outputs) = validate_pair(response, &self.inputs, patterns, regex)? else { return Ok(None) };
+        let Some(mut outputs) = validate_items(response, &self.inputs, patterns, regex)? else { return Ok(None) };
         for (output, replacements) in outputs.iter_mut().zip(&self.replacements) {
             for (alias, original) in replacements {
                 *output = output.replace(alias, original);
             }
         }
-        let decoded = serde_json::json!([
-            {"id": 0, "output": outputs[0]},
-            {"id": 1, "output": outputs[1]},
-        ]).to_string();
-        if validate_pair(&decoded, &self.originals, patterns, regex)?.is_none() { return Ok(None); }
+        let decoded = serde_json::to_string(&outputs.iter().enumerate().map(|(id, output)| {
+            serde_json::json!({"id": id, "output": output})
+        }).collect::<Vec<_>>()).expect("outputs serialize");
+        if validate_items(&decoded, &self.originals, patterns, regex)?.is_none() { return Ok(None); }
         Ok(Some(decoded))
     }
 }
@@ -123,8 +122,8 @@ pub fn should_retry(context: bool, request_succeeded: bool, structurally_valid: 
     context && request_succeeded && !structurally_valid && !already_retried && !cancelled
 }
 
-pub fn placeholder_checklist<R: PlaceholderRegex>(
-    inputs: &[TranslateInput; 2], patterns: &[u64], regex: &mut R,
+pub fn placeholder_checklist<R: PlaceholderRegex, const N: usize>(
+    inputs: &[TranslateInput; N], patterns: &[u64], regex: &mut R,
 ) -> Result<Option<String>, R::Error> {
     if patterns.len() != 3 { return Ok(None); }
     let mut lists = Vec::new();
@@ -192,6 +191,23 @@ pub fn render_whole_sentence_batch_prompt_with_checklist(
     render_prompt_with_checklist(template, role_block, lang_out, json_input, batch_text_for_glossary, title, local_title, glossaries, checklist)
 }
 
+pub fn render_partitioned_sentence_batch_prompt_with_checklist(
+    role_block: &str,
+    lang_out: &str,
+    json_input: &str,
+    batch_text_for_glossary: &str,
+    title: Option<(&str, &str)>,
+    local_title: Option<(&str, &str)>,
+    glossaries: &[Glossary],
+    checklist: &str,
+) -> String {
+    let template = llm_only::context_prompt_template().replace(
+        "The two input paragraphs contain a sentence continuing across a page boundary. Understand and translate that sentence as a whole, using both paragraphs as context. A word ending with a hyphen at the boundary may be a line-break fragment or an actual hyphenated compound: use the context and do not translate either fragment as a separate word. Make the two outputs read naturally in order. Return exactly one output for each original id. Preserve each paragraph's content and its own placeholders, tags, and code in that paragraph; do not add, omit, or move content between paragraphs.",
+        "The second input starts with a complete sentence that originally continued across a page boundary. Translate that complete sentence as one unit. The third input contains only the later text from the second page. Translate each input independently without moving content between IDs. Preserve spaces at the start of the third input. Return exactly one output for each id and preserve each input's placeholders, tags, and code.",
+    );
+    render_prompt_with_checklist(template, role_block, lang_out, json_input, batch_text_for_glossary, title, local_title, glossaries, checklist)
+}
+
 fn render_prompt_with_checklist(
     template: String,
     role_block: &str,
@@ -254,15 +270,25 @@ pub fn validate_pair<R: PlaceholderRegex>(
     patterns: &[u64],
     regex: &mut R,
 ) -> Result<Option<[String; 2]>, R::Error> {
+    validate_items(response, inputs, patterns, regex)
+}
+
+pub fn validate_items<R: PlaceholderRegex, const N: usize>(
+    response: &str,
+    inputs: &[TranslateInput; N],
+    patterns: &[u64],
+    regex: &mut R,
+) -> Result<Option<[String; N]>, R::Error> {
     let Ok(items) = serde_json::from_str::<Vec<Output>>(response) else { return Ok(None) };
-    if items.len() != 2 { return Ok(None); }
-    let mut outputs: [Option<String>; 2] = [None, None];
+    if items.len() != N { return Ok(None); }
+    let mut outputs: [Option<String>; N] = std::array::from_fn(|_| None);
     for item in items {
-        if item.id >= 2 || outputs[item.id].is_some() || item.output.trim().is_empty() { return Ok(None); }
+        if item.id >= N || outputs[item.id].is_some() || item.output.trim().is_empty() { return Ok(None); }
         outputs[item.id] = Some(item.output);
     }
-    let [Some(left), Some(right)] = outputs else { return Ok(None) };
-    for (input, output) in inputs.iter().zip([&left, &right]) {
+    let Some(outputs) = outputs.into_iter().collect::<Option<Vec<_>>>() else { return Ok(None) };
+    let Ok(outputs): Result<[String; N], _> = outputs.try_into() else { return Ok(None) };
+    for (input, output) in inputs.iter().zip(&outputs) {
         if !cross_page_protocol::validate_response(regex, input, output, patterns)? { return Ok(None); }
         if has_readable_outside_tokens(&input.text, patterns, regex)?
             && !has_readable_outside_tokens(output, patterns, regex)? { return Ok(None); }
@@ -277,5 +303,5 @@ pub fn validate_pair<R: PlaceholderRegex>(
             }
         }
     }
-    Ok(Some([left, right]))
+    Ok(Some(outputs))
 }

@@ -54,7 +54,9 @@ class DirectTranslator:
                 LEFT_TAIL + " several independent experiments.", TRANSLATED_SENTENCE,
             ).replace(LEFT_TAIL, "研究结果表明，在多项实验中取得了显著改进").replace(
                 "several independent experiments.", "多个相互独立的实验。",
-            ).replace(" Additional observations follow.", TRANSLATED_FOLLOWING)
+            ).replace(" Additional observations follow.", TRANSLATED_FOLLOWING).replace(
+                "Additional observations follow.", TRANSLATED_FOLLOWING,
+            )
             item.pop("layout_label", None)
         return json.dumps(items)
 
@@ -195,12 +197,71 @@ def test_direct_whole_sentence_success(tmp_path):
     assert len(tracking["cross_page"]) == 1
 
 
-def test_same_style_following_sentence_avoids_dedicated_request(tmp_path):
+def test_same_style_following_sentence_has_its_own_request_item(tmp_path):
     document = make_direct_document(split_following=False)
     service = DirectApplicationService()
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.requests
-    assert service.translator.cross_page_requests == 0
+    assert_direct_request(service)
+    items = json.loads(service.translator.requests[0].rsplit("## Here is the input:", 1)[1].strip())
+    assert len(items) == 3
+    assert "Additional observations follow." not in items[1]["input"]
+    assert "Additional observations follow." in items[2]["input"]
+    assert service.application_outputs == ["left", "left", "right"]
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    left, right = [page["pdf_paragraph"][0]["unicode"] for page in pages]
+    assert TRANSLATED_FOLLOWING not in left
+    assert TRANSLATED_FOLLOWING in right
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "empty"])
+def test_invalid_following_item_falls_back_for_both_pages(tmp_path, damage):
+    document = make_direct_document(split_following=False)
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def damaged(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if "## Cross-page continuation" not in prompt:
+            return response
+        items = json.loads(response)
+        if damage == "missing":
+            items.pop()
+        elif damage == "duplicate":
+            items[2]["id"] = 1
+        else:
+            items[2]["output"] = ""
+        return json.dumps(items)
+
+    service.translator.llm_translate = damaged
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 2
+    assert service.translator.fallback_requests == 2
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    left, right = [page["pdf_paragraph"][0]["unicode"] for page in pages]
+    assert "Additional observations follow." not in left
+    assert "Additional observations follow." in right
+
+
+def test_normalization_cannot_move_a_suffix_when_sentence_boundary_disappears(tmp_path):
+    document = make_direct_document(split_following=False)
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def damaged(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if "## Cross-page continuation" not in prompt:
+            return response
+        items = json.loads(response)
+        items[1]["output"] = items[1]["output"].replace(TRANSLATED_SENTENCE, "研究结果" + "。" * 20 + "另有无句界内容")
+        return json.dumps(items)
+
+    service.translator.llm_translate = damaged
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 2
+    assert service.translator.fallback_requests == 2
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    assert "Additional observations follow." not in pages[0]["pdf_paragraph"][0]["unicode"]
+    assert "Additional observations follow." in pages[1]["pdf_paragraph"][0]["unicode"]
 
 
 def test_direct_whole_sentence_keeps_the_next_sentence_on_its_page(tmp_path, monkeypatch):
@@ -327,8 +388,9 @@ def test_numeric_sentence_with_a_dropped_number_fails_without_mutation(tmp_path,
     assert not (tmp_path / "translate_tracking.json").exists()
 
 
+@pytest.mark.parametrize("split_following", [True, False])
 @pytest.mark.parametrize("failure", ["cancel", "second_output"])
-def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure):
+def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure, split_following):
     flag = _rust_il.CancelFlag()
     fired = []
 
@@ -342,7 +404,7 @@ def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure):
             fired.append(side)
             raise RuntimeError("injected direct second-output failure")
 
-    document = make_direct_document()
+    document = make_direct_document(split_following=split_following)
     before = document.parser_artifact_hash()
     service = DirectApplicationService(fail)
     expected = asyncio.CancelledError if failure == "cancel" else RuntimeError
@@ -359,8 +421,9 @@ def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure):
     assert document.parser_artifact_hash() == before
 
 
-def test_direct_whole_sentence_tracking_publish_failure_rolls_back(tmp_path):
-    document = make_direct_document()
+@pytest.mark.parametrize("split_following", [True, False])
+def test_direct_whole_sentence_tracking_publish_failure_rolls_back(tmp_path, split_following):
+    document = make_direct_document(split_following=split_following)
     before = document.parser_artifact_hash()
     destination = tmp_path / "translate_tracking.json"
     service = DirectApplicationService()

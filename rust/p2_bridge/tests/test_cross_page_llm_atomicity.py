@@ -40,7 +40,6 @@ class Translator:
         if "## Cross-page continuation" in prompt:
             self.cross_page_requests += 1
         items = json.loads(prompt.rsplit(marker, 1)[1].strip())
-        assert len(items) == 2
         return json.dumps([{"id": item["id"], "output": item["input"]} for item in items])
 
 
@@ -134,5 +133,5 @@ def test_formula_application_control(tmp_path):
     service = ApplicationService()
     run(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.cross_page_requests == 0
-    assert len(json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))["cross_page"]) == 1
+    assert json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))["cross_page"] == []
     assert document.parser_artifact_hash() != before

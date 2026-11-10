@@ -133,3 +133,5 @@ def test_ambiguous_boundary_stays_out_of_cross_page_request(tmp_path, kwargs):
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.requests
     assert service.translator.cross_page_requests == 0
+    tracking = json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))
+    assert tracking["cross_page"] == []

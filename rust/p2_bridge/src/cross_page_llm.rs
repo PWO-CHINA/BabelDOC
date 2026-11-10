@@ -16,10 +16,35 @@ pub(crate) fn reflow_response(
     plan: &WholeSentenceMove,
     response: &str,
     aliases: Option<&StyleAliases>,
+    partitioned_aliases: Option<&StyleAliases<3>>,
     originals: &[babeldoc_p2_stages::translation::ordinary_translation::TranslateInput; 2],
     patterns: &[u64],
     regex: &mut RegexService<'_>,
 ) -> PyResult<Option<String>> {
+    if let Some(following) = &plan.following {
+        let decoded = match partitioned_aliases {
+            Some(aliases) => match aliases.decode(response, patterns, regex)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+            None => response.to_owned(),
+        };
+        let moved = [plan.inputs.left.clone(), plan.inputs.right.clone(), following.clone()];
+        let Some(outputs) = babeldoc_p2_stages::translation::cross_page_context::validate_items(
+            &decoded, &moved, patterns, regex,
+        )? else { return Ok(None) };
+        let outputs = outputs.map(|output| babeldoc_p2_stages::translation::ordinary_translation::normalize_response_punctuation(&output));
+        let Some((left, right)) = cross_page_protocol::reflow_partitioned_response(
+            plan, &outputs[0], &outputs[1], &outputs[2], &originals[0], &originals[1], patterns, regex,
+        )? else { return Ok(None) };
+        let response = serde_json::json!([
+            {"id": 0, "output": left}, {"id": 1, "output": right},
+        ]).to_string();
+        if babeldoc_p2_stages::translation::cross_page_context::validate_pair(
+            &response, originals, patterns, regex,
+        )?.is_none() { return Ok(None); }
+        return Ok(Some(response));
+    }
     let decoded = match aliases {
         Some(aliases) => match aliases.decode(response, patterns, regex)? {
             Some(value) => value,
@@ -31,6 +56,7 @@ pub(crate) fn reflow_response(
     let Some(outputs) = babeldoc_p2_stages::translation::cross_page_context::validate_pair(
         &decoded, &moved, patterns, regex,
     )? else { return Ok(None) };
+    let outputs = outputs.map(|output| babeldoc_p2_stages::translation::ordinary_translation::normalize_response_punctuation(&output));
     let Some((left, right)) = cross_page_protocol::reflow_whole_sentence_response(
         plan, &outputs[0], &outputs[1], &originals[0], &originals[1], patterns, regex,
     )? else { return Ok(None) };

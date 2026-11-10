@@ -484,6 +484,66 @@ fn reflow_handles_a_long_whitespace_run() {
 }
 
 #[test]
+fn partitioned_following_sentence_stays_on_the_right_page() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent groups. A later finding follows.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &left, &right, &[], "improved outcomes across multiple independent groups.", &patterns, &mut regex,
+    ).unwrap().is_none());
+    let plan = cross_page_protocol::plan_partitioned_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
+    assert_eq!(plan.inputs.right.text, "<style id='2'>The treatment improved outcomes across multiple independent groups.</style>");
+    assert_eq!(plan.following.as_ref().unwrap().text, "<style id='2'> A later finding follows.</style>");
+    let (first, second) = cross_page_protocol::reflow_partitioned_response(
+        &plan, "前文。", "<style id='2'>研究显示多个独立群体的结果有所改善。</style>",
+        "<style id='2'>后续发现保留在第二页。</style>", &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert!(!first.contains("后续发现"));
+    assert!(second.contains("后续发现"));
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")), "前文。研究显示多个独立群体的结果有所改善。后续发现保留在第二页。");
+    let (first, second) = cross_page_protocol::reflow_partitioned_response(
+        &plan, "Earlier work was described.", "<style id='2'>The complete sentence ends here.</style>",
+        "<style id='2'>Another finding follows.</style>", &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")),
+        "Earlier work was described. The complete sentence ends here. Another finding follows.");
+    for malformed in ["<style id='2'>研究结果没有句界</style>", "<style id='2'>研究先结束。另一句被移入。</style>"] {
+        assert!(cross_page_protocol::reflow_partitioned_response(
+            &plan, "前文。", malformed, "<style id='2'>后续发现。</style>", &left, &right, &patterns, &mut regex,
+        ).unwrap().is_none());
+    }
+}
+
+#[test]
+fn partitioned_reflow_rejects_a_sentence_crossing_style_boundaries() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent</style><style id='3'> groups. A later finding follows.</style>".into(), placeholders: vec![rich(2), rich(3)], original_tokens: vec![] };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    assert!(cross_page_protocol::plan_partitioned_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().is_none());
+}
+
+#[test]
+fn partitioned_reflow_joins_a_following_style_without_a_tag_space() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent groups.</style><style id='3'> A later finding follows.</style>".into(), placeholders: vec![rich(2), rich(3)], original_tokens: vec![] };
+    let plan = cross_page_protocol::plan_partitioned_sentence(
+        &left, &right, &[], "The treatment improved outcomes across multiple independent groups.", &patterns, &mut regex,
+    ).unwrap().unwrap();
+    let (first, second) = cross_page_protocol::reflow_partitioned_response(
+        &plan, "前文。", "<style id='2'>研究显示多个独立群体有所改善。</style>",
+        "<style id='3'>后续发现。</style>", &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("<style id='3'>", "").replace("</style>", "")),
+        "前文。研究显示多个独立群体有所改善。后续发现。");
+}
+
+#[test]
 fn reflow_declines_ambiguous_abbreviations_and_parenthesized_sentences() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
