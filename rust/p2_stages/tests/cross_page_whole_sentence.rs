@@ -517,6 +517,102 @@ fn partitioned_following_sentence_stays_on_the_right_page() {
 }
 
 #[test]
+fn partitioned_sentence_after_formula_uses_the_verified_source_boundary() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let formula = InputPlaceholder::Formula(FormulaInput {
+        id: 1, composition_index: 1, token: "{v1}".into(), pattern: r"\{v1\}".into(), source_chars: "x".into(), hint_source: false,
+    });
+    let left = TranslateInput {
+        text: "Previous findings were clear{v1}. The treatment improved outcomes across".into(),
+        placeholders: vec![formula], original_tokens: vec![],
+    };
+    let right = TranslateInput {
+        text: "<style id='2'>multiple independent groups. A later finding follows.</style>".into(),
+        placeholders: vec![rich(2)], original_tokens: vec![],
+    };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    let start = left.text.find("{v1}").unwrap();
+    let ranges = [start..start + "{v1}".len()];
+    let plan = cross_page_protocol::plan_partitioned_sentence(&left, &right, &ranges, sentence, &patterns, &mut regex).unwrap().unwrap();
+    assert_eq!(plan.inputs.left.text, "Previous findings were clear{v1}. ");
+    assert_eq!(plan.inputs.right.text, "<style id='2'>The treatment improved outcomes across multiple independent groups.</style>");
+    assert_eq!(plan.following.as_ref().unwrap().text, "<style id='2'> A later finding follows.</style>");
+    let (first, second) = cross_page_protocol::reflow_partitioned_response(
+        &plan, "此前的结果明确{v1}。", "<style id='2'>研究显示多个独立群体的结果有所改善。</style>",
+        "<style id='2'>后续发现保留在第二页。</style>", &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert!(first.contains("{v1}"));
+    assert!(!first.contains("后续发现"));
+    assert!(second.contains("后续发现"));
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")),
+        "此前的结果明确{v1}。研究显示多个独立群体的结果有所改善。后续发现保留在第二页。");
+    for incorrect in [
+        "improved outcomes across multiple independent groups.",
+        "Previous findings were clear x. The treatment improved outcomes across multiple independent groups.",
+    ] {
+        assert!(cross_page_protocol::plan_partitioned_sentence(
+            &left, &right, &ranges, incorrect, &patterns, &mut regex,
+        ).unwrap().is_none());
+    }
+    let mut obscured = left.clone();
+    let InputPlaceholder::Formula(formula) = &mut obscured.placeholders[0] else { unreachable!() };
+    formula.source_chars.clear();
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &obscured, &right, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &left, &right, &[start..left.text.len()], sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+    let overlap = TranslateInput {
+        text: "Previous findings were clear. The treatment improved {v1} across".into(),
+        placeholders: left.placeholders.clone(), original_tokens: vec![],
+    };
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &overlap, &right, &[], "The treatment improved x across multiple independent groups.", &patterns, &mut regex,
+    ).unwrap().is_none());
+    let mut crossing = right.clone();
+    crossing.text = "<style id='2'>multiple independent</style><style id='3'> groups. A later finding follows.</style>".into();
+    crossing.placeholders.push(rich(3));
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &left, &crossing, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+}
+
+#[test]
+fn partitioned_sentence_after_numeric_formula_accepts_only_proven_boundary() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput {
+        text: "Previous measurements included samples {v1}. The treatment improved outcomes across".into(),
+        placeholders: vec![InputPlaceholder::Formula(FormulaInput {
+            id: 1, composition_index: 1, token: "{v1}".into(), pattern: r"\{v1\}".into(), source_chars: "20".into(), hint_source: true,
+        })], original_tokens: vec![],
+    };
+    let right = TranslateInput {
+        text: "<style id='2'>multiple independent groups. A later finding follows.</style>".into(),
+        placeholders: vec![rich(2)], original_tokens: vec![],
+    };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    let start = left.text.find("{v1}").unwrap();
+    let ranges = [start..start + "{v1}".len()];
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &left, &right, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_some());
+    let mut ambiguous = left.clone();
+    let InputPlaceholder::Formula(formula) = &mut ambiguous.placeholders[0] else { unreachable!() };
+    formula.source_chars = "3.14".into();
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &ambiguous, &right, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+    let InputPlaceholder::Formula(formula) = &mut ambiguous.placeholders[0] else { unreachable!() };
+    formula.source_chars = "?".into();
+    assert!(cross_page_protocol::plan_partitioned_sentence(
+        &ambiguous, &right, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+}
+
+#[test]
 fn partitioned_reflow_rejects_a_sentence_crossing_style_boundaries() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];

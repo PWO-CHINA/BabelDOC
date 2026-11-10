@@ -334,6 +334,23 @@ pub fn plan_partitioned_sentence<R: PlaceholderRegex>(
         _ => return Ok(None),
     };
     let first_style = &right_content[..right_close];
+    let mut restored_left = None;
+    if !left.placeholders.is_empty() && left.placeholders.iter().all(|item| matches!(item, InputPlaceholder::Formula(_))) {
+        let mut restored = String::new();
+        let mut cursor = 0;
+        for placeholder in &left.placeholders {
+            let InputPlaceholder::Formula(formula) = placeholder else { unreachable!() };
+            if !formula.source_chars.chars().any(char::is_alphanumeric) { return Ok(None); }
+            let Some(offset) = left.text[cursor..].find(&formula.token) else { return Ok(None) };
+            let start = cursor + offset;
+            restored.push_str(&left.text[cursor..start]);
+            restored.push_str(&formula.source_chars);
+            cursor = start + formula.token.len();
+        }
+        restored.push_str(&left.text[cursor..]);
+        restored_left = Some(restored);
+    }
+    let source_left = restored_left.as_deref().unwrap_or(left_text);
     let source_sentence = if rich.is_some() {
         let mut plain = right.text.clone();
         for placeholder in &right.placeholders {
@@ -341,9 +358,9 @@ pub fn plan_partitioned_sentence<R: PlaceholderRegex>(
                 plain = plain.replace(&rich.left, "").replace(&rich.right, "");
             }
         }
-        super::cross_page::extract_context_sentence(left_text, &plain)
+        super::cross_page::extract_context_sentence(source_left, &plain)
     } else {
-        super::cross_page::extract_context_sentence(left_text, &right.text)
+        super::cross_page::extract_context_sentence(source_left, &right.text)
     };
     if source_sentence.as_deref() != Some(sentence) { return Ok(None); }
     let mut continuation = None;

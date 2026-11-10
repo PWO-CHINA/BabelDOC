@@ -213,6 +213,84 @@ def test_same_style_following_sentence_has_its_own_request_item(tmp_path):
     assert TRANSLATED_FOLLOWING in right
 
 
+def test_formula_before_sentence_does_not_hide_its_boundary(tmp_path):
+    pages = []
+    for index in range(2):
+        base = il.PdfStyle(font_id="regular", font_size=10.0)
+        formula_text = "observations" if index == 0 else "x"
+        formula = il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[
+            il.PdfCharacter(pdf_style=base, char_unicode=formula_text),
+        ]))
+        if index == 0:
+            text = "Previous findings confirmed observations. The treatment improved outcomes across"
+            compositions = [
+                il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
+                    pdf_style=base, char_unicode="Previous findings confirmed ",
+                )),
+                formula,
+                il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
+                    pdf_style=base, char_unicode=". The treatment improved outcomes across",
+                )),
+            ]
+        else:
+            text = "multiple independent groups. A later finding follows."
+            rich = il.PdfStyle(
+                font_id="regular", font_size=10.0,
+                graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"),
+            )
+            compositions = [
+                il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
+                    pdf_style=rich, pdf_character=[il.PdfCharacter(pdf_style=rich, char_unicode=text)],
+                )),
+                formula,
+            ]
+        paragraph = il.PdfParagraph(
+            box=il.Box(x=60, y=80 if index == 0 else 650, x2=540, y2=150 if index == 0 else 720),
+            pdf_style=base, unicode=text, debug_id=f"formula-boundary-{index}", layout_label="text",
+            pdf_paragraph_composition=compositions,
+        )
+        pages.append(il.Page(
+            page_number=index, cropbox=il.Cropbox(box=il.Box(x=0, y=0, x2=600, y2=800)),
+            pdf_font=[il.PdfFont(font_id="regular", bold=False, italic=False, monospace=False, serif=False)],
+            pdf_paragraph=[paragraph],
+        ))
+    document = _rust_il.transfer_document(il.Document(page=pages, total_pages=2))
+    service = DirectApplicationService()
+
+    def translate(prompt, rate_limit_params=None):
+        service.translator.requests.append(prompt)
+        if "## Here is the input:" not in prompt:
+            service.translator.fallback_requests += 1
+            return prompt.rsplit("Now translate the following text:", 1)[1].strip()
+        service.translator.cross_page_requests += "## Cross-page continuation" in prompt
+        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
+        for item in items:
+            item["output"] = item.pop("input").replace(
+                "Previous findings confirmed {v1}.", "此前的结果已确认{v1}。",
+            ).replace(
+                "The treatment improved outcomes across multiple independent groups.",
+                "研究显示多个独立群体的结果有所改善。",
+            ).replace(" A later finding follows.", "后续发现保留在第二页。")
+            item.pop("layout_label", None)
+        return json.dumps(items)
+
+    service.translator.llm_translate = translate
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 1
+    assert service.translator.fallback_requests == 0
+    items = json.loads(service.translator.requests[0].rsplit("## Here is the input:", 1)[1].strip())
+    assert len(items) == 3
+    assert "The treatment improved outcomes across multiple independent groups." in items[1]["input"]
+    assert "A later finding follows." in items[2]["input"]
+    output_pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    first, second = [page["pdf_paragraph"][0]["unicode"] for page in output_pages]
+    assert "此前的结果已确认" in first
+    assert "后续发现" not in first
+    assert "后续发现保留在第二页。" in second
+    joined = re.sub(r"</?b\d+>", "", first + second)
+    assert "研究显示多个独立群体的结果有所改善。" in joined
+
+
 @pytest.mark.parametrize("damage", ["missing", "duplicate", "empty"])
 def test_invalid_following_item_falls_back_for_both_pages(tmp_path, damage):
     document = make_direct_document(split_following=False)
