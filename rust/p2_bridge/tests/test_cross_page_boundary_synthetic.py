@@ -35,7 +35,7 @@ def paragraph(text, bounds, label="text", size=10.0):
 
 def fixture(*, size=10.0, labelled_caption=False, neighbour_caption=False,
             caption_size=7.0, title=False, running_header=False, single_header=False, page_number=1,
-            left_text=LEFT_PREFIX + LEFT_TAIL, right_text="several independent experiments."):
+            left_text=LEFT_PREFIX + LEFT_TAIL, right_text="several independent experiments.", styled=False):
     left = paragraph(left_text, (310, 60, 550, 145),
                      label="figure_caption" if labelled_caption else "text", size=size)
     left_items = [
@@ -57,6 +57,28 @@ def fixture(*, size=10.0, labelled_caption=False, neighbour_caption=False,
         right_items.append(paragraph("Review article", (40, 730, 135, 754), label="title"))
     if single_header:
         right_items.append(paragraph("Review article", (40, 730, 135, 748), label="title"))
+    if styled:
+        for target in (left, right_items[0]):
+            style = il.PdfStyle(font_id="regular", font_size=10.0,
+                                graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"))
+            text = target.unicode
+            if target is left:
+                prefix, tail = text.split("clear. ", 1)
+                target.pdf_paragraph_composition = [
+                    il.PdfParagraphComposition(pdf_character=il.PdfCharacter(pdf_style=target.pdf_style, char_unicode=prefix + "clear. ")),
+                    il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
+                        pdf_style=style, pdf_character=[il.PdfCharacter(pdf_style=style, char_unicode=tail)]
+                    )),
+                ]
+            else:
+                target.pdf_paragraph_composition = [
+                    il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
+                        pdf_style=style, pdf_character=[il.PdfCharacter(pdf_style=style, char_unicode=text)]
+                    )),
+                    il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[
+                        il.PdfCharacter(pdf_style=target.pdf_style, char_unicode="x")
+                    ])),
+                ]
     font = il.PdfFont(font_id="regular", bold=False, italic=False, monospace=False, serif=False)
     pages = [
         il.Page(page_number=number, cropbox=il.Cropbox(box=il.Box(x=0, y=0, x2=600, y2=800)),
@@ -116,6 +138,16 @@ def test_identity_sentence_retains_each_page_anchor(tmp_path):
     right = pages[1]["pdf_paragraph"][0]["unicode"]
     assert "synthetic left anchor" in left
     assert "synthetic right anchor" in right
+
+
+@pytest.mark.parametrize("right_text", ["several independent experiments.",
+                                        "several independent experiments. Additional observations follow."])
+def test_unproven_boundary_styles_do_not_use_reflow(tmp_path, right_text):
+    document = fixture(right_text=right_text, styled=True)
+    service = DirectApplicationService()
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.requests
+    assert service.translator.cross_page_requests == 0
 
 
 @pytest.mark.parametrize("kwargs", [

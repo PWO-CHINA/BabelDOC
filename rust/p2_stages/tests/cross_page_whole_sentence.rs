@@ -527,6 +527,16 @@ fn partitioned_reflow_rejects_a_sentence_crossing_style_boundaries() {
 }
 
 #[test]
+fn partitioned_reflow_rejects_incompatible_styled_page_boundary() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "<style id='1'>Earlier work was described. The treatment improved outcomes across</style>".into(), placeholders: vec![rich(1)], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent groups. A later finding follows.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    assert!(cross_page_protocol::plan_partitioned_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().is_none());
+}
+
+#[test]
 fn partitioned_reflow_joins_a_following_style_without_a_tag_space() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];

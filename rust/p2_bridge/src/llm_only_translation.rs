@@ -361,6 +361,7 @@ pub fn process(
                     )?;
                     let plan = match plan {
                         Some(plan) => Some(plan),
+                        None if matches!(pair_inputs[0].placeholders.last(), Some(ordinary_stage::InputPlaceholder::Rich(_))) => None,
                         None => babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
                             &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
                         )?,

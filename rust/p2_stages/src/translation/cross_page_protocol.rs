@@ -394,7 +394,7 @@ pub fn plan_partitioned_sentence<R: PlaceholderRegex>(
         },
     };
     let Some(mut plan) = plan else { return Ok(None) };
-    if plan.sentence != sentence { return Ok(None); }
+    if plan.sentence != sentence || plan.left_styled { return Ok(None); }
     plan.following = Some(following);
     plan.sentence_right = Some(sentence_right);
     plan.following_joins_style = following_joins_style;
