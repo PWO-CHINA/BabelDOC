@@ -1608,6 +1608,16 @@ pub fn process(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<()> {
+    let cross_page_experiment = config
+        .getattr("experimental_cross_page_context")
+        .ok()
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    if cross_page_experiment {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Experimental cross-page translation requires an LLM translator; ordinary translators are not supported.",
+        ));
+    }
     let _native_font_mapper = &mapper.mapper;
     let root = crate::shared_context::root_from_handle(shared_context)?;
     let translator = translator_service.bind(py).clone();
@@ -1648,11 +1658,6 @@ pub fn process(
         false,
         mapper,
     )?;
-    let cross_page_experiment = config
-        .getattr("experimental_cross_page_context")
-        .ok()
-        .and_then(|value| value.extract::<bool>().ok())
-        .unwrap_or(false);
     let candidates = if cross_page_experiment {
         crate::cross_page::find_pairs(document, config).unwrap_or_default()
     } else {

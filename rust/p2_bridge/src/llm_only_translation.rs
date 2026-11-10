@@ -347,9 +347,17 @@ pub fn process(
             };
             let ids = context_patterns.as_ref().expect("context patterns");
             let whole_sentence = match crate::cross_page::protected_ranges(&mut regex, &pair_inputs[0], ids)? {
-                Some(ranges) => babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
-                    &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
-                )?,
+                Some(ranges) => {
+                    let plan = babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
+                        &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
+                    )?;
+                    match plan {
+                        Some(plan) => Some(plan),
+                        None => babeldoc_p2_stages::translation::cross_page_protocol::plan_plain_to_styled_sentence(
+                            &pair_inputs[0], &pair_inputs[1], &ranges, &sentence, ids, &mut regex,
+                        )?,
+                    }
+                },
                 None => None,
             };
             if numeric && whole_sentence.is_none() {

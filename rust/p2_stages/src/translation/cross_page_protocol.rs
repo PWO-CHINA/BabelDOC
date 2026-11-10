@@ -94,7 +94,8 @@ pub struct WholeSentenceMove {
     pub sentence: String,
     left_weight: usize,
     right_weight: usize,
-    styled: bool,
+    left_styled: bool,
+    right_styled: bool,
 }
 
 pub fn plan_whole_sentence_on_right<R: PlaceholderRegex>(
@@ -142,7 +143,7 @@ pub fn plan_whole_sentence_reflow<R: PlaceholderRegex>(
             || !validate_response(regex, &moved_right, &moved_right.text, patterns)? { return Ok(None); }
         return Ok(Some(WholeSentenceMove {
             inputs: CrossPageInputs { left: moved_left, right: moved_right }, sentence,
-            left_weight: tail.chars().count(), right_weight: continuation.chars().count(), styled: false,
+            left_weight: tail.chars().count(), right_weight: continuation.chars().count(), left_styled: false, right_styled: false,
         }));
     }
     let (Some(InputPlaceholder::Rich(left_rich)), Some(InputPlaceholder::Rich(right_rich))) =
@@ -212,7 +213,67 @@ pub fn plan_whole_sentence_reflow<R: PlaceholderRegex>(
         || !validate_response(regex, &moved_right, &moved_right.text, patterns)? { return Ok(None); }
     Ok(Some(WholeSentenceMove {
         inputs: CrossPageInputs { left: moved_left, right: moved_right }, sentence,
-        left_weight: tail.chars().count(), right_weight: continuation.chars().count(), styled: true,
+        left_weight: tail.chars().count(), right_weight: continuation.chars().count(), left_styled: true, right_styled: true,
+    }))
+}
+
+pub fn plan_plain_to_styled_sentence<R: PlaceholderRegex>(
+    left: &TranslateInput,
+    right: &TranslateInput,
+    left_protected: &[Range<usize>],
+    sentence: &str,
+    patterns: &[u64],
+    regex: &mut R,
+) -> Result<Option<WholeSentenceMove>, R::Error> {
+    if !left.original_tokens.is_empty() || !right.original_tokens.is_empty()
+        || left.placeholders.iter().any(|item| !matches!(item, InputPlaceholder::Formula(_)))
+        || !validate_response(regex, left, &left.text, patterns)?
+        || !validate_response(regex, right, &right.text, patterns)? { return Ok(None); }
+    let Some(InputPlaceholder::Rich(right_rich)) = right.placeholders.first() else { return Ok(None) };
+    if !right_rich.left.starts_with('<') || !right_rich.left.ends_with('>')
+        || !right_rich.right.starts_with('<') || !right_rich.right.ends_with('>') {
+        return Ok(None);
+    }
+    let Some(right_content) = right.text.strip_prefix(&right_rich.left) else { return Ok(None) };
+    let Some(close) = right_content.find(&right_rich.right) else { return Ok(None) };
+    let first_style = &right_content[..close];
+    let mut matching = None;
+    for (offset, character) in sentence.char_indices() {
+        if !character.is_whitespace() { continue; }
+        let tail = sentence[..offset].trim_end();
+        let continuation = sentence[offset..].trim_start();
+        if tail.is_empty() || continuation.is_empty() { continue; }
+        if left.text.trim_end().ends_with(tail) && first_style.starts_with(continuation) {
+            if matching.is_some() { return Ok(None); }
+            matching = Some((tail, continuation));
+        }
+    }
+    let Some((tail, continuation)) = matching else { return Ok(None) };
+    if tail.ends_with('-') || !continuation.ends_with(['.', '!', '?', '。', '！', '？']) {
+        return Ok(None);
+    }
+    if first_style[continuation.len()..].chars().next().is_some_and(|character| !character.is_whitespace()) {
+        return Ok(None);
+    }
+    for pattern in patterns {
+        if !regex.find_all(*pattern, sentence)?.is_empty() { return Ok(None); }
+    }
+    let Some(prefix) = left.text.trim_end().strip_suffix(tail) else { return Ok(None) };
+    if !prefix.chars().any(char::is_alphanumeric) { return Ok(None); }
+    let start = prefix.len();
+    if left_protected.iter().any(|range| range.start >= range.end || range.end > left.text.len()
+        || !left.text.is_char_boundary(range.start) || !left.text.is_char_boundary(range.end)
+        || (range.start < left.text.len() && range.end > start)) { return Ok(None); }
+    let mut moved_left = left.clone();
+    moved_left.text = prefix.to_owned();
+    let mut moved_right = right.clone();
+    moved_right.text = format!("{}{tail} {right_content}", right_rich.left);
+    if !validate_response(regex, &moved_left, &moved_left.text, patterns)?
+        || !validate_response(regex, &moved_right, &moved_right.text, patterns)? { return Ok(None); }
+    Ok(Some(WholeSentenceMove {
+        inputs: CrossPageInputs { left: moved_left, right: moved_right }, sentence: sentence.to_owned(),
+        left_weight: tail.chars().count(), right_weight: continuation.chars().count(),
+        left_styled: false, right_styled: true,
     }))
 }
 
@@ -227,22 +288,25 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
 ) -> Result<Option<(String, String)>, R::Error> {
     if !validate_response(regex, &plan.inputs.left, left_output, patterns)?
         || !validate_response(regex, &plan.inputs.right, right_output, patterns)? { return Ok(None); }
-    let (left_prefix, left_close, right_open, right_content, close) = if plan.styled {
-        let (Some(InputPlaceholder::Rich(left_rich)), Some(InputPlaceholder::Rich(right_rich))) =
-            (original_left.placeholders.last(), original_right.placeholders.first()) else { return Ok(None) };
+    let (left_prefix, left_close) = if plan.left_styled {
+        let Some(InputPlaceholder::Rich(left_rich)) = original_left.placeholders.last() else { return Ok(None) };
         let Some(left_prefix) = left_output.strip_suffix(&left_rich.right) else { return Ok(None) };
+        (left_prefix, left_rich.right.as_str())
+    } else {
+        (left_output, "")
+    };
+    let (right_open, right_content, close) = if plan.right_styled {
+        let Some(InputPlaceholder::Rich(right_rich)) = original_right.placeholders.first() else { return Ok(None) };
         let Some(right_content) = right_output.strip_prefix(&right_rich.left) else { return Ok(None) };
         let Some(close) = right_content.find(&right_rich.right) else { return Ok(None) };
-        (left_prefix, left_rich.right.as_str(), right_rich.left.as_str(), right_content, close)
+        (right_rich.left.as_str(), right_content, close)
     } else {
-        if !original_left.placeholders.is_empty() || !original_right.placeholders.is_empty() { return Ok(None); }
-        (left_output, "", "", right_output, right_output.len())
+        ( "", right_output, right_output.len())
     };
     let content = &right_content[..close];
-    let total = content.chars().count();
     let Some(weight) = plan.left_weight.checked_add(plan.right_weight) else { return Ok(None) };
     if weight == 0 { return Ok(None); }
-    let target = total.saturating_mul(plan.left_weight) / weight;
+    let mut sentence_length = content.chars().count();
     let mut candidates = Vec::new();
     let mut depth = 0usize;
     for (position, (offset, character)) in content.char_indices().enumerate() {
@@ -254,6 +318,7 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
                 !word.is_empty() && (word.chars().count() <= 3 || matches!(word.to_ascii_lowercase().as_str(), "prof" | "assoc" | "dept" | "approx" | "figs" | "etc"))
             };
             if !abbreviation && (character != '.' || after.chars().next().is_none_or(char::is_whitespace)) {
+                sentence_length = position + 1;
                 break;
             }
         }
@@ -267,7 +332,7 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
             if word_boundary && !bad_start && !bad_end && !inside_word
                 && content[..offset].chars().any(char::is_alphanumeric)
                 && content[offset..].chars().any(char::is_alphanumeric) {
-                candidates.push((position.abs_diff(target), offset));
+                candidates.push((position, offset));
             }
         }
         match character {
@@ -276,7 +341,8 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
             _ => {},
         }
     }
-    candidates.sort_unstable();
+    let target = sentence_length.saturating_mul(plan.left_weight) / weight;
+    candidates.sort_unstable_by_key(|(position, offset)| (position.abs_diff(target), *offset));
     for (_, offset) in candidates {
         let first = &content[..offset];
         let rest = &right_content[offset..];

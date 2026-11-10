@@ -193,6 +193,86 @@ fn plain_paragraphs_translate_the_complete_sentence_before_reflow() {
 }
 
 #[test]
+fn reflow_split_ignores_sentences_after_the_first() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
+    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
+    let first_sentence = "Dr. Lane (see Fig. 2) reported significant improvements across multiple groups.";
+    let mut splits = Vec::new();
+    for following in ["", " Another result.", " A much longer subsequent result describes unrelated findings and adds enough words to alter the target considerably."] {
+        let output = format!("<style id='2'>{first_sentence}{following}</style>");
+        let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+            &plan, "Earlier work was described.", &output, &left, &right, &patterns, &mut regex,
+        ).unwrap().unwrap();
+        assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")), format!("Earlier work was described. {first_sentence}{following}"));
+        splits.push(first);
+    }
+    assert_eq!(splits[0], splits[1]);
+    assert_eq!(splits[0], splits[2]);
+    assert!(splits[0].contains("Dr. Lane (see Fig. 2)"));
+}
+
+#[test]
+fn reflow_accepts_first_style_without_sentence_ending() {
+    let (left, right, mut regex, patterns) = fixture();
+    let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
+    let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+        &plan, "<style id='1'>Earlier work was described.</style>",
+        "<style id='2'>Dr. Lane (see Fig. 2) reported significant improvements across groups</style><style id='3'>6e</style><style id='4'> and further findings.</style>",
+        &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert!(first.contains("Dr. Lane (see Fig. 2)"));
+    assert!(second.contains("<style id='3'>6e</style>"));
+}
+
+#[test]
+fn joins_plain_and_styled_boundaries_only_for_the_verified_sentence() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let formula = |id| InputPlaceholder::Formula(FormulaInput {
+        id, composition_index: id as usize, token: format!("{{v{id}}}"), pattern: format!(r"\{{v{id}\}}"), source_chars: "x".into(), hint_source: false,
+    });
+    let left = TranslateInput {
+        text: "Prior results showed improvements{v1}. Although it remains uncertain, treatment has potential for circadian".into(),
+        placeholders: vec![formula(1)], original_tokens: vec![],
+    };
+    let right = TranslateInput {
+        text: "<style id='2'>disorders and associated conditions. The next finding is supported</style>{v3}.".into(),
+        placeholders: vec![rich(2), formula(3)], original_tokens: vec![],
+    };
+    let start = left.text.find("{v1}").unwrap();
+    let ranges = [start..start + 4];
+    let sentence = "Although it remains uncertain, treatment has potential for circadian disorders and associated conditions.";
+    let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &ranges, sentence, &patterns, &mut regex).unwrap().unwrap();
+    assert_eq!(plan.inputs.right.text, "<style id='2'>Although it remains uncertain, treatment has potential for circadian disorders and associated conditions. The next finding is supported</style>{v3}.");
+    let left_output = "此前的结果显示改善{v1}。";
+    let right_output = "<style id='2'>虽然仍不确定，该疗法有望治疗昼夜节律障碍及相关疾病。下一发现得到支持</style>{v3}。";
+    let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+        &plan, left_output, right_output, &left, &right, &patterns, &mut regex,
+    ).unwrap().unwrap();
+    assert!(!first.contains("<style"));
+    assert!(second.starts_with("<style id='2'>"));
+    assert!(second.contains("</style>{v3}。"));
+    assert_eq!(format!("{first}{}", second.replace("<style id='2'>", "").replace("</style>", "")),
+        format!("{left_output}{}", right_output.replace("<style id='2'>", "").replace("</style>", "")));
+    assert!(cross_page_protocol::plan_plain_to_styled_sentence(
+        &left, &right, &ranges, "A different sentence ends here.", &patterns, &mut regex,
+    ).unwrap().is_none());
+    assert!(cross_page_protocol::plan_plain_to_styled_sentence(
+        &left, &right, &[start..left.text.len()], sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+    let mut broken = right.clone();
+    broken.text = broken.text.replace("associated conditions.", "associated</style><style id='4'> conditions.");
+    broken.placeholders.insert(1, rich(4));
+    assert!(cross_page_protocol::plan_plain_to_styled_sentence(
+        &left, &broken, &ranges, sentence, &patterns, &mut regex,
+    ).unwrap().is_none());
+}
+
+#[test]
 fn reflow_declines_formulas_or_unknown_tokens_in_the_cross_page_sentence() {
     let (left, mut right, mut regex, patterns) = fixture();
     right.text = right.text.replace("11 samples", "11 {v9} samples");
