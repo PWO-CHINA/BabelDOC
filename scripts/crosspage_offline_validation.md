@@ -85,12 +85,15 @@ For an explicitly authorized live comparison, the separate
 `crosspage_single_request_proxy.py` serves only on loopback and forwards at most
 one confirmed target's dedicated request to DeepSeek. All other requests receive
 local synthetic responses; these are not translations. Before sending, the
-proxy exclusively creates a caller-specified marker outside Git worktrees, so
+proxy requires the exact prompt SHA-256 from an `--offline-prepare` run through
+the same desktop configuration, and
+exclusively creates a caller-specified marker outside Git worktrees, so
 concurrent requests, later retries and a restart using that marker cannot send
 again, even if the provider attempt fails. It uses a direct HTTPS POST with no
 redirect or retry handling and sets an output-token cap. The marker and status
 contain hashes and counts, not source or response text. The caller must verify
-the installed artifacts, target and current prices, remove provider credentials
+the offline and live desktop configurations produce the same prompt, the installed
+artifacts, target and current prices, remove provider credentials
 from the isolated desktop process, configure that process exclusively to the
 loopback endpoint, and keep private files out of Git. The proxy's own guard does
 not constrain unrelated processes or native networking. Do not run it without

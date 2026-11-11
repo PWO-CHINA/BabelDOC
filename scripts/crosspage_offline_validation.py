@@ -853,6 +853,8 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
         "target_context_only_calls": 0,
         "target_response_items": 0,
         "target_response_items_unchanged": 0,
+        "target_whole_first_prompt_sha256": None,
+        "target_whole_first_prompt_bytes": None,
         "historical_replay_items": 0,
         "historical_replay_unmatched_items": 0,
     }
@@ -910,6 +912,10 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
                     counts["target_dedicated_retry_calls"] += retry
                     counts["target_whole_input_calls"] += bool(whole)
                     counts["target_context_only_calls"] += not whole
+                    if whole and not retry and counts["target_whole_first_prompt_sha256"] is None:
+                        encoded_prompt = prompt.encode("utf-8")
+                        counts["target_whole_first_prompt_sha256"] = hashlib.sha256(encoded_prompt).hexdigest()
+                        counts["target_whole_first_prompt_bytes"] = len(encoded_prompt)
                     counts["target_response_items"] += len(items)
                     counts["target_response_items_unchanged"] += sum(
                         item["input"] == output["output"] for item, output in zip(items, outputs, strict=True)

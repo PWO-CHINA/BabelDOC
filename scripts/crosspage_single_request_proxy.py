@@ -6,6 +6,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import socketserver
 import sys
 import threading
@@ -107,7 +108,15 @@ def send_deepseek_once(prompt, api_key):
 
 
 class SingleRequestProxy:
-    def __init__(self, target, marker, api_key, transport=send_deepseek_once):
+    def __init__(
+        self,
+        target,
+        marker,
+        api_key,
+        expected_prompt_sha256,
+        transport=send_deepseek_once,
+        offline_prepare=False,
+    ):
         if len(target) != 2 or any(
             not isinstance(anchor, str) or len(anchor) < 12 for anchor in target
         ):
@@ -115,16 +124,28 @@ class SingleRequestProxy:
         self.target = target
         self.marker = marker
         self.api_key = api_key
+        if offline_prepare and expected_prompt_sha256 is not None:
+            raise ValueError("Offline preparation cannot select a fixed prompt")
+        if not offline_prepare and (
+            not api_key
+            or not isinstance(expected_prompt_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_prompt_sha256)
+        ):
+            raise ValueError("A fixed prompt SHA-256 is required")
+        self.offline_prepare = offline_prepare
+        self.expected_prompt_sha256 = expected_prompt_sha256
         self.transport = transport
         self.lock = threading.Lock()
         self.counts = {
             "local_batches": 0,
             "local_fallbacks": 0,
             "target_first": 0,
+            "target_prompt_mismatch": 0,
             "target_retries_rejected": 0,
             "provider_attempts": 0,
         }
         self.usage = None
+        self.prepared_prompt = None
 
     def handle(self, body):
         if not isinstance(body, dict):
@@ -168,42 +189,59 @@ class SingleRequestProxy:
                 with self.lock:
                     self.counts["target_retries_rejected"] += 1
                 raise RejectedRequestError("target retry or ambiguity")
-            with self.lock:
-                self.counts["target_first"] += 1
-                try:
-                    with self.marker.open("x", encoding="utf-8") as marker:
-                        json.dump(
-                            {
-                                "model": MODEL,
-                                "prompt_sha256": hashlib.sha256(
-                                    prompt.encode("utf-8")
-                                ).hexdigest(),
-                                "max_output_tokens": MAX_OUTPUT_TOKENS,
-                            },
-                            marker,
-                        )
-                except FileExistsError:
-                    self.counts["target_retries_rejected"] += 1
-                    raise RejectedRequestError(
-                        "provider attempt already consumed"
-                    ) from None
-                self.counts["provider_attempts"] += 1
-            result = self.transport(prompt, self.api_key)
-            usage = result.get("usage")
-            if isinstance(usage, dict):
+            prompt_bytes = prompt.encode("utf-8")
+            prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
+            if self.offline_prepare:
                 with self.lock:
-                    self.usage = {
-                        key: usage[key]
-                        for key in (
-                            "prompt_tokens",
-                            "completion_tokens",
-                            "total_tokens",
-                            "prompt_cache_hit_tokens",
-                            "prompt_cache_miss_tokens",
-                        )
-                        if type(usage.get(key)) is int and usage[key] >= 0
-                    }
-            return result
+                    self.counts["target_first"] += 1
+                    if self.prepared_prompt is None:
+                        self.prepared_prompt = {
+                            "sha256": prompt_hash,
+                            "bytes": len(prompt_bytes),
+                            "identical": True,
+                        }
+                    elif self.prepared_prompt["sha256"] != prompt_hash:
+                        self.prepared_prompt["identical"] = False
+            else:
+                if prompt_hash != self.expected_prompt_sha256:
+                    with self.lock:
+                        self.counts["target_prompt_mismatch"] += 1
+                    raise RejectedRequestError("target prompt identity changed")
+                with self.lock:
+                    self.counts["target_first"] += 1
+                    try:
+                        with self.marker.open("x", encoding="utf-8") as marker:
+                            json.dump(
+                                {
+                                    "model": MODEL,
+                                    "prompt_sha256": self.expected_prompt_sha256,
+                                    "prompt_bytes": len(prompt_bytes),
+                                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                                },
+                                marker,
+                            )
+                    except FileExistsError:
+                        self.counts["target_retries_rejected"] += 1
+                        raise RejectedRequestError(
+                            "provider attempt already consumed"
+                        ) from None
+                    self.counts["provider_attempts"] += 1
+                result = self.transport(prompt, self.api_key)
+                usage = result.get("usage")
+                if isinstance(usage, dict):
+                    with self.lock:
+                        self.usage = {
+                            key: usage[key]
+                            for key in (
+                                "prompt_tokens",
+                                "completion_tokens",
+                                "total_tokens",
+                                "prompt_cache_hit_tokens",
+                                "prompt_cache_miss_tokens",
+                            )
+                            if type(usage.get(key)) is int and usage[key] >= 0
+                        }
+                return result
         with self.lock:
             self.counts["local_batches"] += 1
         outputs = [
@@ -244,6 +282,7 @@ def make_handler(proxy, local_key):
                 response = {
                     "counts": dict(proxy.counts),
                     "usage": proxy.usage,
+                    "prepared_prompt": proxy.prepared_prompt,
                     "attempt_marker_exists": proxy.marker.exists(),
                 }
             self.respond(200, response)
@@ -280,6 +319,9 @@ def main():
     parser.add_argument("--downloads", type=Path, required=True)
     parser.add_argument("--sample", required=True)
     parser.add_argument("--attempt-marker", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--expected-prompt-sha256")
+    mode.add_argument("--offline-prepare", action="store_true")
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
     samples = validation.load_manifest(args.manifest.resolve(strict=True))
@@ -301,19 +343,41 @@ def main():
         raise ValueError("A new marker outside Git worktrees is required")
     api_key = os.environ.pop("DEEPSEEK_API_KEY", None)
     local_key = os.environ.pop("CROSSPAGE_PROXY_LOCAL_KEY", None)
-    if not api_key or not local_key:
+    if not local_key or (not args.offline_prepare and not api_key):
         raise ValueError("Missing proxy credentials")
-    proxy = SingleRequestProxy(target, marker, api_key)
+    proxy = SingleRequestProxy(
+        target,
+        marker,
+        api_key,
+        args.expected_prompt_sha256,
+        offline_prepare=args.offline_prepare,
+    )
     server = LoopbackServer(("127.0.0.1", args.port), make_handler(proxy, local_key))
     print(
-        json.dumps({"listening": True, "port": server.server_port, "model": MODEL}),
+        json.dumps(
+            {
+                "listening": True,
+                "port": server.server_port,
+                "model": MODEL,
+                "offline_prepare": args.offline_prepare,
+            }
+        ),
         flush=True,
     )
     try:
         server.serve_forever()
     finally:
         server.server_close()
-        print(json.dumps({"counts": proxy.counts, "usage": proxy.usage}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "counts": proxy.counts,
+                    "usage": proxy.usage,
+                    "prepared_prompt": proxy.prepared_prompt,
+                }
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

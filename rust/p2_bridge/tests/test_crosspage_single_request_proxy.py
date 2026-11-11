@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -38,12 +39,16 @@ def target_prompt():
     return batch("left anchor long right anchor long.")
 
 
+PROMPT_HASH = hashlib.sha256(target_prompt().encode("utf-8")).hexdigest()
+
+
 def test_local_and_non_target_batches_never_use_provider(tmp_path):
     calls = []
     proxy = proxy_module.SingleRequestProxy(
         TARGET,
         tmp_path / "attempt",
         "private-key",
+        PROMPT_HASH,
         lambda *arguments: calls.append(arguments),
     )
     for prompt in (
@@ -74,10 +79,52 @@ def test_retry_and_ambiguous_target_never_use_provider(tmp_path, prompt):
         TARGET,
         tmp_path / "attempt",
         "private-key",
+        PROMPT_HASH,
         lambda *arguments: calls.append(arguments),
     )
     with pytest.raises(proxy_module.RejectedRequestError):
         proxy.handle(request(prompt))
+    assert not calls
+    assert not (tmp_path / "attempt").exists()
+
+
+def test_changed_target_prompt_never_uses_provider(tmp_path):
+    calls = []
+    proxy = proxy_module.SingleRequestProxy(
+        TARGET,
+        tmp_path / "attempt",
+        "private-key",
+        PROMPT_HASH,
+        lambda *arguments: calls.append(arguments),
+    )
+    with pytest.raises(proxy_module.RejectedRequestError):
+        proxy.handle(request(target_prompt() + " "))
+    assert not calls
+    assert proxy.counts["target_prompt_mismatch"] == 1
+    assert not (tmp_path / "attempt").exists()
+
+
+def test_offline_prepare_records_only_prompt_identity_and_never_sends(tmp_path):
+    calls = []
+    proxy = proxy_module.SingleRequestProxy(
+        TARGET,
+        tmp_path / "attempt",
+        None,
+        None,
+        lambda *arguments: calls.append(arguments),
+        offline_prepare=True,
+    )
+    response = proxy.handle(request(target_prompt()))
+    assert response["choices"][0]["message"]["content"]
+    assert proxy.prepared_prompt == {
+        "sha256": PROMPT_HASH,
+        "bytes": len(target_prompt().encode("utf-8")),
+        "identical": True,
+    }
+    proxy.handle(request(target_prompt() + " "))
+    assert not proxy.prepared_prompt["identical"]
+    assert proxy.counts["target_first"] == 2
+    assert proxy.counts["provider_attempts"] == 0
     assert not calls
     assert not (tmp_path / "attempt").exists()
 
@@ -92,7 +139,9 @@ def test_concurrent_target_requests_consume_only_one_attempt(tmp_path):
         return proxy_module.synthetic_response("synthetic translated response")
 
     marker = tmp_path / "attempt"
-    proxy = proxy_module.SingleRequestProxy(TARGET, marker, "private-key", transport)
+    proxy = proxy_module.SingleRequestProxy(
+        TARGET, marker, "private-key", PROMPT_HASH, transport
+    )
 
     def attempt():
         try:
@@ -110,7 +159,7 @@ def test_concurrent_target_requests_consume_only_one_attempt(tmp_path):
     assert persisted["model"] == proxy_module.MODEL
     assert "private-key" not in json.dumps(persisted)
     restarted = proxy_module.SingleRequestProxy(
-        TARGET, marker, "private-key", transport
+        TARGET, marker, "private-key", PROMPT_HASH, transport
     )
     with pytest.raises(proxy_module.RejectedRequestError):
         restarted.handle(request(target_prompt()))
@@ -125,7 +174,7 @@ def test_failed_provider_attempt_cannot_be_retried(tmp_path):
         raise OSError("unavailable")
 
     proxy = proxy_module.SingleRequestProxy(
-        TARGET, tmp_path / "attempt", "private-key", transport
+        TARGET, tmp_path / "attempt", "private-key", PROMPT_HASH, transport
     )
     with pytest.raises(OSError):
         proxy.handle(request(target_prompt()))
@@ -143,7 +192,9 @@ def test_marker_blocks_concurrent_separate_proxy_instances(tmp_path):
         return proxy_module.synthetic_response("ok")
 
     proxies = [
-        proxy_module.SingleRequestProxy(TARGET, marker, "private-key", transport)
+        proxy_module.SingleRequestProxy(
+            TARGET, marker, "private-key", PROMPT_HASH, transport
+        )
         for _ in range(2)
     ]
 
@@ -236,6 +287,7 @@ def test_loopback_proxy_rejects_auth_and_forwards_target_once(tmp_path):
         TARGET,
         tmp_path / "attempt",
         "private-key",
+        PROMPT_HASH,
         lambda *arguments: (
             calls.append(arguments) or proxy_module.synthetic_response("ok")
         ),
@@ -291,7 +343,7 @@ def test_openai_client_retries_cannot_resend_to_provider(tmp_path):
         raise OSError("synthetic provider failure")
 
     proxy = proxy_module.SingleRequestProxy(
-        TARGET, tmp_path / "attempt", "private-key", transport
+        TARGET, tmp_path / "attempt", "private-key", PROMPT_HASH, transport
     )
     server = proxy_module.LoopbackServer(
         ("127.0.0.1", 0), proxy_module.make_handler(proxy, "local-key")
