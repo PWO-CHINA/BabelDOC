@@ -2,23 +2,19 @@ import json
 import re
 
 import pytest
-
 from babeldoc import _rust_il
 from babeldoc.format.pdf.document_il import il_version_1 as il
-
-from test_cross_page_llm_direct_atomicity import (
-    DirectApplicationService,
-    DirectTranslator,
-    LEFT_PREFIX,
-    LEFT_TAIL,
-    Monitor,
-    RIGHT_CONTINUATION,
-    TRANSLATED_FOLLOWING,
-    TRANSLATED_PREFIX,
-    TRANSLATED_SENTENCE,
-    make_direct_document,
-    run_bridge,
-)
+from test_cross_page_llm_direct_atomicity import LEFT_PREFIX
+from test_cross_page_llm_direct_atomicity import LEFT_TAIL
+from test_cross_page_llm_direct_atomicity import RIGHT_CONTINUATION
+from test_cross_page_llm_direct_atomicity import TRANSLATED_FOLLOWING
+from test_cross_page_llm_direct_atomicity import TRANSLATED_PREFIX
+from test_cross_page_llm_direct_atomicity import TRANSLATED_SENTENCE
+from test_cross_page_llm_direct_atomicity import DirectApplicationService
+from test_cross_page_llm_direct_atomicity import DirectTranslator
+from test_cross_page_llm_direct_atomicity import Monitor
+from test_cross_page_llm_direct_atomicity import make_direct_document
+from test_cross_page_llm_direct_atomicity import run_bridge
 
 
 def paragraph(text, box, *, label="text", size=10.0):

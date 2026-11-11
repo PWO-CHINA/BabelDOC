@@ -1,0 +1,6 @@
+# Unicode punctuation and digits are intentional in these translation tests and parsers.
+/rust/p2_stages/src/translation/cross_page_sentence.rs
+/rust/p2_stages/src/translation/cross_page_protocol.rs
+/rust/p2_stages/tests/cross_page.rs
+/rust/p2_stages/tests/cross_page_whole_sentence.rs
+/rust/p2_bridge/tests/test_cross_page_llm_direct_atomicity.py

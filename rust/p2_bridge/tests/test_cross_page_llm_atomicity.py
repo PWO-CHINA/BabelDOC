@@ -10,7 +10,6 @@ from babeldoc.format.pdf.document_il import il_version_1 as il
 from babeldoc.rust_run_context import PriorityServiceDispatcher
 from babeldoc.rust_translation_service import RustTranslatorService
 
-
 LEFT = "Earlier findings were clear. The results demonstrate a substantial improvement across"
 RIGHT = "several independent experiments. Additional observations follow."
 
@@ -105,7 +104,7 @@ def run(document, tmp_path, service, flag, monitor):
     config = SimpleNamespace(
         disable_rich_text_translate=False, min_text_length=1,
         experimental_cross_page_context=True, pool_max_workers=1, lang_out="Chinese",
-        debug=True, working_dir=str(tmp_path), should_translate_page=lambda page: True,
+        debug=True, working_dir=str(tmp_path), should_translate_page=lambda _page: True,
         get_working_file_path=lambda name: str(tmp_path / name),
     )
     shared = _rust_il.SharedContextCrossSplitPart([])
