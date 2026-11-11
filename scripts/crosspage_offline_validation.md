@@ -70,6 +70,32 @@ does not establish lost text or incorrect page assignment. Dedicated first and
 retry request counts use the fixed retry instruction, and target response-item
 counts compare inputs and outputs only in memory.
 
+`--translator-mode historical_replay` can reuse an existing local response for
+one historically tracked target. It requires the same successful response on
+both tracked paragraphs, unique matching IDs, matching placeholder order and a
+changed target response. It reuses the response only if an item in a dedicated
+request exactly matches the historical target input and layout label; all
+other items and fallbacks use synthetic ROT13. The report records replay and
+unmatched item counts and hashes the local response metadata. A zero replay
+count does not show that a real translation was tested. Page alignment and
+visual quality of a replayed translation require separate human inspection.
+Historical material and retained outputs remain private local data.
+
+For an explicitly authorized live comparison, the separate
+`crosspage_single_request_proxy.py` serves only on loopback and forwards at most
+one confirmed target's dedicated request to DeepSeek. All other requests receive
+local synthetic responses; these are not translations. Before sending, the
+proxy exclusively creates a caller-specified marker outside Git worktrees, so
+concurrent requests, later retries and a restart using that marker cannot send
+again, even if the provider attempt fails. It uses a direct HTTPS POST with no
+redirect or retry handling and sets an output-token cap. The marker and status
+contain hashes and counts, not source or response text. The caller must verify
+the installed artifacts, target and current prices, remove provider credentials
+from the isolated desktop process, configure that process exclusively to the
+loopback endpoint, and keep private files out of Git. The proxy's own guard does
+not constrain unrelated processes or native networking. Do not run it without
+explicit authorization and a verified account budget.
+
 The report records whether the native supports stage capture. With a native
 built with the `stage-capture` feature, `--capture-stages` additionally records
 per-page anchor counts from translation and typesetting paragraph text and
@@ -94,12 +120,17 @@ retaining the tokens. Tracking input can reflect ordinary or fallback processing
 and does not prove which input a dedicated cross-page request would have used.
 
 Output contains counts, hashes, selected page numbers, and extraction-based
-geometry only. Full PDF text, prompts, responses and rendered outputs remain
-in temporary local files and are removed when the process exits normally. Save
+geometry only. By default, full PDF text, prompts, responses and rendered outputs
+remain in temporary local files and are removed when the process exits normally. Save
 metadata output to a local file outside the repository. Python socket calls are
 guarded against non-loopback connections; this Python-level guard does not
 contain native code or subprocesses. The translator itself makes no network
 requests. Run only in a trusted local environment with cached assets.
+
+For manual local visual review, `--retain-output-dir` accepts a new directory
+outside Git worktrees and preserves the generated files there. The directory
+may contain private source text, translations, tracking, and captures; do not
+commit or publish it. The runner refuses to reuse an existing directory.
 
 Interpret tracking events, dedicated requests, whole-input requests, fallback
 calls, and PDF anchor locations independently. Event counts do not establish a
@@ -111,7 +142,8 @@ neither count represents a provider request.
 Missing text anchors may reflect extraction or style segmentation, so they are
 an investigation signal rather than proof of lost text. Page-box checks do not
 verify overlap, clipping, readability, image placement, or semantic quality.
-All calls recorded by this runner are synthetic, not model or provider calls.
+The runner makes no model or provider calls; it can use synthetic responses or
+strictly matched historical local responses.
 Failures record their exception type and frame locations without raw exception
 messages. An exact allowlist of known static numeric-continuation errors is
 classified separately; all other messages are reported as unclassified.

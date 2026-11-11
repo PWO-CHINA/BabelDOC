@@ -97,6 +97,16 @@ def load_manifest(path):
     return samples
 
 
+def output_directory_context(retain_output):
+    if retain_output is None:
+        return tempfile.TemporaryDirectory(prefix="crosspage-offline-")
+    output = retain_output.resolve()
+    if any((parent / ".git").exists() for parent in (output, *output.parents)):
+        raise ValueError("Retained output must be outside Git worktrees")
+    output.mkdir(parents=True, exist_ok=False)
+    return contextlib.nullcontext(str(output))
+
+
 def block_network():
     original_resolve = socket.getaddrinfo
 
@@ -164,6 +174,81 @@ def selected_input(root, downloads, spec):
         if target is None or len(right_anchor) < 12:
             raise ValueError("Historical target anchors are not uniquely reproducible")
     return source, target, metadata_hashes
+
+
+def historical_replay(root, spec, target):
+    if not target or spec.get("anchor_source", "historical_tracking") != "historical_tracking":
+        raise ValueError("Historical replay requires historical target anchors")
+    run = root / spec["run"]
+    tracking_files = list((run / "work").glob("*/translate_tracking.json"))
+    if len(tracking_files) != 1:
+        raise ValueError("Historical replay tracking is unavailable")
+    tracking_path = tracking_files[0]
+    snapshot_path = run / "target-prompt-private.json"
+    tracking = read_local_json(tracking_path)
+    snapshot = read_local_json(snapshot_path)
+    events = [
+        event for event in tracking.get("cross_page", [])
+        if len(event.get("paragraph", [])) >= 2
+        and all(target[index] in normalized(event["paragraph"][index].get("pdf_unicode", "")) for index in range(2))
+    ]
+    if len(events) != 1 or not isinstance(snapshot.get("prompt"), str) or not isinstance(snapshot.get("items"), list):
+        raise ValueError("Historical replay target is ambiguous")
+    responses = []
+    for paragraph in events[0]["paragraph"][:2]:
+        trackers = [
+            tracker for tracker in paragraph.get("llm_translate_trackers", [])
+            if tracker.get("input") == snapshot["prompt"] and tracker.get("has_error") is False
+            and tracker.get("fallback_to_translate") is False and isinstance(tracker.get("output"), str)
+            and tracker["output"]
+        ]
+        if len(trackers) != 1:
+            raise ValueError("Historical replay response is unavailable")
+        responses.append(trackers[0]["output"])
+    if responses[0] != responses[1]:
+        raise ValueError("Historical replay responses disagree")
+    try:
+        outputs = json.loads(responses[0])
+    except ValueError:
+        raise ValueError("Historical replay response is invalid") from None
+    inputs = snapshot["items"]
+    if not isinstance(outputs, list) or not inputs or len(inputs) != len(outputs):
+        raise ValueError("Historical replay response is invalid")
+    if any(not isinstance(item, dict) or type(item.get("id")) not in (int, str)
+           or not isinstance(item.get("input"), str) for item in inputs):
+        raise ValueError("Historical replay response is invalid")
+    if any(not isinstance(item, dict) or type(item.get("id")) not in (int, str)
+           or not isinstance(item.get("output"), str) for item in outputs):
+        raise ValueError("Historical replay response is invalid")
+    input_ids = [item["id"] for item in inputs]
+    output_ids = [item["id"] for item in outputs]
+    if len(set(input_ids)) != len(input_ids) or len(set(output_ids)) != len(output_ids) or set(input_ids) != set(output_ids):
+        raise ValueError("Historical replay response IDs do not match")
+    matches = [item for item in inputs if target[0] + target[1] in normalized(item["input"])]
+    if len(matches) != 1:
+        raise ValueError("Historical replay target item is ambiguous")
+    source_item = matches[0]
+    response_item = next(item for item in outputs if item["id"] == source_item["id"])
+    placeholders = re.compile(r"<[^<>]*>|\{[^{}]*\}")
+    if placeholders.findall(source_item["input"]) != placeholders.findall(response_item["output"]):
+        raise ValueError("Historical replay placeholders do not match")
+    if not response_item["output"] or response_item["output"] == source_item["input"]:
+        raise ValueError("Historical replay has no changed target response")
+    return {
+        "input": source_item["input"],
+        "layout_label": source_item.get("layout_label"),
+        "output": response_item["output"],
+    }, {
+        "tracking_sha256": digest(tracking_path),
+        "prompt_snapshot_sha256": digest(snapshot_path),
+        "response_sha256": hashlib.sha256(responses[0].encode("utf-8")).hexdigest(),
+    }
+
+
+def replay_response_item(item, replay, dedicated):
+    if dedicated and item["input"] == replay["input"] and item.get("layout_label") == replay["layout_label"]:
+        return replay["output"], True
+    return synthetic_text(item["input"], "rot13"), False
 
 
 def output_geometry(pdf_path, expected_pages):
@@ -746,7 +831,7 @@ def tracking_evidence(output, target, expected_fragments):
     }
 
 
-def run_sample(source, target, output, label, spec, capture_stages=False, translator_mode="identity"):
+def run_sample(source, target, output, label, spec, capture_stages=False, translator_mode="identity", replay=None):
     import pymupdf
     from babeldoc.format.pdf.high_level import translate
     from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
@@ -768,7 +853,10 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
         "target_context_only_calls": 0,
         "target_response_items": 0,
         "target_response_items_unchanged": 0,
+        "historical_replay_items": 0,
+        "historical_replay_unmatched_items": 0,
     }
+    fallback_mode = "rot13" if translator_mode == "historical_replay" else translator_mode
 
     class SyntheticTranslator(BaseTranslator):
         def __init__(self):
@@ -779,7 +867,7 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
 
         def do_translate(self, text, rate_limit_params=None):
             counts["synthetic_plain_calls"] += 1
-            return synthetic_text(text, translator_mode)
+            return synthetic_text(text, fallback_mode)
 
         def do_llm_translate(self, text, rate_limit_params=None):
             return None if text is None else self.llm_translate(text, rate_limit_params=rate_limit_params)
@@ -801,9 +889,17 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
                 fallback = "Now translate the following text:"
                 if fallback not in prompt:
                     raise ValueError("Unsupported synthetic fallback prompt")
-                return synthetic_text(prompt.rsplit(fallback, 1)[1].strip(), translator_mode)
+                return synthetic_text(prompt.rsplit(fallback, 1)[1].strip(), fallback_mode)
             items = json.loads(prompt.rsplit(marker, 1)[1].strip())
-            outputs = [{"id": item["id"], "output": synthetic_text(item["input"], translator_mode)} for item in items]
+            outputs = []
+            for item in items:
+                if translator_mode == "historical_replay":
+                    value, matched = replay_response_item(item, replay, dedicated)
+                    counts["historical_replay_items"] += matched
+                    counts["historical_replay_unmatched_items"] += not matched
+                else:
+                    value = synthetic_text(item["input"], translator_mode)
+                outputs.append({"id": item["id"], "output": value})
             if dedicated and target:
                 left, right = target
                 content = normalized(prompt)
@@ -830,9 +926,9 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
         "source_sha256": digest(source),
         "input_pages": input_pages,
         "provider_requests": 0,
-        "translator": f"synthetic_{translator_mode}",
+        "translator": "historical_replay_with_synthetic_rot13" if replay else f"synthetic_{translator_mode}",
         "target_selection": f"{spec.get('anchor_source', 'historical_tracking')}_anchors" if target else "unresolved",
-        "writeback": ("inverse_rot13_extraction_anchor_locations_only" if translator_mode == "rot13" else "anchor_locations_only") if target else "not_verified",
+        "writeback": ("not_verified_for_historical_replay" if replay else "inverse_rot13_extraction_anchor_locations_only" if translator_mode == "rot13" else "anchor_locations_only") if target else "not_verified",
         "layout": "not_verified",
         "finished": False,
     }
@@ -862,7 +958,7 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
         result["target_tracking_fallback_evidence"] = fallback_evidence(output, target)
         if capture_stages:
             result["stage_capture"] = stage_evidence(output / "capture", target)
-        if target:
+        if target and translator_mode != "historical_replay":
             result["output_anchor_occurrences_by_page"] = anchor_locations(Path(translation.mono_pdf_path), target, translator_mode)
             result["output_anchor_page_line_windows"] = [
                 find_split_locations(Path(translation.mono_pdf_path), anchor, translator_mode) for anchor in target
@@ -908,7 +1004,8 @@ def main():
     parser.add_argument("--source-checkout", type=Path)
     parser.add_argument("--source-commit")
     parser.add_argument("--capture-stages", action="store_true")
-    parser.add_argument("--translator-mode", choices=("identity", "rot13"), default="identity")
+    parser.add_argument("--retain-output-dir", type=Path)
+    parser.add_argument("--translator-mode", choices=("identity", "rot13", "historical_replay"), default="identity")
     parser.add_argument("--sample", action="append", required=True)
     args = parser.parse_args()
     samples = load_manifest(args.manifest.resolve(strict=True))
@@ -996,13 +1093,16 @@ def main():
             if current != args.source_commit.lower() or dirty:
                 raise RuntimeError("Source checkout changed during validation")
 
-    with tempfile.TemporaryDirectory(prefix="crosspage-offline-") as directory:
+    with output_directory_context(args.retain_output_dir) as directory:
         for name, (source, target, metadata_hashes) in zip(args.sample, all_inputs, strict=True):
             verify_identity()
-            row = run_sample(source, target, Path(directory) / name, name, samples[name], args.capture_stages, args.translator_mode)
+            replay, replay_metadata = historical_replay(root, samples[name], target) if args.translator_mode == "historical_replay" else (None, None)
+            row = run_sample(source, target, Path(directory) / name, name, samples[name], args.capture_stages, args.translator_mode, replay)
             verify_identity()
             row["original_pages"] = samples[name]["pages"]
             row["historical_metadata_hashes"] = metadata_hashes
+            if replay_metadata:
+                row["historical_replay_metadata"] = replay_metadata
             report["samples"].append(row)
     print(json.dumps(report, ensure_ascii=True, indent=2))
     if any(not row["finished"] or not row["source_unchanged"] for row in report["samples"]):
