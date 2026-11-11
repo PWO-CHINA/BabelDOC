@@ -2,7 +2,7 @@
 
 This experimental fork is based on BabelDOC commit
 `dd9adc352b957533d05b8cb94e88a7589cc56a35`. It retains upstream's AGPL-3.0
-license and is identified as `0.7.1+pwo.2.crosspage.13`. This is an
+license and is identified as `0.7.1+pwo.2.crosspage.16`. This is an
 experimental version and is not a released dependency.
 
 The PWO formula-order change prevents formula groups separated by other paragraph content from
