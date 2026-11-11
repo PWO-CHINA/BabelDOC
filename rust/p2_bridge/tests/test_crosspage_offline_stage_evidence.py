@@ -68,6 +68,153 @@ def test_local_manifest_rejects_unsafe_sample_name(tmp_path):
         validation.load_manifest(manifest)
 
 
+def test_retained_output_requires_a_new_directory_outside_git(tmp_path):
+    output = tmp_path / "private-output"
+    with validation.output_directory_context(output) as directory:
+        (Path(directory) / "local.txt").write_text("synthetic", encoding="utf-8")
+    assert (output / "local.txt").is_file()
+    with pytest.raises(FileExistsError):
+        validation.output_directory_context(output)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("synthetic worktree marker", encoding="utf-8")
+    with pytest.raises(ValueError, match="outside Git worktrees"):
+        validation.output_directory_context(worktree / "private-output")
+
+
+@pytest.fixture
+def replay_records(tmp_path):
+    root = tmp_path / "suite"
+    run = root / "synthetic-run"
+    tracking_path = run / "work" / "document" / "translate_tracking.json"
+    snapshot_path = run / "target-prompt-private.json"
+    tracking_path.parent.mkdir(parents=True)
+    source = "<b0>left anchor right anchor.</b0>"
+    translated = "<b0>synthetic translation.</b0>"
+    items = [{"id": 1, "input": source, "layout_label": "body"}, {"id": 2, "input": "Other."}]
+    outputs = [{"id": 2, "output": "Different."}, {"id": 1, "output": translated}]
+    tracker = {"input": "synthetic prompt", "output": json.dumps(outputs),
+               "has_error": False, "fallback_to_translate": False}
+    tracking = {"cross_page": [{"paragraph": [
+        {"pdf_unicode": "left anchor", "llm_translate_trackers": [dict(tracker)]},
+        {"pdf_unicode": "right anchor", "llm_translate_trackers": [dict(tracker)]},
+    ]}]}
+    snapshot = {"prompt": "synthetic prompt", "items": items}
+
+    def save():
+        tracking_path.write_text(json.dumps(tracking), encoding="utf-8")
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    save()
+    return root, {"run": "synthetic-run"}, ("leftanchor", "rightanchor"), tracking, snapshot, save
+
+
+def test_historical_replay_requires_exact_dedicated_item_and_layout(replay_records):
+    root, spec, target, _, _, _ = replay_records
+    replay, metadata = validation.historical_replay(root, spec, target)
+    item = {"input": replay["input"], "layout_label": replay["layout_label"]}
+    assert validation.replay_response_item(item, replay, True) == ("<b0>synthetic translation.</b0>", True)
+    for changed, dedicated in ((item, False), ({**item, "input": item["input"] + " "}, True),
+                               ({**item, "layout_label": "other"}, True)):
+        output, matched = validation.replay_response_item(changed, replay, dedicated)
+        assert not matched
+        assert output == validation.synthetic_text(changed["input"], "rot13")
+    assert all(len(value) == 64 for value in metadata.values())
+
+
+@pytest.mark.parametrize("case", [
+    "fallback", "error", "missing_tracker", "different_prompt", "different_response",
+    "invalid_json", "duplicate_input_id", "duplicate_output_id", "missing_output_id",
+    "boolean_id", "placeholder_mismatch", "unchanged_response", "ambiguous_target",
+])
+def test_historical_replay_rejects_unverifiable_records(replay_records, case):
+    root, spec, target, tracking, snapshot, save = replay_records
+    paragraphs = tracking["cross_page"][0]["paragraph"]
+    trackers = [paragraph["llm_translate_trackers"][0] for paragraph in paragraphs]
+    outputs = json.loads(trackers[0]["output"])
+    if case == "fallback":
+        trackers[0]["fallback_to_translate"] = True
+    elif case == "error":
+        trackers[0]["has_error"] = True
+    elif case == "missing_tracker":
+        paragraphs[0]["llm_translate_trackers"] = []
+    elif case == "different_prompt":
+        trackers[0]["input"] = "another prompt"
+    elif case == "different_response":
+        trackers[0]["output"] += " "
+    elif case == "invalid_json":
+        for tracker in trackers:
+            tracker["output"] = "not JSON"
+    else:
+        if case == "duplicate_input_id":
+            snapshot["items"][1]["id"] = 1
+        elif case == "duplicate_output_id":
+            outputs[0]["id"] = 1
+        elif case == "missing_output_id":
+            outputs[0]["id"] = 3
+        elif case == "boolean_id":
+            snapshot["items"][0]["id"] = True
+        elif case == "placeholder_mismatch":
+            outputs[1]["output"] = "<b1>synthetic translation.</b1>"
+        elif case == "unchanged_response":
+            outputs[1]["output"] = snapshot["items"][0]["input"]
+        elif case == "ambiguous_target":
+            snapshot["items"][1]["input"] = snapshot["items"][0]["input"]
+        for tracker in trackers:
+            tracker["output"] = json.dumps(outputs)
+    save()
+    with pytest.raises(ValueError, match="Historical replay"):
+        validation.historical_replay(root, spec, target)
+
+
+def test_reviewed_block_edge_anchors_are_unique_on_original_pages(tmp_path):
+    import pymupdf
+
+    suite = tmp_path / "suite"
+    run = suite / "synthetic-run"
+    downloads = tmp_path / "inputs"
+    run.mkdir(parents=True)
+    downloads.mkdir()
+    source = downloads / "synthetic.pdf"
+    with pymupdf.open() as document:
+        document.new_page().insert_text((30, 40), "Earlier evidence was complete and the synthetic study showed that")
+        document.new_page().insert_text((30, 40), "A different synthetic outcome appeared in the following measurements.")
+        document.save(source)
+    (run / "summary.json").write_text(json.dumps({"source": source.name}), encoding="utf-8")
+    spec = local_sample_spec()
+    spec.update(sha256=validation.digest(source), blocks=[0, 0], target=True, anchor_source="selected_block_edges")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "samples": {"sample-a": spec}}), encoding="utf-8")
+
+    samples = validation.load_manifest(manifest)
+    selected, target, _ = validation.selected_input(suite, downloads, samples["sample-a"])
+    assert selected == source
+    assert validation.anchor_locations(source, target) == [[1, 0], [0, 1]]
+
+    with pymupdf.open(source) as document:
+        duplicate = tmp_path / "duplicate.pdf"
+        document[1].insert_text((30, 80), "Earlier evidence was complete and the synthetic study showed that")
+        document.save(duplicate)
+    spec["sha256"] = validation.digest(duplicate)
+    (run / "summary.json").write_text(json.dumps({"source": duplicate.name}), encoding="utf-8")
+    with pytest.raises(ValueError, match="anchors are not unique"):
+        validation.selected_input(suite, tmp_path, spec)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"anchor_source": "unknown"}, {"anchor_source": "selected_block_edges"},
+     {"anchor_source": "selected_block_edges", "target": True}],
+)
+def test_block_edge_manifest_requires_a_reviewed_target_and_two_blocks(tmp_path, changes):
+    spec = local_sample_spec()
+    spec.update(changes)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "samples": {"sample-a": spec}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid local sample manifest"):
+        validation.load_manifest(manifest)
+
+
 def test_stage_evidence_distinguishes_text_composition_and_page(tmp_path):
     pages = [
         {"page_number": 0, "pdf_paragraph": [paragraph("first anchor", [
