@@ -27,10 +27,16 @@ illustrative and do not identify a real input:
 
 `run` names a directory directly under the suite root containing `summary.json`.
 `pages` records the input's original one-based page numbers; `blocks` is either
-null or two zero-based text-block indexes. Set `target` only when the historical
-tracking and private prompt snapshot establish target anchors. Replace the
-illustrative hash with the input's actual SHA-256 locally. Do not commit the
-filled manifest or disclose sample identifiers and hashes in public logs.
+null or two zero-based text-block indexes. By default, `target: true` derives
+anchors from historical tracking and the private prompt snapshot. For a target
+independently verified by a person in the two source pages, set `blocks` to its
+source blocks and add `"anchor_source": "selected_block_edges"`. This derives
+short anchors in memory and requires each to occur once on its expected page
+and nowhere on the other. Uniqueness does not prove that the blocks are a
+correct pair; do not use a suspected caption/body match as a positive target.
+Replace the illustrative hash with the input's actual SHA-256 locally. Do not
+commit the filled manifest or disclose sample identifiers and hashes in public
+logs.
 
 Use a local Python environment containing the dependencies of the fixed BabelDOC
 package. Set `PYTHONPATH` so that the fixed package and its dependencies are

@@ -69,6 +69,54 @@ def test_local_manifest_rejects_unsafe_sample_name(tmp_path):
         validation.load_manifest(manifest)
 
 
+def test_reviewed_block_edge_anchors_are_unique_on_original_pages(tmp_path):
+    import pymupdf
+
+    suite = tmp_path / "suite"
+    run = suite / "synthetic-run"
+    downloads = tmp_path / "inputs"
+    run.mkdir(parents=True)
+    downloads.mkdir()
+    source = downloads / "synthetic.pdf"
+    with pymupdf.open() as document:
+        document.new_page().insert_text((30, 40), "Earlier evidence was complete and the synthetic study showed that")
+        document.new_page().insert_text((30, 40), "A different synthetic outcome appeared in the following measurements.")
+        document.save(source)
+    (run / "summary.json").write_text(json.dumps({"source": source.name}), encoding="utf-8")
+    spec = local_sample_spec()
+    spec.update(sha256=validation.digest(source), blocks=[0, 0], target=True, anchor_source="selected_block_edges")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "samples": {"sample-a": spec}}), encoding="utf-8")
+
+    samples = validation.load_manifest(manifest)
+    selected, target, _ = validation.selected_input(suite, downloads, samples["sample-a"])
+    assert selected == source
+    assert validation.anchor_locations(source, target) == [[1, 0], [0, 1]]
+
+    with pymupdf.open(source) as document:
+        duplicate = tmp_path / "duplicate.pdf"
+        document[1].insert_text((30, 80), "Earlier evidence was complete and the synthetic study showed that")
+        document.save(duplicate)
+    spec["sha256"] = validation.digest(duplicate)
+    (run / "summary.json").write_text(json.dumps({"source": duplicate.name}), encoding="utf-8")
+    with pytest.raises(ValueError, match="anchors are not unique"):
+        validation.selected_input(suite, tmp_path, spec)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"anchor_source": "unknown"}, {"anchor_source": "selected_block_edges"},
+     {"anchor_source": "selected_block_edges", "target": True}],
+)
+def test_block_edge_manifest_requires_a_reviewed_target_and_two_blocks(tmp_path, changes):
+    spec = local_sample_spec()
+    spec.update(changes)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "samples": {"sample-a": spec}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid local sample manifest"):
+        validation.load_manifest(manifest)
+
+
 def test_stage_evidence_distinguishes_text_composition_and_page(tmp_path):
     pages = [
         {"page_number": 0, "pdf_paragraph": [paragraph("first anchor", [

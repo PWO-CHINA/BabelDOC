@@ -73,7 +73,8 @@ def load_manifest(path):
     for name, spec in samples.items():
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
             raise ValueError("Invalid local sample manifest")
-        if not isinstance(spec, dict) or set(spec) != {"run", "sha256", "pages", "blocks", "target"}:
+        required = {"run", "sha256", "pages", "blocks", "target"}
+        if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"anchor_source"}:
             raise ValueError("Invalid local sample manifest")
         run, sha256, pages, blocks, target = (spec[key] for key in ("run", "sha256", "pages", "blocks", "target"))
         if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run):
@@ -87,6 +88,11 @@ def load_manifest(path):
         ):
             raise ValueError("Invalid local sample manifest")
         if type(target) is not bool:
+            raise ValueError("Invalid local sample manifest")
+        anchor_source = spec.get("anchor_source", "historical_tracking")
+        if anchor_source not in ("historical_tracking", "selected_block_edges"):
+            raise ValueError("Invalid local sample manifest")
+        if anchor_source == "selected_block_edges" and (not target or blocks is None):
             raise ValueError("Invalid local sample manifest")
     return samples
 
@@ -131,7 +137,12 @@ def selected_input(root, downloads, spec):
     if digest(source) != spec["sha256"]:
         raise ValueError("Input hash does not match the fixed sample")
     target = None
-    if spec["target"]:
+    if spec["target"] and spec.get("anchor_source") == "selected_block_edges":
+        fragments = block_fragments(source, spec["blocks"])
+        target = (fragments[0][-40:], fragments[1][:40])
+        if any(len(anchor) < 20 for anchor in target) or anchor_locations(source, target) != [[1, 0], [0, 1]]:
+            raise ValueError("Selected block anchors are not unique on their source pages")
+    elif spec["target"]:
         tracking_files = list((run / "work").glob("*/translate_tracking.json"))
         if len(tracking_files) != 1:
             raise ValueError("Expected exactly one historical tracking file")
@@ -820,7 +831,7 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
         "input_pages": input_pages,
         "provider_requests": 0,
         "translator": f"synthetic_{translator_mode}",
-        "target_selection": "historical_tracking_anchors" if target else "unresolved",
+        "target_selection": f"{spec.get('anchor_source', 'historical_tracking')}_anchors" if target else "unresolved",
         "writeback": ("inverse_rot13_extraction_anchor_locations_only" if translator_mode == "rot13" else "anchor_locations_only") if target else "not_verified",
         "layout": "not_verified",
         "finished": False,
