@@ -3,19 +3,18 @@ use super::ordinary_translation::{InputPlaceholder, PlaceholderRegex, TranslateI
 
 static SENTENCE_TERMINATOR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[\p{Sentence_Terminal}…]").expect("literal sentence terminator regex"));
+static NUMERIC_EXPRESSION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(
+    r"(?x)
+        (?:[\p{Sm}\p{Sc}\p{Pd}~～/⁄∶:]\s*)*
+        \p{N}+
+        (?:(?:\s*[\p{Sm}\p{Sc}\p{Pd}.,٫٬'’:/∶⁄~～⋅·*^]\s*[\p{Sm}\p{Pd}]*\s*|\s+)\p{N}+)*
+        (?:\s*[eE]\s*[\p{Sm}\p{Pd}]*\s*\p{N}+)?
+        (?:\s*[\p{Sm}\p{Sc}%％٪‰‱])*
+    "
+).expect("literal numeric expression regex"));
 
 fn numeric_spans(text: &str) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    let mut start = None;
-    for (offset, character) in text.char_indices() {
-        if character.is_numeric() {
-            start.get_or_insert(offset);
-        } else if let Some(begin) = start.take() {
-            spans.push(begin..offset);
-        }
-    }
-    if let Some(begin) = start { spans.push(begin..text.len()); }
-    spans
+    NUMERIC_EXPRESSION.find_iter(text).map(|value| value.range()).collect()
 }
 
 /// Checks exact token counts, translator-specific patterns, and rich-text pairing.
@@ -547,9 +546,9 @@ pub fn reflow_whole_sentence_response<R: PlaceholderRegex>(
     let source_spans = numeric_spans(&plan.sentence);
     let target_spans = numeric_spans(&content[..sentence_end]);
     let mut numeric_boundary = None;
+    if source_spans.iter().map(|span| &plan.sentence[span.clone()])
+        .ne(target_spans.iter().map(|span| &content[span.clone()])) { return Ok(None); }
     if !source_spans.is_empty() {
-        if source_spans.iter().map(|span| &plan.sentence[span.clone()])
-            .ne(target_spans.iter().map(|span| &content[span.clone()])) { return Ok(None); }
         let left_numbers = source_spans.iter().take_while(|span| span.end <= source_boundary).count();
         if source_spans.iter().any(|span| span.start < source_boundary && span.end > source_boundary) { return Ok(None); }
         let minimum = left_numbers.checked_sub(1).map_or(0, |index| target_spans[index].end);

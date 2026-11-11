@@ -104,6 +104,22 @@ fn continuation_join(left: &str, right: &str) -> Option<ContinuationJoin> {
     None
 }
 
+fn signed_decimal_point(text: &str, index: usize) -> bool {
+    let before = &text[..index];
+    let after = &text[index + 1..];
+    let integer_digits = before.chars().rev().take_while(char::is_ascii_digit).count();
+    let fraction_digits = after.chars().take_while(char::is_ascii_digit).count();
+    if integer_digits == 0 || fraction_digits == 0 { return false; }
+    let prefix = &before[..before.len() - integer_digits];
+    let Some(sign) = prefix.chars().next_back() else { return false };
+    if !matches!(sign, '+' | '-' | '−') { return false; }
+    if prefix[..prefix.len() - sign.len_utf8()].chars().next_back()
+        .is_some_and(|character| character.is_alphanumeric() || character == '.') { return false; }
+    let suffix = &after[fraction_digits..];
+    if suffix.chars().next().is_some_and(char::is_alphabetic) { return false; }
+    !suffix.strip_prefix('.').is_some_and(|rest| rest.chars().next().is_some_and(|character| character.is_ascii_digit()))
+}
+
 pub(super) fn context_sentence_parts<'a>(left: &'a str, right: &'a str) -> Option<(&'a str, &'a str)> {
     fn boundary(text: &str) -> Option<usize> {
         for (index, character) in text.char_indices() {
@@ -116,7 +132,11 @@ pub(super) fn context_sentence_parts<'a>(left: &'a str, right: &'a str) -> Optio
                 if previous.is_ascii_digit() {
                     let digits = text[..index].chars().rev().take_while(|value| value.is_ascii_digit()).count();
                     let before = &text[..index - digits];
-                    if digits < 2 || before.ends_with('.') || before.split_whitespace().count() < 3
+                    let signed_decimal = before.ends_with('.') && signed_decimal_point(text, index - digits - 1);
+                    if signed_decimal {
+                        if next.is_some_and(|value| !value.is_whitespace())
+                            || (next.is_some() && text[end..].trim_start().chars().next().is_none_or(|value| !value.is_uppercase())) { continue; }
+                    } else if digits < 2 || before.ends_with('.') || before.split_whitespace().count() < 3
                         || next.is_none_or(|value| !value.is_whitespace())
                         || text[end..].trim_start().chars().next().is_none_or(|value| !value.is_uppercase()) { continue; }
                 } else {
@@ -154,9 +174,14 @@ pub(super) fn context_sentence_parts<'a>(left: &'a str, right: &'a str) -> Optio
         left_end += end;
     }
     let tail = if left_end == 0 {
+        let ambiguous_punctuation = left.char_indices().any(|(index, value)| match value {
+            '.' => !signed_decimal_point(left, index),
+            '!' | '?' | '。' | '！' | '？' | ':' | '：' => true,
+            _ => false,
+        });
         if left.chars().next().is_none_or(|value| !value.is_uppercase())
             || left.split_whitespace().count() < 5
-            || left.chars().any(|value| matches!(value, '.' | '!' | '?' | '。' | '！' | '？' | ':' | '：')) {
+            || ambiguous_punctuation {
             return None;
         }
         left
@@ -182,6 +207,9 @@ pub fn extract_context_sentence(left: &str, right: &str) -> Option<String> {
             '(' => parentheses += 1,
             ')' => parentheses = parentheses.checked_sub(1)?,
             '.' => {
+                if parentheses == 0 && signed_decimal_point(&fragments, index) {
+                    continue;
+                }
                 let word = fragments[..index].rsplit(|value: char| !value.is_alphabetic()).next()?;
                 if parentheses == 0 || !matches!(word.to_ascii_lowercase().as_str(), "fig" | "figs") {
                     return None;

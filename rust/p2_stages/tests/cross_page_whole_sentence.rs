@@ -206,10 +206,10 @@ fn plain_paragraphs_translate_the_complete_sentence_before_reflow() {
 fn reflow_split_ignores_sentences_after_the_first() {
     let mut regex = RegexService::default();
     let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
-    let left = TranslateInput { text: "Earlier work was described. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let left = TranslateInput { text: "Earlier work was described. The treatment (see Fig. 2) improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
     let mut right = TranslateInput { text: "<style id='2'>multiple independent groups. Further results follow.</style>".into(), placeholders: vec![rich(2)], original_tokens: vec![] };
     separate_following(&mut right, " Further");
-    let sentence = "The treatment improved outcomes across multiple independent groups.";
+    let sentence = "The treatment (see Fig. 2) improved outcomes across multiple independent groups.";
     let plan = cross_page_protocol::plan_plain_to_styled_sentence(&left, &right, &[], sentence, &patterns, &mut regex).unwrap().unwrap();
     let first_sentence = "Lane (see Fig. 2) reported significant improvements across multiple groups.";
     let mut splits = Vec::new();
@@ -306,6 +306,55 @@ fn reflow_preserves_unicode_numbers_on_their_original_page() {
     assert!(!second.contains('７'));
     assert!(cross_page_protocol::reflow_whole_sentence_response(
         &plan, "先前结果明确。", "分析后7份回收样本通过了检查。", &left, &right, &patterns, &mut regex,
+    ).unwrap().is_none());
+}
+
+#[test]
+fn reflow_preserves_numeric_expressions_and_their_page_boundaries() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    for (quantity, changed) in [
+        ("-7", "7"), ("-7", "--7"), ("+7", "7"), ("−7", "7"), ("–7", "7"),
+        ("≪7", "7"), ("≒7", "7"), ("7", "-7"), ("7 +/- 3", "7 - 3"), ("7 +/− 3", "7 − 3"),
+        ("7%", "7"), ("7%", "7%%"), ("7 %", "7"), ("7‰", "7"), ("7٪", "7"), ("1e-3", "1e3"),
+        ("1,000", "1.000"), ("7/11", "711"), ("≥7", "7"),
+        ("7–11", "711"), ("1×10^-3", "1×10^3"), ("7÷3", "7∗3"), ("7 × 3", "7 ÷ 3"),
+        ("7 $", "7"), ("€7", "7"), ("7∣3", "7/3"),
+    ] {
+        let left = TranslateInput {
+            text: format!("Earlier findings were clear. The measured value reached {quantity} during"),
+            placeholders: vec![], original_tokens: vec![],
+        };
+        let right = TranslateInput { text: "11 independent experiments.".into(), placeholders: vec![], original_tokens: vec![] };
+        let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
+        let valid = format!("测量值达到{quantity}，涉及11次独立实验。");
+        let (first, second) = cross_page_protocol::reflow_whole_sentence_response(
+            &plan, "先前结果明确。", &valid, &left, &right, &patterns, &mut regex,
+        ).unwrap().unwrap_or_else(|| panic!("valid expression rejected: {quantity}"));
+        assert!(first.contains(quantity), "expression moved from its source page: {quantity}");
+        assert!(second.contains("11"));
+        let invalid = format!("测量值达到{changed}，涉及11次独立实验。");
+        assert!(cross_page_protocol::reflow_whole_sentence_response(
+            &plan, "先前结果明确。", &invalid, &left, &right, &patterns, &mut regex,
+        ).unwrap().is_none(), "changed expression accepted: {quantity} -> {changed}");
+    }
+}
+
+#[test]
+fn reflow_rejects_numbers_added_to_a_non_numeric_sentence() {
+    let mut regex = RegexService::default();
+    let patterns = [regex.compile(r"\{v\d+\}", false).unwrap(), regex.compile(r"<style id='\d+'>", false).unwrap(), regex.compile(r"</style>", false).unwrap()];
+    let left = TranslateInput { text: "Earlier findings were clear. The treatment improved outcomes across".into(), placeholders: vec![], original_tokens: vec![] };
+    let right = TranslateInput { text: "several independent groups.".into(), placeholders: vec![], original_tokens: vec![] };
+    let plan = cross_page_protocol::plan_whole_sentence_reflow(&left, &right, &[], &patterns, &mut regex).unwrap().unwrap();
+    assert!(cross_page_protocol::reflow_whole_sentence_response(
+        &plan, "先前结果明确。", "治疗改善了多个独立组的结果。", &left, &right, &patterns, &mut regex,
+    ).unwrap().is_some());
+    assert!(cross_page_protocol::reflow_whole_sentence_response(
+        &plan, "先前结果明确。", "治疗改善了2个独立组的结果。", &left, &right, &patterns, &mut regex,
+    ).unwrap().is_none());
+    assert!(cross_page_protocol::reflow_whole_sentence_response(
+        &plan, "先前结果明确。", "治疗改善了3.14个独立组的结果。", &left, &right, &patterns, &mut regex,
     ).unwrap().is_none());
 }
 
@@ -410,7 +459,6 @@ fn reflow_stops_at_quoted_multilingual_and_decimal_sentence_boundaries() {
         ("The first translated sentence ends here\u{104b}", " Another sentence contains unrelated findings."),
         ("The first translated sentence ends here։", " Another sentence contains unrelated findings."),
         ("The first translated sentence ends here።", " Another sentence contains unrelated findings."),
-        ("The measured value was 3.14 across both groups.", " Another sentence contains unrelated findings."),
     ] {
         let without_next = cross_page_protocol::reflow_whole_sentence_response(
             &plan, "Earlier findings were clear.", first_sentence, &left, &right, &patterns, &mut regex,

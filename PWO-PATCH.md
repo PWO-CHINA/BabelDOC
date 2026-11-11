@@ -20,6 +20,11 @@ The optional cross-page experiment identifies conservative candidates and
 validates response structure. Eligible continuations can be translated as a
 complete sentence and redistributed to the original pages. Identified numeric
 continuations that cannot be handled as a whole fail with a review message.
+The numeric check compares recognized digit and operator expressions exactly;
+it is not a semantic check of units, written numbers, or other translations.
+Numeric formatting changes or unrecognized notation can require manual review.
+Decimal sentence boundaries are conservative: explicitly signed decimals can
+be recognized, while ambiguous unsigned decimals may be skipped or blocked.
 The option is disabled by default and does not ensure that every continuation
 is detected, translated correctly, or laid out safely.
 

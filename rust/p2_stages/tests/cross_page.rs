@@ -15,6 +15,7 @@ fn context_sentence_evidence_is_conservative() {
     assert!(accepts("A prior result was observed321. The treatment could be useful for", "circadian disorders and related conditions. Another observation follows."));
     assert!(accepts("The first finding was observed321. A second observation was reported322. The treatment could be useful for", "circadian disorders and related conditions. Another observation follows."));
     assert!(accepts("The treatment was associated with improved", "survival in the study population. Another observation follows."));
+    assert!(accepts("A value -3.14 indicates the unfinished", "the continuation ends here."));
     for (left, right) in [
         ("An incomplete heading", "the continuation ends here."),
         ("Dr. Smith studied the unfinished", "the continuation ends here."),
@@ -52,11 +53,28 @@ fn extracts_only_an_unambiguous_complete_sentence() {
         Some("The treatment could be useful for circadian disorders and related conditions.".into()));
     assert_eq!(extract("Earlier result was clear. The café treatment could be useful for", "éventual disorders and related conditions. Another observation follows."),
         Some("The café treatment could be useful for éventual disorders and related conditions.".into()));
+    assert_eq!(extract("Earlier result was clear. The measured value was -0.5 for", "the independent groups in this study."),
+        Some("The measured value was -0.5 for the independent groups in this study.".into()));
+    assert_eq!(extract("Earlier result was clear. The measured value was reported for", "the independent group as -0.5 units."),
+        Some("The measured value was reported for the independent group as -0.5 units.".into()));
+    assert_eq!(extract("The measured value was -0.5 for", "the independent groups in this study."),
+        Some("The measured value was -0.5 for the independent groups in this study.".into()));
+    assert_eq!(extract("Earlier result was clear. The final measurement was reported for", "the independent group as -0.5."),
+        Some("The final measurement was reported for the independent group as -0.5.".into()));
+    assert_eq!(extract("Earlier result was clear. The final measurement was reported for", "the independent group as -0.5. Another observation follows."),
+        Some("The final measurement was reported for the independent group as -0.5.".into()));
     for (left, right) in [
         ("Dr. Smith studied the unfinished", "the continuation ends here."),
         ("Earlier result was clear. The value of 3.14 continues across", "the page and ends here."),
         ("Earlier result was clear. The unfinished sentence continues across", "the value is 3.14 here."),
+        ("Earlier result was clear. The value of approx. continues across", "the page and ends here."),
+        ("Earlier result was clear. The unfinished sentence continues across", "the value is .14 here."),
         ("Earlier result was clear. The unfinished sentence continues across", "the following page"),
+        ("Earlier result was clear. The checklist includes the following step 1.2", "applies to sample collection."),
+        ("The checklist includes the following step 1.2", "applies to sample collection."),
+        ("Earlier result was clear. The method described in Section 1.2 includes", "several independent observations."),
+        ("Earlier result was clear. The software version v1.2 supports", "several independent observations."),
+        ("Earlier result was clear. The software version 1.2.3 supports", "several independent observations."),
     ] { assert_eq!(extract(left, right), None); }
 }
 
