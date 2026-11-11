@@ -137,6 +137,8 @@ max-complexity = 10 # 函数圈复杂度阈值
 "babeldoc/tools/executor/server.py" = ["N802"]
 "tests/*" = ["S101"]            # 在测试文件中允许 assert
 "scripts/*/tests/*" = ["S101", "S106"]  # scaffold tests: allow assert + token fixture
+"rust/p2_bridge/tests/test_cross_page_llm_direct_atomicity.py" = ["ARG001"]
+"scripts/crosspage_offline_validation.py" = ["S603", "S607"]
 "**/__init__.py" = ["F401"]     # 允许未使用的导入
 # 忽略 S311 警告，因为这是有意的
 "babeldoc/format/pdf/document_il/midend/paragraph_finder.py" = ["S311"]

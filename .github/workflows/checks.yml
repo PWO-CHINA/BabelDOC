@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Select Rust toolchain
         shell: bash
@@ -45,6 +47,72 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Offline cross-page native regressions
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          uv run --no-sync python - <<'PY'
+          import hashlib
+          import socket
+          import sys
+          import tempfile
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          import pytest
+          from babeldoc import _rust_il as native
+
+          font = (Path("C:/Windows/Fonts/arial.ttf") if sys.platform == "win32"
+                  else Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+          if not font.is_file():
+              raise SystemExit("Required synthetic-test font is unavailable")
+          if native.CROSS_PAGE_SENTENCE_PROTOCOL_VERSION != 1 or native.stage_capture_enabled():
+              raise SystemExit("Unexpected native protocol or stage-capture configuration")
+          print(f"Native module: {native.__file__}")
+          print(f"Native SHA-256: {hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest()}")
+
+          def deny_network(*args, **kwargs):
+              raise RuntimeError("Network access is disabled during synthetic tests")
+
+          socket.socket.connect = deny_network
+          socket.socket.connect_ex = deny_network
+          socket.socket.sendto = deny_network
+          socket.create_connection = deny_network
+          socket.getaddrinfo = deny_network
+          try:
+              socket.create_connection(("127.0.0.1", 9), timeout=0.1)
+          except RuntimeError:
+              print("Python network guard is active")
+          else:
+              raise SystemExit("Python network guard failed")
+
+          tests = [
+              "test_cross_page_config.py",
+              "test_cross_page_ordinary_entry.py",
+              "test_cross_page_llm_atomicity.py",
+              "test_cross_page_llm_direct_atomicity.py",
+              "test_cross_page_boundary_synthetic.py",
+              "test_cross_page_sample_validation.py",
+              "test_crosspage_formula_boundary_validation.py",
+              "test_crosspage_numbered_steps_validation.py",
+              "test_crosspage_signed_number_validation.py",
+              "test_crosspage_offline_stage_evidence.py",
+          ]
+          tests = [str(Path("rust/p2_bridge/tests") / name) for name in tests]
+          with tempfile.TemporaryDirectory() as directory:
+              report = Path(directory) / "cross-page.xml"
+              result = pytest.main(["-q", f"--junitxml={report}", *tests])
+              if result:
+                  raise SystemExit(int(result))
+              cases = ET.parse(report).getroot().findall(".//testcase")
+              if not cases or any(case.find("skipped") is not None for case in cases):
+                  raise SystemExit("Cross-page suite must run without skipped tests")
+              print(f"Cross-page cases executed: {len(cases)}")
+          PY
 
       - name: Import and CLI smoke
         run: |

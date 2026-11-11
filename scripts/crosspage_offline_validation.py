@@ -1,10 +1,8 @@
 """Run selected local cross-page samples with a synthetic translator."""
 
 import argparse
-import contextlib
 import codecs
-from collections import Counter
-from datetime import datetime, timezone
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -17,8 +15,10 @@ import sys
 import tempfile
 import traceback
 import unicodedata
+from collections import Counter
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
-
 
 RETRY_INSTRUCTION = "Return only the requested JSON. Preserve each item's placeholders exactly and in order.\n\n"
 PROTECTED_TEXT = re.compile(r"(<[^<>]*>|\{[^{}]*\}|(?<=\d)[eErR](?=[+-]?\d))")
@@ -594,7 +594,9 @@ def composition_sentence_evidence(left, right):
     right_stop = len(compact(right_text[:right_end]))
     formula_ends = [end for _, end, kind in left_ranges if kind == "formula"]
     spans = [(left_start, left_end, left_ranges), (0, right_stop, right_ranges)]
-    overlaps = lambda start, end, first, last: start < last and end > first
+    def overlaps(start, end, first, last):
+        return start < last and end > first
+
     result.update({
         "left_tail_after_all_formula_compositions": not formula_ends or left_start >= max(formula_ends),
         "right_sentence_and_end_in_first_rich_composition": bool(right_ranges) and right_ranges[0][2] == "rich" and right_stop <= right_ranges[0][1],
@@ -738,7 +740,8 @@ def tracking_evidence(output, target, expected_fragments):
 def run_sample(source, target, output, label, spec, capture_stages=False, translator_mode="identity"):
     import pymupdf
     from babeldoc.format.pdf.high_level import translate
-    from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
+    from babeldoc.format.pdf.translation_config import TranslationConfig
+    from babeldoc.format.pdf.translation_config import WatermarkOutputMode
     from babeldoc.translator.translator import BaseTranslator
 
     counts = {
@@ -843,7 +846,7 @@ def run_sample(source, target, output, label, spec, capture_stages=False, transl
             use_rich_pbar=False, experimental_cross_page_context=True,
             capture_stages=capture_stages, capture_dir=output / "capture",
         )
-        with open(os.devnull, "w", encoding="utf-8") as discard, contextlib.redirect_stdout(discard), contextlib.redirect_stderr(discard):
+        with Path(os.devnull).open("w", encoding="utf-8") as discard, contextlib.redirect_stdout(discard), contextlib.redirect_stderr(discard):
             translation = translate(config)
         result["output_geometry"] = output_geometry(Path(translation.mono_pdf_path), input_pages)
         result["output_geometry"]["sha256"] = digest(Path(translation.mono_pdf_path))

@@ -697,7 +697,9 @@ def test_default_off_matches_explicit_false_in_production(tmp_path):
 
 
 def test_cross_page_protocol_versions_match():
-    from babeldoc.format.pdf.translation_config import CROSS_PAGE_SENTENCE_PROTOCOL_VERSION
+    from babeldoc.format.pdf.translation_config import (
+        CROSS_PAGE_SENTENCE_PROTOCOL_VERSION,
+    )
 
     assert type(CROSS_PAGE_SENTENCE_PROTOCOL_VERSION) is int
     assert CROSS_PAGE_SENTENCE_PROTOCOL_VERSION == 1

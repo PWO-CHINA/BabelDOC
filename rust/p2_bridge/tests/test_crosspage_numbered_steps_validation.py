@@ -1,12 +1,13 @@
 import json
 
 import pytest
-
 from babeldoc import _rust_il
-
-from test_cross_page_llm_direct_atomicity import DirectApplicationService, Monitor, run_bridge
+from test_cross_page_llm_direct_atomicity import DirectApplicationService
+from test_cross_page_llm_direct_atomicity import Monitor
+from test_cross_page_llm_direct_atomicity import run_bridge
 from test_cross_page_sample_validation import document_with_caption
-from test_crosspage_formula_boundary_validation import ReversibleTranslator, synthetic_substitution
+from test_crosspage_formula_boundary_validation import ReversibleTranslator
+from test_crosspage_formula_boundary_validation import synthetic_substitution
 
 
 @pytest.mark.parametrize("step_number", ["2", "10"])
