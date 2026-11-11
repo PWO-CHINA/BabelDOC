@@ -1,0 +1,61 @@
+import json
+
+import pytest
+
+from babeldoc import _rust_il
+
+from test_cross_page_llm_direct_atomicity import DirectApplicationService, Monitor, run_bridge
+from test_cross_page_sample_validation import document_with_caption
+from test_crosspage_formula_boundary_validation import ReversibleTranslator, synthetic_substitution
+
+
+@pytest.mark.parametrize("step_number", ["2", "10"])
+@pytest.mark.parametrize("separator", [" ", "  "], ids=["single-space", "double-space"])
+def test_numbered_step_is_not_a_cross_page_continuation(tmp_path, step_number, separator):
+    document = document_with_caption(
+        caption_label="text", caption_size=10, obstacle=False,
+        left_text="Earlier measurements were complete. The first operation involved",
+        right_text=f"{step_number}.{separator}Calibrate the measurement system carefully.",
+    )
+    service = DirectApplicationService()
+    service.translator = ReversibleTranslator()
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.requests
+    assert service.translator.cross_page_requests == 0
+
+
+@pytest.mark.parametrize("step_number", ["2", "10"])
+def test_preceding_decimal_is_not_merged_into_numbered_step(tmp_path, step_number):
+    prior = "The reference level was -0.5."
+    step_tail = "The second operation involved"
+    right = "several independent checks before the sample was analyzed."
+    document = document_with_caption(
+        caption_label="text", caption_size=10, obstacle=False,
+        left_text=f"{prior} {step_number}. {step_tail}", right_text=right,
+    )
+    before = document.parser_artifact_hash()
+    service = DirectApplicationService()
+    service.translator = ReversibleTranslator()
+    blocked = False
+    try:
+        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    except RuntimeError as error:
+        blocked = True
+        assert "跨页数值续句" in str(error)
+        assert document.parser_artifact_hash() == before
+        assert not (tmp_path / "translate_tracking.json").exists()
+    for prompt in service.translator.requests:
+        if "## Cross-page continuation" not in prompt:
+            continue
+        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
+        matches = [item["input"] for item in items if step_tail + " " + right in item["input"]]
+        assert len(matches) == 1
+        assert prior not in matches[0]
+    if not blocked:
+        pages = json.loads(document.parser_artifact_json())["document"]["page"]
+        left = pages[0]["pdf_paragraph"][-1]["unicode"]
+        right_output = pages[1]["pdf_paragraph"][0]["unicode"]
+        assert synthetic_substitution(prior) in left
+        assert synthetic_substitution(prior) not in right_output
+        assert f"{step_number}." in left
+        assert f"{step_number}." not in right_output
