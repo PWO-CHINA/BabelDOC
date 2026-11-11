@@ -1,13 +1,13 @@
 import json
 
 import pytest
-
 from babeldoc import _rust_il
 from babeldoc.format.pdf.document_il import il_version_1 as il
-
-from test_cross_page_llm_direct_atomicity import DirectApplicationService, DirectTranslator, Monitor, run_bridge
+from test_cross_page_llm_direct_atomicity import DirectApplicationService
+from test_cross_page_llm_direct_atomicity import DirectTranslator
+from test_cross_page_llm_direct_atomicity import Monitor
+from test_cross_page_llm_direct_atomicity import run_bridge
 from test_crosspage_formula_boundary_validation import synthetic_substitution
-
 
 PREFIX = "Earlier findings were clear. "
 LEFT_TAIL = "The measured change was {left_number} units after"
@@ -175,3 +175,27 @@ def test_corrupted_signed_number_rejects_transaction(tmp_path, signed_page, expr
     assert service.translator.fallback_requests == 0
     assert document.parser_artifact_hash() == before
     assert not (tmp_path / "translate_tracking.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("expression", "replacement"),
+    [("-7", "7"), ("7%", "7"), ("1e-3", "1e3")],
+    ids=["sign", "percentage", "exponent"],
+)
+def test_corrupted_number_preserves_existing_tracking(tmp_path, expression, replacement):
+    document, texts = signed_document("left", expression, True)
+    before = document.parser_artifact_hash()
+    tracking = tmp_path / "translate_tracking.json"
+    original_tracking = b'{"sentinel": true}\n'
+    tracking.write_bytes(original_tracking)
+    service = DirectApplicationService()
+    service.translator = SignedNumberTranslator(expression, replacement)
+
+    with pytest.raises(RuntimeError, match="跨页数值续句"):
+        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+
+    assert_dedicated_sentence(service.translator, texts, replacement, True)
+    assert service.translator.fallback_requests == 0
+    assert document.parser_artifact_hash() == before
+    assert tracking.read_bytes() == original_tracking
+    assert not list(tmp_path.glob("translate_tracking.json.*.tmp"))

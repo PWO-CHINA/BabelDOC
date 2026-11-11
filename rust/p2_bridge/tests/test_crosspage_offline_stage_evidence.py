@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 import pyzstd
 
-
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "crosspage_offline_validation.py"
 SPEC = importlib.util.spec_from_file_location("crosspage_offline_validation", SCRIPT)
 validation = importlib.util.module_from_spec(SPEC)
