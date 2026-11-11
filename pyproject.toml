@@ -1,6 +1,6 @@
 [project]
 name = "BabelDOC"
-version = "0.7.1"
+version = "0.7.1+pwo.2.crosspage.16"
 description = "Yet Another Document Translator"
 license = "AGPL-3.0"
 readme = "README.md"

@@ -4,6 +4,9 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyInt, PyList, PyString, PyTuple};
 pub mod callbacks;
+pub(crate) mod cross_page;
+pub(crate) mod cross_page_llm;
+pub(crate) mod cross_page_transaction;
 pub mod font_mapper;
 mod formula_patterns;
 pub mod layout_parser;
@@ -110,6 +113,7 @@ impl FromPyValue for CurveDebugInfo {
 
 #[pymodule]
 fn _rust_il(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("CROSS_PAGE_SENTENCE_PROTOCOL_VERSION", 1_u8)?;
     module.add("ParserResourceLimitError", module.py().import("babeldoc.format.pdf.parser_resource")?.getattr("ParserResourceLimitError")?)?;
     callbacks::register(module)?;
     logging::register(module)?;

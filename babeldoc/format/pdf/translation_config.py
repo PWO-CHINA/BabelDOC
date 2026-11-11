@@ -17,6 +17,8 @@ from babeldoc.translator.translator import BaseTranslator
 
 logger = logging.getLogger(__name__)
 
+CROSS_PAGE_SENTENCE_PROTOCOL_VERSION = 1
+
 
 class WatermarkOutputMode(enum.Enum):
     Watermarked = "watermarked"
@@ -227,10 +229,14 @@ class TranslationConfig:
         capture_dir: str | Path | None = None,
         deterministic_output: bool = False,
         disable_parser_resource_limits: bool = False,
+        experimental_cross_page_context: bool = False,
     ):
         if type(disable_parser_resource_limits) is not bool:
             raise TypeError("disable_parser_resource_limits must be a bool")
+        if type(experimental_cross_page_context) is not bool:
+            raise TypeError("experimental_cross_page_context must be a bool")
         self.disable_parser_resource_limits = disable_parser_resource_limits
+        self.experimental_cross_page_context = experimental_cross_page_context
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
         initial_user_glossaries = list(glossaries) if glossaries else []

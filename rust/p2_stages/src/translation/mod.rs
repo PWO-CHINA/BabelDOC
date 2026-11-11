@@ -1,4 +1,10 @@
 pub mod automatic_term_extractor;
+pub mod cross_page_protocol;
+pub mod cross_page_sentence;
+pub mod cross_page_style;
+pub mod cross_page;
+pub mod cross_page_batch;
+pub mod cross_page_context;
 pub mod glossary;
 pub mod llm_only;
 pub mod ordinary_translation;

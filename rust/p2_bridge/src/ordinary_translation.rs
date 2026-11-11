@@ -141,6 +141,26 @@ pub(crate) fn legacy_pattern(service: &Bound<'_, PyAny>, method: &str) -> PyResu
     }
 }
 
+pub(crate) fn cross_page_patterns(service: &Bound<'_, PyAny>, regex: &mut RegexService<'_>) -> PyResult<Vec<u64>> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for method in ["get_formular_placeholder", "get_rich_text_left_placeholder", "get_rich_text_right_placeholder"] {
+        let value = service.call_method1(method, ("CROSSPAGEID",))?;
+        let pattern = if let Ok(tuple) = value.cast::<PyTuple>() {
+            let pattern: String = tuple.get_item(1)?.extract()?;
+            pattern.replace("CROSSPAGEID", r"\d+")
+        } else {
+            let token: String = value.extract()?;
+            if !token.contains("CROSSPAGEID") { return Err(PyTypeError::new_err("placeholder does not contain its identifier")); }
+            let escaped: String = service.py().import("re")?.call_method1("escape", (token,))?.extract()?;
+            escaped.replace("CROSSPAGEID", r"\d+")
+        };
+        let unique = if seen.insert(pattern.clone()) { pattern.as_str() } else { "(?!)" };
+        ids.push(regex.compile(unique, true)?);
+    }
+    Ok(ids)
+}
+
 pub(crate) fn character_text(
     values: Vec<ir::Cursor<babeldoc_ir_core::types::PdfCharacter>>,
     view: &TreeView<'_, impl Permission>,
@@ -816,6 +836,61 @@ impl PageFontMaps {
     }
 }
 
+#[cfg(test)]
+mod page_local_font_tests {
+    use super::*;
+
+    struct LiteralRegex(Vec<String>);
+    impl stage::PlaceholderRegex for LiteralRegex {
+        type Error = std::convert::Infallible;
+        fn compile(&mut self, pattern: &str, _: bool) -> Result<u64, Self::Error> {
+            self.0.push(pattern.into());
+            Ok((self.0.len() - 1) as u64)
+        }
+        fn matches(&mut self, pattern: u64, text: &str) -> Result<bool, Self::Error> {
+            Ok(!self.find_all(pattern, text)?.is_empty())
+        }
+        fn find_all(&mut self, pattern: u64, text: &str) -> Result<Vec<stage::RegexMatch>, Self::Error> {
+            Ok(text.match_indices(&self.0[pattern as usize]).map(|(start, value)| stage::RegexMatch {
+                full: value.into(), start: text[..start].chars().count(),
+                end: text[..start + value.len()].chars().count(), groups: vec![],
+            }).collect())
+        }
+    }
+
+    #[test]
+    fn literal_tokens_are_rejected_and_clean_input_is_validated() {
+        let mut regex = LiteralRegex(vec!["{v1}".into(), "{v1}".into(), "{v2}".into()]);
+        let mut input = stage::TranslateInput { text: "字{v1} {v1}".into(), placeholders: vec![], original_tokens: vec![] };
+        assert!(!validate_local_input(&mut input, "字{v1}", &[0, 1, 2], &mut regex).unwrap());
+        assert!(!validate_local_input(&mut input, "字{v1} {v1}", &[0, 1, 2], &mut regex).unwrap());
+        input.text = "普通文字".into();
+        input.original_tokens = vec![("stale".into(), 1)];
+        assert!(validate_local_input(&mut input, "普通文字", &[0, 1, 2], &mut regex).unwrap());
+        assert!(input.original_tokens.is_empty());
+        let mut overlap = LiteralRegex(vec!["{v1}".into(), "v1".into(), "{v2}".into()]);
+        assert!(!validate_local_input(&mut input, "字{v1}", &[0, 1, 2], &mut overlap).unwrap());
+        assert!(!validate_local_input(&mut input, "字{v1}", &[0, 1], &mut overlap).unwrap());
+    }
+
+    #[test]
+    fn page_and_xobject_font_resources_remain_separate() {
+        let normal = babeldoc_p2_stages::font_mapper::SourceFontStyle::default();
+        let mut bold = normal;
+        bold.bold = true;
+        let mut first = PageFontMaps::default();
+        first.fonts.insert("F1".into(), normal);
+        first.xobjects.insert(Some(7), HashMap::from([("F1".into(), bold)]));
+        let mut second = PageFontMaps::default();
+        second.fonts.insert("F1".into(), bold);
+        second.xobjects.insert(Some(7), HashMap::from([("F1".into(), normal)]));
+        assert!(!first.for_xobject(None)["F1"].bold);
+        assert!(first.for_xobject(Some(7))["F1"].bold);
+        assert!(second.for_xobject(None)["F1"].bold);
+        assert!(!second.for_xobject(Some(7))["F1"].bold);
+    }
+}
+
 fn merge_cross_page_font_maps(curr: &PageFontMaps, next: &PageFontMaps) -> PageFontMaps {
     let mut merged = curr.clone();
     merged.fonts.extend(next.fonts.clone());
@@ -847,6 +922,74 @@ fn page_font_maps_for(
         xobjects.insert(id, xobject_fonts);
     }
     Ok(PageFontMaps { fonts, xobjects })
+}
+
+fn validate_local_input<R: stage::PlaceholderRegex>(
+    input: &mut stage::TranslateInput,
+    source: &str,
+    patterns: &[u64],
+    regex: &mut R,
+) -> Result<bool, R::Error> {
+    if patterns.len() != 3 { return Ok(false); }
+    for &pattern in patterns {
+        if !regex.find_all(pattern, source)?.is_empty() { return Ok(false); }
+    }
+    input.original_tokens.clear();
+    babeldoc_p2_stages::translation::cross_page_protocol::validate_response(regex, input, &input.text, patterns)
+}
+
+pub(crate) fn rebuild_page_local_inputs(
+    document: &mut Document,
+    jobs: &mut [Job],
+    pair: [(usize, usize); 2],
+    service: &Bound<'_, PyAny>,
+    regex: &mut RegexService<'_>,
+    patterns: &stage::PlaceholderPatterns,
+    allow_rich: bool,
+    mapper: &FontMapperHandle,
+) -> PyResult<bool> {
+    if pair[0] == pair[1] {
+        return Err(PyRuntimeError::new_err("duplicate paragraph in cross-page pair"));
+    }
+    let mut indices = Vec::with_capacity(2);
+    for key in pair {
+        let mut found = jobs.iter().enumerate().filter(|(_, job)| (job.page, job.paragraph) == key);
+        let Some((index, _)) = found.next() else {
+            return Err(PyRuntimeError::new_err("cross-page paragraph job missing"));
+        };
+        if found.next().is_some() {
+            return Err(PyRuntimeError::new_err("duplicate cross-page paragraph job"));
+        }
+        indices.push(index);
+    }
+    let generic_patterns = cross_page_patterns(service, regex)?;
+    let view = document.view::<ReadOnlyView>();
+    let mut rebuilt: Vec<Job> = indices.iter().map(|&index| jobs[index].clone()).collect();
+    for ((page_index, paragraph_index), job) in pair.into_iter().zip(&mut rebuilt) {
+        let page = view.document().page_at(&view, page_index).map_err(access)?;
+        let paragraph = page.pdf_paragraph_at(&view, paragraph_index).map_err(access)?;
+        let vertical = paragraph.vertical(&view).map_err(access)?.unwrap_or(false);
+        let xobj_id = paragraph.xobj_id(&view).map_err(access)?;
+        let maps = page_font_maps_for(&view, page_index, &HashSet::from([xobj_id]))?;
+        let font_styles = maps.for_xobject(xobj_id);
+        let unicode = paragraph.unicode(&view).map_err(access)?.clone();
+        let tracker_unicode = job.tracker_unicode.clone();
+        rebuild_job_inputs(job, vertical, || {
+            let mut missing = None;
+            let input = build_input(&paragraph, &view, service, regex, patterns, allow_rich, mapper, font_styles, unicode.as_deref(), &mut missing)?;
+            let mut fallback_missing = None;
+            let fallback = build_input(&paragraph, &view, service, regex, patterns, allow_rich, mapper, font_styles, Some(&tracker_unicode), &mut fallback_missing)?;
+            Ok((input, fallback, missing, fallback_missing))
+        })?;
+        let Some(input) = job.input.as_mut() else { return Ok(false) };
+        if !validate_local_input(input, &job.text, &generic_patterns, regex)? { return Ok(false); }
+        let Some(fallback) = job.fallback_input.as_mut() else { return Ok(false) };
+        if !validate_local_input(fallback, &tracker_unicode, &generic_patterns, regex)? { return Ok(false); }
+    }
+    for (index, job) in indices.into_iter().zip(rebuilt) {
+        jobs[index] = job;
+    }
+    Ok(true)
 }
 
 /// Rebuild only inputs selected for cross-page LLM batches with the same
@@ -1465,6 +1608,16 @@ pub fn process(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<()> {
+    let cross_page_experiment = config
+        .getattr("experimental_cross_page_context")
+        .ok()
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    if cross_page_experiment {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Experimental cross-page translation requires an LLM translator; ordinary translators are not supported.",
+        ));
+    }
     let _native_font_mapper = &mapper.mapper;
     let root = crate::shared_context::root_from_handle(shared_context)?;
     let translator = translator_service.bind(py).clone();
@@ -1494,7 +1647,7 @@ pub fn process(
         regex.compile(&patterns.rich_right, true)?,
     ];
     let min_length = config.getattr("min_text_length")?.extract::<usize>()?;
-    let (jobs, page_lengths, total) = collect(
+    let (mut jobs, page_lengths, total) = collect(
         document,
         &root,
         &translator,
@@ -1505,6 +1658,43 @@ pub fn process(
         false,
         mapper,
     )?;
+    let candidates = if cross_page_experiment {
+        crate::cross_page::find_pairs(document, config).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let cross_page_ids = if candidates.is_empty() {
+        None
+    } else {
+        cross_page_patterns(&translator, &mut regex).ok()
+    };
+    let mut paired = Vec::new();
+    if let Some(ids) = &cross_page_ids {
+        let mut candidates_jobs = jobs.clone();
+        let mut safe = true;
+        for job in &mut candidates_jobs {
+            if !candidates.iter().any(|(left, right)| *left == (job.page, job.paragraph) || *right == (job.page, job.paragraph)) { continue; }
+            let Some(input) = &mut job.input else { continue };
+            let mut counts = std::collections::BTreeMap::new();
+            for id in ids {
+                match regex.find_all(*id, &job.text) {
+                    Ok(matches) => for found in matches { *counts.entry(found.full).or_insert(0) += 1; },
+                    Err(_) => { safe = false; break; }
+                }
+            }
+            input.original_tokens = counts.into_iter().collect();
+        }
+        if safe {
+            let prepared = crate::cross_page::prepare_pairs(&mut candidates_jobs, &candidates, &mut regex, ids, min_length);
+            for (left, right) in prepared {
+                let left_index = jobs.iter().position(|job| (job.page, job.paragraph) == (left.page, left.paragraph)).unwrap();
+                let right_index = jobs.iter().position(|job| (job.page, job.paragraph) == (right.page, right.paragraph)).unwrap();
+                paired.push((jobs[left_index].clone(), jobs[right_index].clone(), left, right));
+                jobs[left_index] = candidates_jobs[left_index].clone();
+                jobs[right_index] = candidates_jobs[right_index].clone();
+            }
+        }
+    }
     let workers = config
         .getattr("pool_max_workers")?
         .extract::<usize>()?
@@ -1567,6 +1757,7 @@ pub fn process(
             let mut submitted = 0usize;
             let mut translated = Vec::new();
             let mut admitted_tracking = Vec::new();
+            let pair_keys: HashSet<_> = paired.iter().flat_map(|(left, right, _, _)| [(left.page, left.paragraph), (right.page, right.paragraph)]).collect();
             for job in jobs {
                 if current_page != Some(job.page) {
                     current_page = Some(job.page);
@@ -1576,6 +1767,7 @@ pub fn process(
                     }
                 }
                 let page = job.page;
+                let report_progress = !pair_keys.contains(&(job.page, job.paragraph));
                 let slot = &mut tracking.page[page].paragraph[job.paragraph];
                 if job.missing_font_style.is_some() {
                     progress.report(1, None).map_err(|e| e.into_python())?;
@@ -1641,6 +1833,7 @@ pub fn process(
                         flag.clone(),
                         progress.clone(),
                         admitted,
+                        report_progress,
                     );
                     submitted += 1;
                     if submitted <= workers {
@@ -1657,6 +1850,7 @@ pub fn process(
                         flag.clone(),
                         progress.clone(),
                         admitted,
+                        report_progress,
                     );
                     submitted += 1;
                     if submitted <= workers {
@@ -1665,15 +1859,152 @@ pub fn process(
                     tokio::task::yield_now().await;
                 }
             }
+            let has_pairs = !paired.is_empty();
             while let Some(joined) = tasks.join_next().await {
+                if has_pairs && page_error.is_none() {
+                    page_error = flag.checkpoint().err();
+                }
                 match joined {
                     Ok(Ok(Some((job, response, content_filter)))) => {
                         translated.push((job, response, content_filter))
                     }
                     Ok(Ok(None)) => continue,
+                    Ok(Err(error)) if !has_pairs || page_error.is_none() => return Err(error),
+                    Err(error) if !has_pairs || page_error.is_none() => return Err(PyRuntimeError::new_err(error.to_string())),
+                    _ => continue,
+                }
+            }
+            if has_pairs {
+                if let Some(error) = page_error.take() {
+                    return Err(error);
+                }
+                flag.checkpoint()?;
+            }
+            let mut failed_pairs = HashSet::new();
+            let mut paired_results = HashSet::new();
+            let mut fallback_inputs = HashMap::new();
+            let mut fallback_jobs = Vec::new();
+            for (left, right, safe_left, safe_right) in paired {
+                let left_key = (left.page, left.paragraph);
+                let right_key = (right.page, right.paragraph);
+                let redistributed = Python::attach(|py| -> PyResult<Option<(String, String)>> {
+                    let mut regex = RegexService {
+                        service: regex_service_for_parse.bind(py).clone(),
+                    };
+                    let mut outputs = Vec::new();
+                    let mut inputs = Vec::new();
+                    for key in [left_key, right_key] {
+                        let mut matches = translated.iter().filter(|(job, _, _)| {
+                            (job.page, job.paragraph) == key
+                        });
+                        let Some((job, Ok(output), false)) = matches.next() else {
+                            return Ok(None);
+                        };
+                        if matches.next().is_some() {
+                            return Ok(None);
+                        }
+                        let Some(input) = job.input.as_ref() else {
+                            return Ok(None);
+                        };
+                        inputs.push(input);
+                        outputs.push(stage::normalize_response_punctuation(output));
+                    }
+                    babeldoc_p2_stages::translation::cross_page_protocol::redistribute_response(
+                        inputs[0], &outputs[0], inputs[1], &outputs[1],
+                        safe_left.input.as_ref().expect("prepared left input"),
+                        safe_right.input.as_ref().expect("prepared right input"),
+                        cross_page_ids.as_ref().expect("paired inputs have patterns"), &mut regex,
+                    )
+                }).unwrap_or(None);
+                if let Some((left_output, right_output)) = redistributed {
+                    translated.retain(|(job, _, _)| ![left_key, right_key].contains(&(job.page, job.paragraph)));
+                    for job in [&safe_left, &safe_right] {
+                        if let Some(entry) = admitted_tracking.iter_mut().find(|entry| (entry.0, entry.1) == (job.page, job.paragraph)) {
+                            let input = job.input.as_ref().expect("prepared original input");
+                            entry.3 = input.text.clone();
+                            entry.4 = input.original_tokens.clone();
+                            entry.5 = tracking_placeholders(input);
+                        }
+                    }
+                    translated.push((safe_left, Ok(left_output), false));
+                    translated.push((safe_right, Ok(right_output), false));
+                    paired_results.extend([left_key, right_key]);
+                    progress.report(2, None).map_err(|e| e.into_python())?;
+                } else {
+                    failed_pairs.extend([left_key, right_key]);
+                    fallback_inputs.insert(left_key, safe_left.input.clone());
+                    fallback_inputs.insert(right_key, safe_right.input.clone());
+                    fallback_jobs.extend([safe_left, safe_right]);
+                }
+            }
+            translated.retain(|(job, _, _)| {
+                !failed_pairs.contains(&(job.page, job.paragraph))
+            });
+            for job in fallback_jobs {
+                let Some(input) = job.input.as_ref() else {
+                    continue;
+                };
+                let text = if supports_llm {
+                    let context = stage::context_block(
+                        job.title.as_ref().map(|(id, text)| (id.as_str(), text.as_str())),
+                        job.local_title.as_ref().map(|(id, text)| (id.as_str(), text.as_str())),
+                        add_formula_hint.then(|| formula_hint(input)).flatten().as_deref(),
+                    );
+                    stage::render_prompt(&roles, &lang_out, &stage::glossary_block(&input.text, &glossaries), &context, &input.text)
+                } else { input.text.clone() };
+                let admitted = Arc::new(AtomicBool::new(false));
+                admitted_tracking.retain(|(page, paragraph, ..)| (*page, *paragraph) != (job.page, job.paragraph));
+                admitted_tracking.push((job.page, job.paragraph, job.text.clone(), input.text.clone(), input.original_tokens.clone(), tracking_placeholders(input), Arc::clone(&admitted)));
+                let slot = &mut tracking.page[job.page].paragraph[job.paragraph];
+                slot.llm_translate_trackers.clear();
+                let mut track = stage::LlmTracking::default();
+                if supports_llm { track.input = text.clone(); }
+                slot.llm_translate_trackers.push(track);
+                spawn_request(
+                    &mut tasks,
+                    Arc::clone(&pool),
+                    job,
+                    text,
+                    supports_llm,
+                    flag.clone(),
+                    progress.clone(),
+                    admitted,
+                    false,
+                );
+            }
+            while let Some(joined) = tasks.join_next().await {
+                flag.checkpoint()?;
+                match joined {
+                    Ok(Ok(Some((job, response, content_filter)))) => {
+                        if failed_pairs.contains(&(job.page, job.paragraph)) && (response.is_err() || content_filter) {
+                            return Err(PyRuntimeError::new_err("Cross-page fallback translation failed"));
+                        }
+                        if let Some(Some(input)) = fallback_inputs.get(&(job.page, job.paragraph)) {
+                            let valid = Python::attach(|py| -> PyResult<bool> {
+                                let mut regex = RegexService { service: regex_service_for_parse.bind(py).clone() };
+                                let text = stage::normalize_response_punctuation(response.as_ref().expect("response checked"));
+                                babeldoc_p2_stages::translation::cross_page_protocol::validate_response(
+                                    &mut regex, input, &text, cross_page_ids.as_ref().expect("paired inputs have patterns"),
+                                )
+                            }).unwrap_or(false);
+                            if !valid { return Err(PyRuntimeError::new_err("Cross-page fallback response validation failed")); }
+                        }
+                        translated.push((job, response, content_filter));
+                    }
+                    Ok(Ok(None)) => continue,
                     Ok(Err(error)) => return Err(error),
                     Err(error) => return Err(PyRuntimeError::new_err(error.to_string())),
                 }
+            }
+            if failed_pairs.iter().any(|key| !translated.iter().any(|(job, _, _)| (job.page, job.paragraph) == *key)) {
+                flag.checkpoint()?;
+                return Err(PyRuntimeError::new_err("Cross-page fallback response missing"));
+            }
+            if has_pairs {
+                flag.checkpoint()?;
+            }
+            for _ in 0..failed_pairs.len() / 2 {
+                progress.report(2, None).map_err(|e| e.into_python())?;
             }
             for (page, paragraph, pdf_unicode, input, originals, placeholders, admitted) in
                 admitted_tracking
@@ -1793,7 +2124,7 @@ pub fn process(
                                 &mut regex,
                                 input,
                                 &text,
-                                &hallucination_ids,
+                                if paired_results.contains(&(job.page, job.paragraph)) || failed_pairs.contains(&(job.page, job.paragraph)) { cross_page_ids.as_ref().expect("paired inputs have patterns") } else { &hallucination_ids },
                                 &mut removed,
                             )?;
                             Ok((parsed, full, removed))
@@ -1804,7 +2135,7 @@ pub fn process(
                         .map_err(access)?
                         .pdf_paragraph_at(&view, job.paragraph)
                         .map_err(access)?;
-                    if text != input.text {
+                    if text != input.text || paired_results.contains(&(job.page, job.paragraph)) {
                         paragraph
                             .set_unicode(&mut view, Some(text.clone()))
                             .map_err(access)?;
@@ -1951,6 +2282,7 @@ fn spawn_request(
     flag: CancelFlag,
     progress: PythonProgress,
     recorded: Arc<AtomicBool>,
+    report_progress: bool,
 ) -> oneshot::Receiver<()> {
     let (admitted_tx, admitted_rx) = oneshot::channel();
     tasks.spawn(async move {
@@ -1984,9 +2316,11 @@ fn spawn_request(
             .await;
         match response {
             Ok(Some(value)) => {
-                progress
-                    .report(1, None)
-                    .map_err(|error| error.into_python())?;
+                if report_progress {
+                    progress
+                        .report(1, None)
+                        .map_err(|error| error.into_python())?;
+                }
                 let result = Python::attach(|py| {
                     value
                         .bind(py)
@@ -1997,9 +2331,11 @@ fn spawn_request(
             }
             Ok(None) => Ok(None),
             Err(crate::callbacks::CallbackError::Python(error)) => {
-                progress
-                    .report(1, None)
-                    .map_err(|error| error.into_python())?;
+                if report_progress {
+                    progress
+                        .report(1, None)
+                        .map_err(|error| error.into_python())?;
+                }
                 let is_content_filter = Python::attach(|py| -> PyResult<bool> {
                     let class = py
                         .import("babeldoc.babeldoc_exception.BabelDOCException")?

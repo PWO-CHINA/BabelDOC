@@ -1013,6 +1013,40 @@ pub struct Typesetting {
     progress: bool,
     font_source_styles: HashMap<String, SourceFontStyle>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewRejection {
+    TargetMissing,
+    TypesettingFailed,
+    CaptureFailed,
+    MissingGlyph,
+    InvalidGlyphEvidence,
+    FormulaIdentityUnavailable,
+    ObstacleAndClipEvidenceUnavailable,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreviewGlyph {
+    pub text: Option<String>,
+    pub glyph_id: Option<i64>,
+    pub font_size: Option<f64>,
+    pub bounds: Option<crate::layout_audit::Bounds>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PreviewUnit {
+    Glyph(PreviewGlyph),
+    Formula { bounds: Option<crate::layout_audit::Bounds> },
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypesettingPreview {
+    pub glyphs: Vec<PreviewGlyph>,
+    pub units: Vec<PreviewUnit>,
+    pub rejections: Vec<PreviewRejection>,
+}
+
 impl Typesetting {
     pub fn new(
         lang: &str,
@@ -1523,14 +1557,17 @@ impl Typesetting {
         pages: &[Page],
         v: &mut View<'_>,
         ctx: &mut StageContext<'_>,
+        audit_checkpoints: bool,
     ) -> Result<(), StageError> {
         let mut weighted_scales = HashMap::<u64, (f64, usize)>::new();
         let mut nan_min = None;
         let mut has_weighted_scale = false;
         for page in pages.iter() {
+            if audit_checkpoints { ctx.check_cancelled()?; }
             ctx.report_progress(1, Some(pages.len() as u64 * 2))?;
             let fonts = self.font_map(page, v)?;
             for index in 0..page.pdf_paragraph_len(v)? {
+                if audit_checkpoints { ctx.check_cancelled()?; }
                 let p = page.pdf_paragraph_at(v, index)?;
                 let result = (|| {
                     let mut units = self.create_units(&p, &fonts, v)?;
@@ -1589,7 +1626,9 @@ impl Typesetting {
                 .or(nan_min)
                 .expect("a non-empty weighted scale distribution has a mode");
             for page in pages {
+                if audit_checkpoints { ctx.check_cancelled()?; }
                 for child_index in 0..page.pdf_paragraph_len(v)? {
+                    if audit_checkpoints { ctx.check_cancelled()?; }
                     let p = page.pdf_paragraph_at(v, child_index)?;
                     if p.optimal_scale(v)?.is_some_and(|s| s > limit) {
                         p.set_optimal_scale(v, Some(limit))?
@@ -1659,7 +1698,7 @@ impl Typesetting {
         let mut v = d.view::<TypesettingView>();
         let pages = v.document().page_iter(&v)?.collect::<Result<Vec<_>, _>>()?;
         if self.progress {
-            self.preprocess(&pages, &mut v, ctx)?
+            self.preprocess(&pages, &mut v, ctx, false)?
         }
         for p in pages.iter() {
             ctx.check_cancelled()?;
@@ -1672,6 +1711,98 @@ impl Typesetting {
         drop(v);
         d.compact();
         Ok(())
+    }
+
+    pub fn audit_fork(
+        &self,
+        document: &ir::Document,
+        targets: &[(usize, usize)],
+        ctx: &mut StageContext<'_>,
+    ) -> Result<Vec<TypesettingPreview>, StageError> {
+        let empty = || TypesettingPreview {
+            glyphs: Vec::new(),
+            units: Vec::new(),
+            rejections: vec![PreviewRejection::FormulaIdentityUnavailable, PreviewRejection::ObstacleAndClipEvidenceUnavailable],
+        };
+        let mut results: Vec<_> = targets.iter().map(|_| empty()).collect();
+        ctx.check_cancelled()?;
+        if targets.is_empty() { return Ok(results); }
+        if !self.progress {
+            for result in &mut results { result.rejections.push(PreviewRejection::CaptureFailed); }
+            return Ok(results);
+        }
+        let mut fork = document.fork();
+        let run = (|| {
+            let mut view = fork.view::<TypesettingView>();
+            let pages = view.document().page_iter(&view)?.collect::<Result<Vec<_>, _>>()?;
+            self.preprocess(&pages, &mut view, ctx, true)?;
+            for page in &pages {
+                ctx.check_cancelled()?;
+                self.render_page(page, &mut view)?;
+                ctx.report_progress(1, Some(pages.len() as u64 * 2))?;
+            }
+            drop(pages);
+            drop(view);
+            fork.compact();
+            Ok::<_, StageError>(())
+        })();
+        if let Err(error) = run {
+            if error == StageError::Cancelled { return Err(error); }
+            for result in &mut results { result.rejections.push(PreviewRejection::TypesettingFailed); }
+            return Ok(results);
+        }
+        let artifact = match fork.artifact() {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                for result in &mut results { result.rejections.push(PreviewRejection::CaptureFailed); }
+                return Ok(results);
+            }
+        };
+        for (&(page_index, paragraph_index), result) in targets.iter().zip(&mut results) {
+        let Some(paragraph) = artifact.get("document").and_then(|value| value.get("page"))
+            .and_then(|value| value.get(page_index)).and_then(|value| value.get("pdf_paragraph"))
+            .and_then(|value| value.get(paragraph_index)) else {
+            result.rejections.push(PreviewRejection::TargetMissing);
+            continue;
+        };
+        let Some(compositions) = paragraph.get("pdf_paragraph_composition").and_then(|value| value.as_array()) else {
+            result.rejections.push(PreviewRejection::CaptureFailed);
+            continue;
+        };
+        for composition in compositions {
+            let Some(character) = composition.get("pdf_character").filter(|value| !value.is_null()) else {
+                if let Some(formula) = composition.get("pdf_formula").filter(|value| !value.is_null()) {
+                    let bounds = formula.get("box").and_then(|value| Some(crate::layout_audit::Bounds {
+                        left: value.get("x")?.as_f64()?, bottom: value.get("y")?.as_f64()?,
+                        right: value.get("x2")?.as_f64()?, top: value.get("y2")?.as_f64()?,
+                    }));
+                    result.units.push(PreviewUnit::Formula { bounds });
+                } else {
+                    result.units.push(PreviewUnit::Unknown);
+                }
+                result.rejections.push(PreviewRejection::CaptureFailed);
+                continue;
+            };
+            let bounds = character.get("box").and_then(|value| Some(crate::layout_audit::Bounds {
+                left: value.get("x")?.as_f64()?, bottom: value.get("y")?.as_f64()?,
+                right: value.get("x2")?.as_f64()?, top: value.get("y2")?.as_f64()?,
+            }));
+            let glyph = PreviewGlyph {
+                text: character.get("char_unicode").and_then(|value| value.as_str()).map(str::to_owned),
+                glyph_id: character.get("pdf_character_id").and_then(|value| value.as_i64()),
+                font_size: character.get("pdf_style").and_then(|value| value.get("font_size")).and_then(|value| value.as_f64()),
+                bounds,
+            };
+            if glyph.glyph_id.is_none_or(|id| id <= 0) { result.rejections.push(PreviewRejection::MissingGlyph); }
+            if glyph.text.as_ref().is_none_or(String::is_empty) || glyph.font_size.is_none_or(|size| !size.is_finite() || size <= 0.0) || glyph.bounds.is_none() {
+                result.rejections.push(PreviewRejection::InvalidGlyphEvidence);
+            }
+            result.units.push(PreviewUnit::Glyph(glyph.clone()));
+            result.glyphs.push(glyph);
+        }
+        if result.glyphs.is_empty() { result.rejections.push(PreviewRejection::InvalidGlyphEvidence); }
+        }
+        Ok(results)
     }
 }
 fn width_before(units: &mut [TypesettingUnit], scale: f64) -> Result<f64, StageError> {

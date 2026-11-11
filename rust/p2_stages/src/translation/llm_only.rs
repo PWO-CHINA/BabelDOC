@@ -20,6 +20,29 @@ pub fn render_batch_prompt(
     local_title: Option<(&str, &str)>,
     glossaries: &[super::glossary::Glossary],
 ) -> String {
+    render_batch_prompt_with_template(PROMPT_TEMPLATE, role_block, lang_out, json_input, batch_text_for_glossary, title, local_title, glossaries)
+}
+
+pub(crate) fn context_prompt_template() -> String {
+    PROMPT_TEMPLATE.replace(
+        "2. Input paragraphs may be **sliced pieces of the same original paragraph**.  \n   → You MUST treat each input paragraph **as an independent, fixed unit**.  \n   → Do NOT merge paragraphs, split paragraphs, or move content between paragraphs.",
+        "## Cross-page continuation\n2. The two input paragraphs contain a sentence continuing across a page boundary. Understand and translate that sentence as a whole, using both paragraphs as context. A word ending with a hyphen at the boundary may be a line-break fragment or an actual hyphenated compound: use the context and do not translate either fragment as a separate word. Make the two outputs read naturally in order. Return exactly one output for each original id. Preserve each paragraph's content and its own placeholders, tags, and code in that paragraph; do not add, omit, or move content between paragraphs.",
+    ).replace(
+        "Inside each paragraph, you may adjust word order for fluency, but:",
+        "Use sentence-level context, while keeping each paragraph's content and placeholders in its original output:",
+    )
+}
+
+pub(crate) fn render_batch_prompt_with_template(
+    template: &str,
+    role_block: &str,
+    lang_out: &str,
+    json_input: &str,
+    batch_text_for_glossary: &str,
+    title: Option<(&str, &str)>,
+    local_title: Option<(&str, &str)>,
+    glossaries: &[super::glossary::Glossary],
+) -> String {
     let mut contextual_lines = Vec::new();
     if let Some((_, text)) = title {
         contextual_lines.push(format!("1. First title in full text: {text}"));
@@ -77,7 +100,7 @@ pub fn render_batch_prompt(
     values.insert("contextual_hints_block", contextual_hints_block.as_str());
     values.insert("glossary_tables_block", glossary_tables_block.as_str());
     values.insert("json_input_str", json_input);
-    super::python_semantics::template_substitute(PROMPT_TEMPLATE, &values)
+    super::python_semantics::template_substitute(template, &values)
         .unwrap_or_else(|_| String::new())
 }
 
@@ -138,10 +161,18 @@ fn eligible(p: &ParagraphFacts, min_text_length: usize, body: bool) -> bool {
 /// Produces submissions in source order. `multi_paragraph_id` is assigned at
 /// submission time, before any worker can finish.
 pub fn plan_batches(pages: &[Vec<ParagraphFacts>], min_text_length: usize) -> Vec<BatchPlan> {
+    plan_batches_with_cross_page(pages, min_text_length, true)
+}
+
+pub fn plan_batches_page_local(pages: &[Vec<ParagraphFacts>], min_text_length: usize) -> Vec<BatchPlan> {
+    plan_batches_with_cross_page(pages, min_text_length, false)
+}
+
+fn plan_batches_with_cross_page(pages: &[Vec<ParagraphFacts>], min_text_length: usize, cross_page: bool) -> Vec<BatchPlan> {
     let mut translated = std::collections::HashSet::<ParagraphId>::new();
     let mut batches = Vec::new();
     let mut next_id = 1usize;
-    for page in 0..pages.len().saturating_sub(1) {
+    for page in 0..if cross_page { pages.len().saturating_sub(1) } else { 0 } {
         let left = pages[page]
             .iter()
             .enumerate()

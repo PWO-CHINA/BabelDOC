@@ -10,6 +10,7 @@ regex = "=1.13.1"
 aho-corasick = "=1.1.5"
 tiktoken-rs = "=0.12.1"
 serde_json = { workspace = true }
+serde = { workspace = true }
 fastrand = "=2.5.0"
 log = { workspace = true }
 babeldoc-ir-core = { path = "../ir_core" }

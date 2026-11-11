@@ -50,7 +50,7 @@ def stored_scalar(cls, field, expression):
 def generate_tables(classes, rust_type):
     """Typed storage, and relocation of edges without changing object identity."""
     tables = [c for c in classes if c.__name__ in TABLE_TYPES]
-    out = ["#[derive(Default)] struct TypedTables {"]
+    out = ["#[derive(Clone, Default)] struct TypedTables {"]
     out += [f"{c.__name__.lower()}:Vec<StoredNode<Data{c.__name__}>>," for c in tables]
     out += [
         "}",
@@ -191,7 +191,7 @@ def generate_core(classes, rust_type):
         "_=>false}} pub fn is_table(self)->bool {match self {",
         *[f"Self::{name}=>true," for name in sorted(TABLE_TYPES)],
         "_=>false}}}",
-        "pub enum Edge {",
+        "#[derive(Clone)] pub enum Edge {",
         "Inline(std::boxed::Box<Node>),Shared(usize),",
         *[
             f"Immutable{c.__name__}(Arc<ImmutableNode<Data{c.__name__}>>),"
@@ -237,7 +237,7 @@ def generate_core(classes, rust_type):
         out += ["}"]
     out += [
         "}",
-        "pub enum NodeData {",
+        "#[derive(Clone)] pub enum NodeData {",
         *[f"{c.__name__}(Data{c.__name__})," for c in classes],
         "}",
     ]
@@ -261,7 +261,7 @@ def generate_core(classes, rust_type):
             if name == "PdfPath" and not init:
                 continue
             struct = f"{name}Init" if init else f"Data{name}"
-            out += [f"#[derive(Default)] pub struct {struct} {{"]
+            out += [f"#[derive({'Default' if init else 'Clone, Default'})] pub struct {struct} {{"]
             out += [
                 f"pub {f}:{'CurveCtm' if name == 'PdfCurve' and f == 'ctm' and not init else field_typ(o, m, c, s, init)},"
                 for _, f, o, m, c, s in fs

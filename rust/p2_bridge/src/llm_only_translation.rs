@@ -10,6 +10,7 @@ use babeldoc_p2_stages::{
     ProgressReporter,
     runtime::shared_context::SharedContextRoot,
     translation::{
+        cross_page_context,
         llm_only as stage,
         ordinary_translation::{self as ordinary_stage, PlaceholderRegex},
         token_count::count_tokens,
@@ -41,6 +42,12 @@ struct Work {
     admitted: Arc<AtomicBool>,
     tracker_group: usize,
     skipped_count: usize,
+    cross_page_context: bool,
+    context_sentence: Option<String>,
+    context_aliases: Option<cross_page_context::StyleAliases>,
+    partitioned_aliases: Option<cross_page_context::StyleAliases<3>>,
+    whole_sentence: Option<babeldoc_p2_stages::translation::cross_page_protocol::WholeSentenceMove>,
+    numeric_continuation: bool,
 }
 
 #[derive(Clone)]
@@ -53,6 +60,7 @@ struct Output {
     tracker_kind: stage::GroupKind,
     tracker_group: usize,
     tracker_index: usize,
+    context_group: Option<usize>,
 }
 
 struct FallbackRequest {
@@ -249,28 +257,189 @@ pub fn process(
     });
     let cross_title = initial_first.or_else(|| first_title.clone());
     let cross_recent = initial_recent.or(first_title);
-    let plans = stage::plan_batches(&facts, min_length);
-    let cross_page_pairs = plans
-        .iter()
-        .filter(|plan| plan.kind == stage::GroupKind::CrossPage)
-        .filter_map(|plan| match plan.paragraphs.as_slice() {
-            [left, right] => Some([(left.page, left.index), (right.page, right.index)]),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let context_enabled = config
+        .getattr("experimental_cross_page_context")
+        .ok()
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    let continuation_pairs = if context_enabled {
+        crate::cross_page::find_pairs(document, config)?
+    } else {
+        Vec::new()
+    };
+    let mut plans = if context_enabled {
+        stage::plan_batches_page_local(&facts, min_length)
+    } else {
+        stage::plan_batches(&facts, min_length)
+    };
     let mut regex = RegexService {
         service: translator.clone(),
     };
-    ordinary::rebuild_cross_page_inputs(
-        document,
-        &mut jobs,
-        &cross_page_pairs,
-        &translator,
-        &mut regex,
-        &patterns,
-        !disable_rich,
-        mapper,
-    )?;
+    let context_patterns = if context_enabled {
+        ordinary::cross_page_patterns(&translator, &mut regex).ok()
+    } else {
+        None
+    };
+    if context_enabled && context_patterns.is_none() {
+        for &(left, right) in &continuation_pairs {
+            let left_text = jobs.iter().find(|job| (job.page, job.paragraph) == left).map(|job| job.text.as_str());
+            let right_text = jobs.iter().find(|job| (job.page, job.paragraph) == right).map(|job| job.text.as_str());
+            if matches!((left_text, right_text), (Some(left), Some(right)) if babeldoc_p2_stages::translation::cross_page::numeric_continuation_needs_review(left, right)) {
+                return Err(py_error("跨页数值续句无法校验占位符；请人工核对。"));
+            }
+        }
+    }
+    if !context_enabled {
+        let original_cross_page_pairs = stage::plan_batches(&facts, min_length)
+            .iter()
+            .filter(|plan| plan.kind == stage::GroupKind::CrossPage)
+            .filter_map(|plan| match plan.paragraphs.as_slice() {
+                [left, right] => Some([(left.page, left.index), (right.page, right.index)]),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ordinary::rebuild_cross_page_inputs(
+            document,
+            &mut jobs,
+            &original_cross_page_pairs,
+            &translator,
+            &mut regex,
+            &patterns,
+            !disable_rich,
+            mapper,
+        )?;
+    }
+    let mut accepted_pairs = Vec::new();
+    let mut context_checklists = HashMap::new();
+    let mut context_sentences = HashMap::new();
+    let mut context_aliases = HashMap::new();
+    let mut partitioned_context_aliases = HashMap::new();
+    let mut whole_sentences = HashMap::new();
+    let mut numeric_pairs = std::collections::HashSet::new();
+    if context_patterns.is_some() {
+        for &(left, right) in &continuation_pairs {
+            let left_text = jobs.iter().find(|job| (job.page, job.paragraph) == left).map(|job| job.text.as_str());
+            let right_text = jobs.iter().find(|job| (job.page, job.paragraph) == right).map(|job| job.text.as_str());
+            if !matches!((left_text, right_text), (Some(left), Some(right)) if babeldoc_p2_stages::translation::cross_page::has_context_sentence_evidence(left, right)) {
+                continue;
+            }
+            let numeric = babeldoc_p2_stages::translation::cross_page::numeric_continuation_needs_review(
+                left_text.expect("eligible left text"), right_text.expect("eligible right text"),
+            );
+            if !crate::cross_page_llm::is_context_pair(&continuation_pairs, &[left, right], &jobs, min_length) {
+                if numeric { return Err(py_error("跨页数值续句无法安排成对翻译；请人工核对。")); }
+                continue;
+            }
+            let mut trial_jobs = jobs.clone();
+            let ready = ordinary::rebuild_page_local_inputs(
+                document, &mut trial_jobs, [left, right], &translator, &mut regex,
+                &patterns, !disable_rich, mapper,
+            ).unwrap_or(false);
+            if !ready || !crate::cross_page_llm::is_context_pair(&continuation_pairs, &[left, right], &trial_jobs, min_length) {
+                if numeric { return Err(py_error("跨页数值续句无法准备原页内容；请人工核对。")); }
+                continue;
+            }
+            if [left, right].iter().any(|key| trial_jobs.iter().find(|job| (job.page, job.paragraph) == *key)
+                .is_none_or(|job| job.fallback_missing_font_style.is_some()
+                    || job.fallback_input.as_ref().is_none_or(|input| input.text.chars().count() < min_length))) {
+                if numeric { return Err(py_error("跨页数值续句无法准备原页内容；请人工核对。")); }
+                continue;
+            }
+            let pair_inputs = [left, right].map(|key| trial_jobs.iter().find(|job| (job.page, job.paragraph) == key)
+                .and_then(|job| job.input.clone()).expect("eligible context input"));
+            let Some(sentence) = babeldoc_p2_stages::translation::cross_page::extract_context_sentence(
+                left_text.expect("eligible left text"), right_text.expect("eligible right text"),
+            ) else {
+                if numeric { return Err(py_error("跨页数值续句无法识别完整句子；请人工核对。")); }
+                continue
+            };
+            let ids = context_patterns.as_ref().expect("context patterns");
+            let whole_sentence = match crate::cross_page::protected_ranges(&mut regex, &pair_inputs[0], ids)? {
+                Some(ranges) => {
+                    let plan = babeldoc_p2_stages::translation::cross_page_protocol::plan_partitioned_sentence(
+                        &pair_inputs[0], &pair_inputs[1], &ranges, &sentence, ids, &mut regex,
+                    )?;
+                    let plan = match plan {
+                        Some(plan) => Some(plan),
+                        None if matches!(pair_inputs[0].placeholders.last(), Some(ordinary_stage::InputPlaceholder::Rich(_))) => None,
+                        None => babeldoc_p2_stages::translation::cross_page_protocol::plan_whole_sentence_reflow(
+                            &pair_inputs[0], &pair_inputs[1], &ranges, ids, &mut regex,
+                        )?,
+                    };
+                    match plan {
+                        Some(plan) => Some(plan),
+                        None => babeldoc_p2_stages::translation::cross_page_protocol::plan_plain_to_styled_sentence(
+                            &pair_inputs[0], &pair_inputs[1], &ranges, &sentence, ids, &mut regex,
+                        )?,
+                    }
+                },
+                None => None,
+            };
+            if numeric && whole_sentence.is_none() {
+                return Err(py_error("跨页续句包含跨页数值，当前无法可靠翻译整句；请关闭实验选项并人工核对该处。"));
+            }
+            if whole_sentence.is_none() { continue; }
+            let request_inputs = whole_sentence.as_ref().map_or_else(|| pair_inputs.clone(), |plan| [plan.inputs.left.clone(), plan.inputs.right.clone()]);
+            let following = whole_sentence.as_ref().and_then(|plan| plan.following.as_ref());
+            let aliases = if following.is_none() {
+                cross_page_context::StyleAliases::prepare(&request_inputs, &sentence, ids, &mut regex).unwrap_or(None)
+            } else { None };
+            let triple_inputs = following.map(|following| [request_inputs[0].clone(), request_inputs[1].clone(), following.clone()]);
+            let partitioned_aliases = triple_inputs.as_ref().and_then(|inputs| {
+                cross_page_context::StyleAliases::prepare(inputs, &sentence, ids, &mut regex).unwrap_or(None)
+            });
+            let checklist = if let Some(triple) = &triple_inputs {
+                let inputs = partitioned_aliases.as_ref().map_or(triple, |value| &value.inputs);
+                cross_page_context::placeholder_checklist(inputs, ids, &mut regex).unwrap_or(None)
+            } else {
+                let inputs = aliases.as_ref().map_or(&request_inputs, |value| &value.inputs);
+                cross_page_context::placeholder_checklist(inputs, ids, &mut regex).unwrap_or(None)
+            };
+            let Some(mut checklist) = checklist else {
+                if numeric { return Err(py_error("跨页数值续句无法校验占位符；请人工核对。")); }
+                continue
+            };
+            if aliases.is_some() || partitioned_aliases.is_some() {
+                checklist.push_str("\nSome numbered placeholders mark style boundaries. Preserve each one exactly and in order, and translate the human-readable text between them.");
+            }
+            let extra_tokens = count_tokens(&format!("{checklist}\n\n"));
+            let sentence_tokens = count_tokens(&cross_page_context::read_only_sentence_block(&sentence));
+            let input_tokens = if let Some(triple) = &triple_inputs {
+                partitioned_aliases.as_ref().map_or(triple, |value| &value.inputs).iter().map(|input| count_tokens(&input.text)).sum::<usize>()
+            } else {
+                aliases.as_ref().map_or(&request_inputs, |value| &value.inputs).iter().map(|input| count_tokens(&input.text)).sum::<usize>()
+            };
+            let mut trial_plans = plans.clone();
+            crate::cross_page_llm::prioritize_context_pairs(
+                &mut trial_plans, &[(left, right)], &trial_jobs, min_length,
+            );
+            let paired = trial_plans.iter_mut().find(|plan| {
+                plan.kind == stage::GroupKind::CrossPage
+                    && plan.paragraphs.as_slice() == [
+                        stage::ParagraphId { page: left.0, index: left.1 },
+                        stage::ParagraphId { page: right.0, index: right.1 },
+                    ]
+            });
+            if let Some(plan) = paired {
+                let Some(total) = cross_page_context::context_token_budget(plan.token_count.max(input_tokens), extra_tokens, sentence_tokens, 1_048_576) else {
+                    if numeric { return Err(py_error("跨页数值续句超出翻译请求长度；请人工核对。")); }
+                    continue
+                };
+                plan.token_count = total;
+                jobs = trial_jobs;
+                plans = trial_plans;
+                accepted_pairs.push((left, right));
+                context_checklists.insert((left, right), checklist);
+                context_sentences.insert((left, right), sentence);
+                if let Some(plan) = whole_sentence { whole_sentences.insert((left, right), plan); }
+                if numeric { numeric_pairs.insert((left, right)); }
+                if let Some(aliases) = aliases { context_aliases.insert((left, right), aliases); }
+                if let Some(aliases) = partitioned_aliases { partitioned_context_aliases.insert((left, right), aliases); }
+            } else if numeric {
+                return Err(py_error("跨页数值续句无法安排成对翻译；请人工核对。"));
+            }
+        }
+    }
     let workers = config
         .getattr("pool_max_workers")?
         .extract::<usize>()?
@@ -327,7 +496,6 @@ pub fn process(
             inputs.push(input.text.clone());
             json_items.push((input.text.clone(), label, hint));
         }
-        let serialized = stage::batch_json(&json_items, formula_hints);
         let matching_text = json_items
             .iter()
             .map(|(input, _, _)| input.as_str())
@@ -345,15 +513,55 @@ pub fn process(
         };
         let title = title_value.map(|(id, text)| (id.as_str(), text.as_str()));
         let local_title = local_title_value.map(|(id, text)| (id.as_str(), text.as_str()));
-        let prompt = stage::render_batch_prompt(
-            &roles,
-            &lang,
-            &serialized,
-            &matching_text,
-            title,
-            local_title,
-            &glossaries,
-        );
+        let keys = batch.paragraphs.iter().map(|id| (id.page, id.index)).collect::<Vec<_>>();
+        let cross_page_context = context_enabled
+            && context_patterns.is_some()
+            && batch.kind == stage::GroupKind::CrossPage
+            && prepare_error.is_none()
+            && json_items.len() == 2
+            && crate::cross_page_llm::is_context_pair(&accepted_pairs, &keys, &work_jobs, min_length);
+        let aliases = if cross_page_context { context_aliases.get(&(keys[0], keys[1])).cloned() } else { None };
+        let partitioned_aliases = if cross_page_context { partitioned_context_aliases.get(&(keys[0], keys[1])).cloned() } else { None };
+        let whole_sentence = if cross_page_context { whole_sentences.get(&(keys[0], keys[1])).cloned() } else { None };
+        if let Some(plan) = &whole_sentence {
+            for (item, input) in json_items.iter_mut().zip([&plan.inputs.left, &plan.inputs.right]) {
+                item.0 = input.text.clone();
+            }
+        }
+        if let Some(aliases) = &aliases {
+            for (item, input) in json_items.iter_mut().zip(&aliases.inputs) {
+                item.0 = input.text.clone();
+            }
+        }
+        if let Some(plan) = &whole_sentence {
+            if let Some(following) = &plan.following {
+                json_items.push((following.text.clone(), work_jobs[1].layout_label.clone(), None));
+                if let Some(aliases) = &partitioned_aliases {
+                    for (item, input) in json_items.iter_mut().zip(&aliases.inputs) {
+                        item.0 = input.text.clone();
+                    }
+                }
+            }
+        }
+        let serialized = stage::batch_json(&json_items, formula_hints);
+        let prompt = if cross_page_context {
+            let checklist = context_checklists.get(&(keys[0], keys[1])).expect("accepted context checklist");
+            if whole_sentence.as_ref().is_some_and(|plan| plan.following.is_some()) {
+                cross_page_context::render_partitioned_sentence_batch_prompt_with_checklist(
+                    &roles, &lang, &serialized, &matching_text, title, local_title, &glossaries, checklist,
+                )
+            } else if whole_sentence.is_some() {
+                cross_page_context::render_whole_sentence_batch_prompt_with_checklist(
+                    &roles, &lang, &serialized, &matching_text, title, local_title, &glossaries, checklist,
+                )
+            } else {
+                cross_page_context::render_context_batch_prompt_with_checklist(
+                    &roles, &lang, &serialized, &matching_text, title, local_title, &glossaries, checklist,
+                )
+            }
+        } else {
+            stage::render_batch_prompt(&roles, &lang, &serialized, &matching_text, title, local_title, &glossaries)
+        };
         let title_context = title_value.cloned();
         let local_title_context = local_title_value.cloned();
         let group = if batch.kind == stage::GroupKind::Page {
@@ -379,6 +587,12 @@ pub fn process(
             admitted,
             tracker_group: group,
             skipped_count,
+            cross_page_context,
+            context_sentence: (cross_page_context && whole_sentence.is_none()).then(|| context_sentences.get(&(keys[0], keys[1])).cloned()).flatten(),
+            context_aliases: aliases,
+            partitioned_aliases,
+            numeric_continuation: cross_page_context && numeric_pairs.contains(&(keys[0], keys[1])),
+            whole_sentence,
         });
         let _ = group;
     }
@@ -534,7 +748,8 @@ pub fn process(
                 let admitted = Arc::clone(&work.admitted);
                 let req_flag = flag.clone();
                 let (args, kwargs) = Python::attach(|py| {
-                    request_args(py, &work.prompt, work.batch.token_count, true)
+                    let request_prompt = cross_page_context::add_read_only_sentence(&work.prompt, work.context_sentence.as_deref());
+                    request_args(py, &request_prompt, work.batch.token_count, true)
                 })?;
                 let pool = Arc::clone(&pool_a);
                 let prompt = work.prompt.clone();
@@ -629,14 +844,113 @@ pub fn process(
                 if !work.admitted.load(Ordering::Acquire) {
                     continue;
                 }
-                let (response, tracker_output, request_error) = match response {
+                if work.cross_page_context {
+                    flag.checkpoint()?;
+                }
+                let request_succeeded = matches!(&response, Some(Ok(_)));
+                let (mut response, mut tracker_output, mut request_error) = match response {
                     Some(Ok((value, tracker_output))) => (value, tracker_output, None),
                     Some(Err((error, tracker_output))) => {
                         (String::new(), tracker_output, Some(error))
                     }
                     None => (String::new(), None, None),
                 };
-                let parsed = stage::interpret_response(&response, &inputs, false);
+                if work.cross_page_context && request_succeeded {
+                    let structurally_valid = Python::attach(|py| -> PyResult<bool> {
+                        let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                        let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
+                        let pair_inputs = [work.jobs[0].input.clone().expect("context input"), work.jobs[1].input.clone().expect("context input")];
+                        if let Some(plan) = &work.whole_sentence {
+                            Ok(crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), work.partitioned_aliases.as_ref(), &pair_inputs, &ids, &mut regex)?.is_some())
+                        } else if let Some(aliases) = &work.context_aliases {
+                            Ok(aliases.decode(&response, &ids, &mut regex)?.is_some())
+                        } else {
+                            Ok(cross_page_context::validate_pair(&response, &pair_inputs, &ids, &mut regex)?.is_some())
+                        }
+                    })?;
+                    let retry_count = work.batch.token_count.checked_add(count_tokens(cross_page_context::RETRY_INSTRUCTION))
+                        .filter(|count| *count < 1_048_576);
+                    if retry_count.is_some() && cross_page_context::should_retry(true, true, structurally_valid, false, flag.is_cancelled()) {
+                        flag.checkpoint()?;
+                        tracker_output = None;
+                        let retry_prompt = format!("{}{}", cross_page_context::RETRY_INSTRUCTION, cross_page_context::add_read_only_sentence(&work.prompt, work.context_sentence.as_deref()));
+                        let retry_count = retry_count.expect("checked retry budget");
+                        let (args, kwargs) = Python::attach(|py| request_args(py, &retry_prompt, retry_count, true))?;
+                        let retry_flag = flag.clone();
+                        let retry = pool_a.request("llm_translate", format!("llm-only-retry:{}", work.batch.id), args, Some(kwargs), 1_048_576 - retry_count as i64, move || !retry_flag.is_cancelled()).await;
+                        flag.checkpoint()?;
+                        match retry {
+                            Ok(Some(value)) => {
+                                response = Python::attach(|py| value.bind(py).extract::<String>()).unwrap_or_default();
+                                request_error = None;
+                            }
+                            Ok(None) | Err(crate::callbacks::CallbackError::Python(_)) => {
+                                response.clear();
+                                request_error = Some("Cross-page retry failed".into());
+                            }
+                            Err(crate::callbacks::CallbackError::Bridge(error)) => return Err(py_error(error)),
+                        }
+                    }
+                    if !structurally_valid { tracker_output = None; }
+                }
+                if work.cross_page_context && request_error.is_some() {
+                    request_error = Some("Cross-page request failed".into());
+                    tracker_output = None;
+                }
+                if work.cross_page_context && request_error.is_none() {
+                    if let Some(plan) = &work.whole_sentence {
+                        response = Python::attach(|py| -> PyResult<Option<String>> {
+                            let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                            let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
+                            let pair_inputs = [work.jobs[0].input.clone().expect("context input"), work.jobs[1].input.clone().expect("context input")];
+                            crate::cross_page_llm::reflow_response(plan, &response, work.context_aliases.as_ref(), work.partitioned_aliases.as_ref(), &pair_inputs, &ids, &mut regex)
+                        })?.unwrap_or_default();
+                    } else if let Some(aliases) = &work.context_aliases {
+                        response = Python::attach(|py| -> PyResult<Option<String>> {
+                            let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                            let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
+                            aliases.decode(&response, &ids, &mut regex)
+                        })?.unwrap_or_default();
+                    }
+                }
+                let mut parsed = stage::interpret_response(&response, &inputs, false);
+                if work.cross_page_context {
+                    let valid = if request_error.is_none()
+                        && parsed.error.is_none()
+                        && parsed.fallback_indices.is_empty()
+                        && parsed.items.len() == 2
+                    {
+                        Python::attach(|py| -> PyResult<bool> {
+                            let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                            let ids = ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex)?;
+                            let pair_inputs = [
+                                work.jobs[0].input.clone().expect("context input"),
+                                work.jobs[1].input.clone().expect("context input"),
+                            ];
+                            let Some(validated) = cross_page_context::validate_pair(&response, &pair_inputs, &ids, &mut regex)? else {
+                                return Ok(false);
+                            };
+                            Ok(parsed.items.iter().all(|item| {
+                                item.id < 2 && item.output == validated[item.id]
+                            }))
+                        })?
+                    } else {
+                        false
+                    };
+                    if !valid {
+                        if work.numeric_continuation {
+                            return Err(py_error("跨页数值续句未能完成整句翻译或拆分；请重试并人工核对。"));
+                        }
+                        tracker_output = None;
+                        parsed.items.clear();
+                        parsed.fallback_indices = (0..inputs.len()).collect();
+                        parsed.fallback_errors.clear();
+                        parsed.processed = 0;
+                        parsed.ok_count = 0;
+                        parsed.fallback_count = 0;
+                        parsed.error = Some("Cross-page response validation failed".into());
+                    }
+                }
                 let outer_error = request_error.is_some() || parsed.error.is_some();
                 counters_out.0.fetch_add(parsed.ok_count, Ordering::Relaxed);
                 counters_out.1.fetch_add(
@@ -765,6 +1079,7 @@ pub fn process(
                             tracker_kind,
                             tracker_group,
                             tracker_index,
+                            context_group: work.cross_page_context.then_some(group_index),
                         });
                         progress.report(1, None).map_err(|e| e.into_python())?;
                     }
@@ -784,14 +1099,23 @@ pub fn process(
                         }
                     }
                     for _ in 0..fallback_times {
+                        if work.cross_page_context {
+                            flag.checkpoint()?;
+                        }
                         let Some(request) =
                             fallback_request(&job, formula_hints, llm_error.is_some())
                         else {
+                            if work.cross_page_context {
+                                return Err(py_error("Cross-page fallback input unavailable"));
+                            }
                             progress.report(1, None).map_err(|e| e.into_python())?;
                             continue;
                         };
                         let text = request.text.clone();
                         if text.chars().count() < min_length {
+                            if work.cross_page_context {
+                                return Err(py_error("Cross-page fallback input too short"));
+                            }
                             progress.report(1, None).map_err(|e| e.into_python())?;
                             continue;
                         }
@@ -823,6 +1147,7 @@ pub fn process(
                         let input_for_task = request.input;
                         let fallback_prompt = prompt.clone();
                         let indices = (tracker_kind, tracker_group, tracker_index);
+                        let context_group = work.cross_page_context.then_some(group_index);
                         b_tasks.spawn(async move {
                             let response = pool
                                 .request(
@@ -853,8 +1178,11 @@ pub fn process(
                                         tracker_kind: indices.0,
                                         tracker_group: indices.1,
                                         tracker_index: indices.2,
+                                        context_group,
                                     }))
                                 }
+                                Ok(None) if context_group.is_some() => Err(py_error("Cross-page fallback cancelled or not admitted")),
+                                Err(crate::callbacks::CallbackError::Python(error)) if context_group.is_some() => Err(error),
                                 Ok(None) => Ok(None),
                                 Err(crate::callbacks::CallbackError::Python(_)) => Ok(None),
                                 Err(crate::callbacks::CallbackError::Bridge(error)) => {
@@ -892,10 +1220,33 @@ pub fn process(
             .map(|pattern| regex.compile(pattern, true))
             .collect()
         })?;
+        let context_ids = if context_enabled {
+            Python::attach(|py| -> PyResult<Option<Vec<u64>>> {
+                let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                Ok(ordinary::cross_page_patterns(translator_for_regex.bind(py), &mut regex).ok())
+            })?
+        } else {
+            None
+        };
+        if context_enabled {
+            flag.checkpoint()?;
+        }
+        let mut context_groups: std::collections::BTreeMap<usize, Vec<Output>> = std::collections::BTreeMap::new();
+        let mut ordinary_outputs = Vec::new();
         for output in outputs {
+            if let Some(group) = output.context_group {
+                context_groups.entry(group).or_default().push(output);
+            } else {
+                ordinary_outputs.push(output);
+            }
+        }
+        let transactional_context = !context_groups.is_empty();
+        let mut transaction = crate::cross_page_transaction::StageTransaction::new(document, transactional_context);
+        let mut applied_outputs = Vec::new();
+        for output in ordinary_outputs {
             let (text, full_match, removed) = Python::attach(|py| {
                 ordinary::apply_llm_output(
-                    document,
+                    transaction.document(),
                     output.job.page,
                     output.job.paragraph,
                     &output.input,
@@ -904,6 +1255,51 @@ pub fn process(
                     &hallucination_ids,
                 )
             })?;
+            applied_outputs.push((output, text, full_match, removed));
+        }
+        for (_, mut pair) in context_groups {
+            pair.sort_by_key(|output| output.tracker_index);
+            if pair.len() != 2 || pair[0].tracker_index != 0 || pair[1].tracker_index != 1
+                || pair[0].fallback != pair[1].fallback {
+                return Err(py_error("Cross-page response incomplete"));
+            }
+            flag.checkpoint()?;
+            let ids = context_ids.as_deref().ok_or_else(|| py_error("Cross-page placeholder patterns unavailable"))?;
+            let validated = Python::attach(|py| -> PyResult<bool> {
+                let response = serde_json::json!([
+                    {"id": 0, "output": ordinary_stage::normalize_response_punctuation(&pair[0].text)},
+                    {"id": 1, "output": ordinary_stage::normalize_response_punctuation(&pair[1].text)},
+                ]).to_string();
+                let inputs = [pair[0].input.clone(), pair[1].input.clone()];
+                let mut regex = RegexService { service: translator_for_regex.bind(py).clone() };
+                Ok(cross_page_context::validate_pair(&response, &inputs, ids, &mut regex)?.is_some())
+            })?;
+            if !validated {
+                return Err(py_error("Cross-page fallback validation failed"));
+            }
+            let mut applied_pair = Vec::new();
+            for output in pair {
+                flag.checkpoint()?;
+                let (text, full_match, removed) = Python::attach(|py| {
+                    ordinary::apply_llm_output(
+                        transaction.document(),
+                        output.job.page,
+                        output.job.paragraph,
+                        &output.input,
+                        &output.text,
+                        translator_for_regex.bind(py),
+                        ids,
+                    )
+                })?;
+                if !full_match || !removed.is_empty() {
+                    return Err(py_error("Cross-page response could not be applied safely"));
+                }
+                applied_pair.push((output, text, full_match, removed));
+            }
+            flag.checkpoint()?;
+            applied_outputs.extend(applied_pair);
+        }
+        for (output, text, full_match, removed) in applied_outputs {
             let slot = match output.tracker_kind {
                 stage::GroupKind::Page => {
                     &mut result_tracking.page[output.tracker_group].paragraph[output.job.paragraph]
@@ -931,12 +1327,26 @@ pub fn process(
                 last.placeholder_full_match = full_match || output.text == output.input.text;
             }
         }
-        progress.end(None).map_err(ProgressError::into_python)?;
-        if write_tracking {
-            if let Some(parent) = std::path::Path::new(&tracking_path).parent() {
-                std::fs::create_dir_all(parent).map_err(py_error)?;
+        if transactional_context {
+            let tracking = if write_tracking {
+                Some(crate::cross_page_transaction::PreparedTracking::prepare(
+                    std::path::Path::new(&tracking_path), &result_tracking.to_json(),
+                ).map_err(py_error)?)
+            } else {
+                None
+            };
+            progress.end(None).map_err(ProgressError::into_python)?;
+            flag.checkpoint()?;
+            transaction.commit_with_tracking(tracking).map_err(py_error)?;
+        } else {
+            progress.end(None).map_err(ProgressError::into_python)?;
+            if write_tracking {
+                if let Some(parent) = std::path::Path::new(&tracking_path).parent() {
+                    std::fs::create_dir_all(parent).map_err(py_error)?;
+                }
+                std::fs::write(&tracking_path, result_tracking.to_json()).map_err(py_error)?;
             }
-            std::fs::write(&tracking_path, result_tracking.to_json()).map_err(py_error)?;
+            transaction.commit();
         }
         Ok::<_, PyErr>(())
     });
