@@ -36,6 +36,12 @@ are committed together; outputs are verified before replacing baseline files,
 with rollback on publication failure. Automatic glossary suggestions retain
 source context and do not become global mandatory glossary entries. Rotated
 source text and verified spacing are preserved without reordering formulas.
+TOC output I/O errors propagate. If baseline restoration itself fails, the job
+reports the original failure, restoration errors and recovery backup paths;
+output reports mark the publication state as uncertain.
+Independent numbered paragraphs and candidates with explicit non-body,
+small-font or adjacent-caption evidence retain ordinary translation even if
+the model attempts to select them.
 
 Nine real two-page samples were tested through the installed Windows backend
 with DeepSeek. All produced monolingual and bilingual outputs. Three of eleven
@@ -45,6 +51,8 @@ issues are fixed. Version strings, URLs, bibliography formatting, labels and PDF
 link annotations have known defects deferred to a later version. Chinese words
 can split across pages or columns. Strict numeric, formula and layout guards
 remain in place. See `docs/release-notes/v0.7.1+pwo.2.crosspage.17.md` for scope.
+Final release preparation adds conservative candidate exclusions, so this earlier
+sample application rate does not establish the final version's application rate.
 
 Continuations near figures or captions, or containing formulas and multiple
 styles, may not be identified. Unidentified continuations can be translated
