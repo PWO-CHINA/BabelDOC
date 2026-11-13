@@ -288,6 +288,90 @@ fn ensure(
     }
     Ok(())
 }
+
+fn has_original_rotated_text(stream: &[u8]) -> bool {
+    stream.windows(crate::content::ORIGINAL_ROTATED_STREAM_MARKER.len())
+        .any(|window| window == crate::content::ORIGINAL_ROTATED_STREAM_MARKER)
+}
+
+fn page_resources(doc: &Document, page: ObjectId) -> Result<Option<Object>> {
+    let mut current = page;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(WriterError::Invalid("cycle in page resource inheritance".into()));
+        }
+        let node = doc.get_dictionary(current)?;
+        if let Ok(resources) = node.get(b"Resources") {
+            if !matches!(resources, Object::Null) {
+                return Ok(Some(resources.clone()));
+            }
+        }
+        match node.get(b"Parent").ok().and_then(|parent| parent.as_reference().ok()) {
+            Some(parent) => current = parent,
+            None => return Ok(None),
+        }
+    }
+}
+
+fn content_uses_form(
+    doc: &Document,
+    data: &[u8],
+    resources: &Object,
+    target: ObjectId,
+    visited: &mut BTreeSet<ObjectId>,
+) -> Result<bool> {
+    let resource_dictionary = dict(deref(doc, resources)?)?;
+    let xobjects = resource_dictionary.get(b"XObject").ok()
+        .map(|value| deref(doc, value).and_then(dict)).transpose()?;
+    let operations = lopdf::content::Content::decode(data)?;
+    for operation in operations.operations.into_iter().filter(|operation| operation.operator == "Do") {
+        let name = operation.operands.first().ok_or_else(|| WriterError::Invalid("Form invocation has no name".into()))?.as_name()?;
+        let Some(object) = xobjects.and_then(|objects| objects.get(name).ok()) else { continue };
+        let Ok(id) = object.as_reference() else { continue };
+        if id == target {
+            return Ok(true);
+        }
+        if !visited.insert(id) {
+            continue;
+        }
+        let Ok(object) = doc.get_object(id).and_then(Object::as_stream) else { continue };
+        let dictionary = &object.dict;
+        if dictionary.get(b"Subtype").ok().and_then(|value| value.as_name().ok()) == Some(b"Form") {
+            let child_resources = dictionary.get(b"Resources").ok()
+                .filter(|value| !matches!(value, Object::Null))
+                .unwrap_or(resources);
+            if content_uses_form(doc, &object.get_plain_content()?, child_resources, target, visited)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn validate_original_text_forms(doc: &Document, output: &PageOutput, page: ObjectId) -> Result<()> {
+    for form in &output.forms {
+        if !has_original_rotated_text(&form.stream) {
+            continue;
+        }
+        let id = xref(doc, form.xref_id)?;
+        if doc.get_object(id)?.as_stream()?.get_plain_content()? == form.stream {
+            continue;
+        }
+        for other_page in doc.get_pages().into_values().filter(|other| *other != page) {
+            if let Some(resources) = page_resources(doc, other_page)? {
+                let content = doc.get_page_content_with_limit(other_page, 64 * 1024 * 1024)?;
+                if content_uses_form(doc, &content, &resources, id, &mut BTreeSet::new())? {
+                    return Err(WriterError::Invalid(format!(
+                        "original rotated text belongs to Form xref {} shared across pages; replacing it would change another page",
+                        form.xref_id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 /// Apply one page. The caller must invoke this in IR page order; no parallel mutation.
 ///
 /// Compatibility entry for the frozen `p2_stage_diff::writer_probe`.
@@ -309,6 +393,7 @@ fn apply_page_output_at(
     output: &PageOutput,
     page: ObjectId,
 ) -> Result<ApplyCounts> {
+    validate_original_text_forms(doc, output, page)?;
     let mut candidates = vec![page];
     // Invalid Form IDs remain skippable in the candidate search, as Python's getter errors are swallowed.
     candidates.extend(
@@ -342,6 +427,23 @@ fn apply_page_output_at(
             replace_stream(doc, id, form.stream.clone())
         };
         if let Err(e) = update() {
+            if has_original_rotated_text(&form.stream) {
+                return Err(WriterError::Invalid(format!(
+                    "failed to preserve original rotated text in Form xref {}: {e}",
+                    form.xref_id
+                )));
+            }
+            let existing_has_original_text = xref(doc, form.xref_id).ok()
+                .and_then(|id| doc.get_object(id).ok())
+                .and_then(|object| object.as_stream().ok())
+                .and_then(|stream| stream.get_plain_content().ok())
+                .is_some_and(|stream| has_original_rotated_text(&stream));
+            if existing_has_original_text {
+                return Err(WriterError::Invalid(format!(
+                    "failed to replace Form xref {} already containing original rotated text: {e}",
+                    form.xref_id
+                )));
+            }
             log::warn!("update xref {} stream fail, continue", form.xref_id);
             counts.form_failures.push((form.xref_id, e.to_string()));
         }

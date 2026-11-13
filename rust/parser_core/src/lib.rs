@@ -44,6 +44,11 @@ mod type3_b20;
 mod resource_v3_tests;
 
 pub mod fonts;
+pub mod cross_boundary_evidence;
+pub mod strict_clip_evidence;
+pub mod strict_page_paint_evidence;
+pub mod strict_page_identity;
+pub mod strict_text_source_evidence;
 pub mod object_numbers;
 mod page_access;
 mod expansion;
@@ -57,6 +62,7 @@ use ir::{Edge, Node, NodeData, PythonValue};
 use lopdf::{Dictionary, Document as Pdf, Object, ObjectId};
 pub use lopdf::resource::ParserDiagnostics;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokens::{Lexer, Token};
@@ -561,6 +567,7 @@ struct Segment {
 struct State {
     ctm: Matrix,
     font: Option<String>,
+    original_font: Option<String>,
     size: f64,
     tc: f64,
     tw: f64,
@@ -570,6 +577,9 @@ struct State {
     mode: i64,
     tm: Matrix,
     line: [f64; 2],
+    original_line: [f64; 2],
+    original_line_trusted: bool,
+    original_has_text_clip: bool,
     in_text: bool,
     text_clip: Option<std::sync::Arc<TextClip>>,
 }
@@ -578,6 +588,7 @@ impl Default for State {
         Self {
             ctm: ID,
             font: None,
+            original_font: None,
             size: 0.,
             tc: 0.,
             tw: 0.,
@@ -587,6 +598,9 @@ impl Default for State {
             mode: 0,
             tm: ID,
             line: [0.; 2],
+            original_line: [0.; 2],
+            original_line_trusted: true,
+            original_has_text_clip: false,
             in_text: false,
             text_clip: None,
         }
@@ -652,11 +666,18 @@ pub struct Parsed {
     /// Runtime writer metadata only; this is intentionally excluded from the
     /// IR document and artifact/hash.
     pub page_objects: Vec<ObjectId>,
+    /// SHA-256 of the complete input read for this parse, when requested and available.
+    /// This runtime evidence alone does not establish that an operation is safe.
+    pub source_sha256: Option<[u8; 32]>,
     #[cfg(test)]
     pub(crate) resource_graph_cache_len: usize,
 }
 /// Serial page lifecycle shared by the harness and product adapter.
 pub trait ParseObserver {
+    /// Opt in to hashing the complete source read by the parser.
+    fn capture_source_sha256(&self) -> bool {
+        false
+    }
     fn resource_limits_disabled(&mut self) -> Result<()> {
         log::warn!(target: "babeldoc.parser", "{}", lopdf::resource::DISABLED_WARNING);
         Ok(())
@@ -691,6 +712,8 @@ pub fn parse_observed(
         observer.resource_limits_disabled()?;
     }
     let policy = if config.disable_parser_resource_limits { Policy::disabled() } else { Policy::default() };
+    let capture_source_sha256 = observer.capture_source_sha256();
+    let mut source_sha256 = None;
     let pdf = Pdf::load_with_object_loader(
         path,
         lopdf::LoadOptions {
@@ -698,11 +721,18 @@ pub fn parse_observed(
             parser_policy: Some(policy),
             ..Default::default()
         },
-        |reader| page_access::load_selected(reader, config.pages.as_deref()),
+        |reader| {
+            if capture_source_sha256 {
+                source_sha256 = reader.full_input().map(|input| Sha256::digest(input).into());
+            }
+            page_access::load_selected(reader, config.pages.as_deref())
+        },
     )
     .map_err(|e| if e.is_resource_limit() { e.into() } else { Error::new("FileDataError", e.to_string()) })?;
     let diagnostics = pdf.parser_diagnostics;
-    parse_loaded_with_diagnostics(pdf, config, observer, diagnostics)
+    let mut parsed = parse_loaded_with_diagnostics(pdf, config, observer, diagnostics)?;
+    parsed.source_sha256 = source_sha256;
+    Ok(parsed)
 }
 #[cfg(test)]
 fn parse_loaded(pdf: Pdf, config: Config, observer: &mut impl ParseObserver) -> Result<Parsed> {
@@ -798,6 +828,7 @@ fn parse_loaded_with_diagnostics(
         page_text,
         diagnostics,
         page_objects,
+        source_sha256: None,
         #[cfg(test)]
         resource_graph_cache_len,
     })
@@ -1036,6 +1067,7 @@ impl Parser {
         let mut buffered = Vec::new();
         let mut text_ops = Vec::new();
         let mut clip_text = false;
+        let mut original_clip_text = false;
         let mut clip_ctm = ID;
         while let Some(oper) = lexer.operation()? {
             let op = oper.op.as_str();
@@ -1063,13 +1095,19 @@ impl Parser {
                     state.in_text = true;
                     state.tm = ID;
                     state.line = [0.; 2];
+                    state.original_line = [0.; 2];
+                    state.original_line_trusted = true;
                     text_ops = vec!["BT".into()];
-                    clip_text = false
+                    clip_text = false;
+                    original_clip_text = false;
                 }
                 "ET" => {
                     state.in_text = false;
                     state.tm = ID;
                     state.line = [0.; 2];
+                    state.original_line = [0.; 2];
+                    state.original_line_trusted = true;
+                    state.original_has_text_clip |= original_clip_text;
                     if clip_text {
                         state.text_clip = Some(std::sync::Arc::new(TextClip {
                             ops: text_ops.join(" "),
@@ -1079,6 +1117,7 @@ impl Parser {
                 }
                 "Tf" => {
                     state.font = Some(tokens::decode_name(args[0].name()?));
+                    state.original_font = Some(args[0].name()?.to_owned());
                     state.size = args[1].number()?
                 }
                 "Tc" => state.tc = args[0].number()?,
@@ -1089,19 +1128,25 @@ impl Parser {
                 "Tr" => state.mode = args[0].number()? as i64,
                 "Tm" => {
                     state.tm = nums()?.try_into().unwrap();
-                    state.line = [0.; 2]
+                    state.line = [0.; 2];
+                    state.original_line = [0.; 2];
+                    state.original_line_trusted = true;
                 }
                 "Td" | "TD" => {
                     let v = nums()?;
                     state.tm = translate(state.tm, [v[0], v[1]]);
                     state.line = [0.; 2];
+                    state.original_line = [0.; 2];
+                    state.original_line_trusted = true;
                     if op == "TD" {
                         state.leading = v[1]
                     }
                 }
                 "T*" => {
                     state.tm = translate(state.tm, [0., state.leading]);
-                    state.line = [0.; 2]
+                    state.line = [0.; 2];
+                    state.original_line = [0.; 2];
+                    state.original_line_trusted = true;
                 }
                 "Tj" | "TJ" | "'" | "\"" => {
                     if !state.in_text {
@@ -1116,7 +1161,9 @@ impl Parser {
                             state.tc = args[1].number()?
                         }
                         state.tm = translate(state.tm, [0., state.leading]);
-                        state.line = [0.; 2]
+                        state.line = [0.; 2];
+                        state.original_line = [0.; 2];
+                        state.original_line_trusted = true;
                     }
                     let seq = if op == "TJ" {
                         if let Token::Array(a) = &args[0] {
@@ -1134,16 +1181,27 @@ impl Parser {
                         clip_text = true;
                         clip_ctm = state.ctm
                     }
+                    if (4..=7).contains(&state.mode) {
+                        original_clip_text = true;
+                    }
                     self.ensure_text_font(&state, &mut fonts)?;
+                    if original_clip_text && !(4..=7).contains(&state.mode) {
+                        let matrix = mul(state.tm, state.ctm);
+                        let rotation = matrix[1].atan2(matrix[0]).to_degrees();
+                        if !((-0.1..=0.1).contains(&rotation) || (89.9..=90.1).contains(&rotation)) {
+                            return Err(Error::new("UnsupportedOriginalText", "rotated text shares a text object with an unfinished clipping path"));
+                        }
+                    }
                     self.text(
                         &state,
                         &seq,
                         &mut fonts,
                         xid,
                         &snap,
-                        clips.as_deref(),
+                        clips.clone(),
                         &mut buffered,
                     )?;
+                    self.advance_original(&mut state, &seq, &mut fonts)?;
                     self.advance(&mut state, &seq, &mut fonts)?;
                 }
                 "w" | "i" | "J" | "j" | "M" | "ri" | "gs" | "cs" | "CS" | "g" | "G" | "rg"
@@ -1412,6 +1470,7 @@ impl Parser {
                                     child_fonts,
                                     State {
                                         ctm: combined,
+                                        original_has_text_clip: state.original_has_text_clip,
                                         ..Default::default()
                                     },
                                     child_id,

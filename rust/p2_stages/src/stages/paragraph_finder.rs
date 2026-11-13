@@ -6,7 +6,7 @@ use crate::shared::layout_helper::{
 };
 use crate::shared::style::{INDIGO, PaletteColor, WHITE};
 use crate::{StageContext, StageError};
-use babeldoc_il_types::Box as B;
+use babeldoc_il_types::{Box as B, PdfCharacter};
 use babeldoc_ir_core::{self as ir, Cursor, ParagraphFinderView, TreeView, types};
 use log::{error, warn};
 use regex::Regex;
@@ -163,7 +163,171 @@ fn line(
     }
     .into_value())
 }
-fn split_lines(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
+fn plain_reading_character(character: &PdfCharacter) -> bool {
+    let Some(text) = character.char_unicode.as_deref() else { return false; };
+    !text.is_empty()
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, ',' | '.' | ';' | ':' | '-' | '\'' | '"' | '(' | ')' | '/' | '&' | '©' | '–' | '—' | '’')
+                || ('\u{00c0}'..='\u{024f}').contains(&ch)
+                || ('\u{fb00}'..='\u{fb06}').contains(&ch)
+        })
+}
+fn character_geometry(character: &PdfCharacter) -> Option<(f64, f64, f64, f64, f64)> {
+    let bounds = character.r#box.as_deref()?;
+    let size = character.pdf_style.as_deref()?.font_size?;
+    let (x, y, x2, y2) = (bounds.x?, bounds.y?, bounds.x2?, bounds.y2?);
+    if [x, y, x2, y2, size].iter().all(|value| value.is_finite())
+        && size > 0.0 && x2 > x && y2 > y {
+        Some((x, y, x2, y2, size))
+    } else {
+        None
+    }
+}
+fn reading_lines(characters: &[PdfCharacter]) -> Option<Vec<Vec<usize>>> {
+    if characters.is_empty() { return None; }
+    let first = &characters[0];
+    let first_geometry = character_geometry(first)?;
+    let geometries = characters.iter().map(|character| {
+        let geometry = character_geometry(character)?;
+        if character.vertical.unwrap_or(false)
+            || character.formula_layout_id.is_some()
+            || character.xobj_id != first.xobj_id
+            || character.pdf_style.as_deref()?.font_id.is_none()
+            || !matches!(character.scale, None | Some(1.0))
+            || (geometry.4 / first_geometry.4 - 1.0).abs() > 0.05
+            || !plain_reading_character(character) {
+            return None;
+        }
+        Some(geometry)
+    }).collect::<Option<Vec<_>>>()?;
+    let mut indexes: Vec<_> = (0..characters.len()).collect();
+    indexes.sort_by(|left, right| geometries[*right].1.total_cmp(&geometries[*left].1));
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    for index in indexes {
+        if let Some(last) = lines.last_mut() {
+            let baseline = geometries[last[0]].1;
+            if (baseline - geometries[index].1).abs() <= first_geometry.4 * 0.12 {
+                last.push(index);
+                continue;
+            }
+            if (baseline - geometries[index].1).abs() < first_geometry.4 * 0.55 {
+                return None;
+            }
+        }
+        lines.push(vec![index]);
+    }
+    for line in &mut lines {
+        line.sort_by(|left, right| geometries[*left].0.total_cmp(&geometries[*right].0));
+        for pair in line.windows(2) {
+            let left = geometries[pair[0]];
+            let right = geometries[pair[1]];
+            let gap = right.0 - left.2;
+            if gap > first_geometry.4 * 1.5
+                || gap < -(left.2 - left.0).min(right.2 - right.0) * 0.45 {
+                return None;
+            }
+        }
+    }
+    for pair in lines.windows(2) {
+        let left = geometries[*pair[0].first()?].0.max(geometries[*pair[1].first()?].0);
+        let right = pair.iter().map(|line| {
+            line.iter().map(|index| geometries[*index].2).fold(f64::NEG_INFINITY, f64::max)
+        }).fold(f64::INFINITY, f64::min);
+        if right <= left {
+            return None;
+        }
+    }
+    Some(lines)
+}
+fn token_character(character: &PdfCharacter) -> bool {
+    character.char_unicode.as_deref().is_some_and(|text| {
+        !text.is_empty() && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '-' | '_' | ':' | '?' | '#' | '%' | '&' | '=' | '+' | '~' | '@')
+                || ('\u{00c0}'..='\u{024f}').contains(&ch)
+                || ('\u{fb00}'..='\u{fb06}').contains(&ch)
+        })
+    })
+}
+fn token_neighbors(left: &PdfCharacter, right: &PdfCharacter) -> bool {
+    let (Some(a), Some(b)) = (character_geometry(left), character_geometry(right)) else { return false; };
+    let (Some(left_style), Some(right_style)) = (left.pdf_style.as_deref(), right.pdf_style.as_deref()) else { return false; };
+    let gap = b.0 - a.2;
+    token_character(left) && token_character(right)
+        && !left.vertical.unwrap_or(false) && !right.vertical.unwrap_or(false)
+        && matches!(left.scale, None | Some(1.0)) && matches!(right.scale, None | Some(1.0))
+        && left.xobj_id == right.xobj_id
+        && left.formula_layout_id.is_none()
+        && right.formula_layout_id.is_none()
+        && left_style.font_id.is_some() && left_style.font_id == right_style.font_id
+        && (a.4 / b.4 - 1.0).abs() <= 0.05
+        && (a.1 - b.1).abs() <= a.4 * 0.12
+        && gap >= -(a.2 - a.0).min(b.2 - b.0) * 0.45
+        && gap <= a.4 * 0.2
+}
+fn overlapping_layouts(first: i64, second: i64, layouts: &[babeldoc_il_types::PageLayout]) -> bool {
+    let bounds = |id| layouts.iter().find(|layout| layout.id == Some(id))
+        .and_then(|layout| layout.r#box.as_deref())
+        .and_then(|bounds| Some((bounds.x?, bounds.y?, bounds.x2?, bounds.y2?)));
+    let (Some(a), Some(b)) = (bounds(first), bounds(second)) else { return false; };
+    [a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3].iter().all(|value| value.is_finite())
+        && a.2 > a.0 && b.2 > b.0 && a.3 > a.1 && b.3 > b.1
+        && a.2.min(b.2) - a.0.max(b.0) >= (a.2 - a.0).min(b.2 - b.0) * 0.5
+        && a.1 <= b.3 && b.1 <= a.3
+}
+fn reconcile_token_layouts(
+    characters: &[PdfCharacter],
+    assignments: &mut [Option<Layout>],
+    layouts: &[babeldoc_il_types::PageLayout],
+) {
+    let allowed = |layout: &Option<Layout>| layout.as_ref().is_some_and(|layout| {
+        layout.id.is_some() && matches!(layout.name.as_deref(), Some("plain text" | "tiny text" | "text" | "title"))
+    });
+    let mut start = 0;
+    while start < characters.len() {
+        let mut end = start + 1;
+        while end < characters.len() && allowed(&assignments[end - 1]) && allowed(&assignments[end])
+            && token_neighbors(&characters[end - 1], &characters[end]) {
+            end += 1;
+        }
+        if end - start >= 3 {
+            let mut counts: HashMap<i64, usize> = HashMap::new();
+            for layout in assignments[start..end].iter().flatten() {
+                if let Some(id) = layout.id { *counts.entry(id).or_default() += 1; }
+            }
+            if counts.len() > 1 {
+                if let Some((&id, &count)) = counts.iter().max_by_key(|entry| entry.1) {
+                    let owner_name = assignments[start..end].iter().flatten()
+                        .find(|layout| layout.id == Some(id)).and_then(|layout| layout.name.as_deref());
+                    if count * 5 >= (end - start) * 3
+                        && counts.keys().all(|other| *other == id || overlapping_layouts(id, *other, layouts))
+                        && characters[start..end].iter().zip(&assignments[start..end]).all(|(character, assignment)| {
+                            if assignment.as_ref().and_then(|layout| layout.id) == Some(id) {
+                                return true;
+                            }
+                            if assignment.as_ref().and_then(|layout| layout.name.as_deref()) == owner_name {
+                                return false;
+                            }
+                            let owner = layouts.iter().find(|layout| layout.id == Some(id)).and_then(|layout| layout.r#box.as_deref());
+                            let visual = character.visual_bbox.as_deref().and_then(|visual| visual.r#box.as_deref());
+                            match (owner, visual) {
+                                (Some(owner), Some(visual)) => {
+                                    lh::calculate_iou_for_boxes(visual, owner).is_ok_and(|overlap| overlap >= 0.5)
+                                }
+                                _ => false,
+                            }
+                        }) {
+                        let owner = assignments[start..end].iter().flatten().find(|layout| layout.id == Some(id)).cloned();
+                        for assignment in &mut assignments[start..end] { *assignment = owner.clone(); }
+                    }
+                }
+            }
+        }
+        start = end;
+    }
+}
+fn split_lines(p: &P, v: &mut View<'_>) -> Result<bool, StageError> {
     let mut cs = vec![];
     let mut others = vec![];
     for child_index in 0..p.pdf_paragraph_composition_len(v)? {
@@ -175,7 +339,21 @@ fn split_lines(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
         }
     }
     if cs.is_empty() {
-        return Ok(());
+        return Ok(false);
+    }
+    if others.is_empty() && !matches!(p.layout_label(v)?.as_deref(),
+        Some("table_text" | "table_cell" | "table_cell_hybrid" | "wired_table_cell" | "wireless_table_cell")) {
+        let snapshots = cs.iter().map(|ch| character(ch, v)).collect::<Result<Vec<_>, _>>()?;
+        if let Some(lines) = reading_lines(&snapshots) {
+            let mut out = Vec::with_capacity(lines.len());
+            for indices in lines {
+                let selected = indices.into_iter().map(|index| cs[index].clone()).collect::<Vec<_>>();
+                out.push(line(&selected, v)?);
+            }
+            p.set_pdf_paragraph_composition(v, out)?;
+            update(p, v, false)?;
+            return Ok(true);
+        }
     }
     let bounds = cs
         .iter()
@@ -241,7 +419,8 @@ fn split_lines(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
         out.push(c.share(v)?);
     }
     p.set_pdf_paragraph_composition(v, out)?;
-    update(p, v, false)
+    update(p, v, false)?;
+    Ok(false)
 }
 fn dummy(
     source: &C,
@@ -255,6 +434,7 @@ fn dummy(
         pdf_style: style,
         r#box: Some(shared),
         char_unicode: Some(" ".into()),
+        synthetic_spacing: Some(true),
         scale: source.scale(v)?,
         advance: Some(need(b.x2, "x2")? - need(b.x, "x")?),
         visual_bbox: Some(
@@ -319,7 +499,11 @@ fn space_list(c: &Co, v: &View<'_>) -> Result<Option<SpaceList>, StageError> {
         c.pdf_formula(v)?.map(SpaceList::Formula)
     })
 }
+#[cfg(test)]
 fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
+    add_spaces_with_trusted_lines(p, v, false)
+}
+fn add_spaces_with_trusted_lines(p: &P, v: &mut View<'_>, trusted_lines: bool) -> Result<(), StageError> {
     for child_index in 0..p.pdf_paragraph_composition_len(v)? {
         let c = p.pdf_paragraph_composition_at(v, child_index)?;
         let Some(l) = space_list(&c, v)? else {
@@ -389,7 +573,17 @@ fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
         let a = box_read(&need(last.r#box(v)?, "box")?, v)?;
         let b = box_read(&need(next.r#box(v)?, "box")?, v)?;
         let d = need(b.x, "x")? - need(a.x2, "x2")?;
-        if d > 1. {
+        let left = character(last, v)?;
+        let right = character(next, v)?;
+        let separated_line = trusted_lines && match (character_geometry(&left), character_geometry(&right)) {
+            (Some(first), Some(second)) => {
+                (first.1 - second.1).abs() >= first.4.min(second.4) * 0.55
+                    && !space(left.char_unicode.as_deref().unwrap_or_default())
+                    && !space(right.char_unicode.as_deref().unwrap_or_default())
+            }
+            _ => false,
+        };
+        if d > 1. || separated_line {
             if let Some(l) = space_list(&first_composition, v)? {
                 let x = need(a.x2, "x2")?;
                 let index = l.characters(v)?.len();
@@ -398,7 +592,7 @@ fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
                     B {
                         x: Some(x),
                         y: a.y,
-                        x2: Some(x + d),
+                        x2: Some(if separated_line { x } else { x + d }),
                         y2: a.y2,
                     },
                     v,
@@ -412,7 +606,16 @@ fn add_spaces(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
 }
 fn spacing(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
     let mut out = vec![];
-    for child_index in 0..p.pdf_paragraph_composition_len(v)? {
+    let composition_len = p.pdf_paragraph_composition_len(v)?;
+    let mut following_text = vec![false; composition_len];
+    let mut has_following_text = false;
+    for child_index in (0..composition_len).rev() {
+        following_text[child_index] = has_following_text;
+        let composition = p.pdf_paragraph_composition_at(v, child_index)?;
+        has_following_text |= text_chars(&chars(&composition, v)?, v)?.chars()
+            .any(|character| !python_space(character));
+    }
+    for child_index in 0..composition_len {
         let c = p.pdf_paragraph_composition_at(v, child_index)?;
         if let Some(l) = c.pdf_line(v)? {
             let cs = l.pdf_character_iter(v)?.collect::<Result<Vec<_>, _>>()?;
@@ -429,6 +632,16 @@ fn spacing(p: &P, v: &mut View<'_>) -> Result<(), StageError> {
             while let Some(c) = kept.last() {
                 if !space(c.char_unicode(v)?.as_deref().unwrap_or("")) {
                     break;
+                }
+                if child_index + 1 < composition_len
+                {
+                    let source_separator = c.synthetic_spacing(v)? != Some(true)
+                        && c.pdf_character_id(v)?.is_some() && following_text[child_index];
+                    let wrapped_separator = c.synthetic_spacing(v)? == Some(true)
+                        && c.r#box(v)?.is_some_and(|bounds| bounds.x(v).ok() == bounds.x2(v).ok());
+                    if source_separator || wrapped_separator {
+                        break;
+                    }
                 }
                 kept.pop();
             }
@@ -598,11 +811,12 @@ fn process_page(
     let mut current = None::<P>;
     let mut current_layout = None::<Layout>;
     let mut skipped = vec![];
+    let mut snapshots = Vec::with_capacity(page.pdf_character_len(v)?);
+    let mut assignments = Vec::with_capacity(page.pdf_character_len(v)?);
     for child_index in 0..page.pdf_character_len(v)? {
         let ch = page.pdf_character_at(v, child_index)?;
-        let ch = ch.retain(v)?;
-        let snapshot = character(&ch, v)?;
-        let layout = lh::get_character_layout(&snapshot, &index, &map)?;
+        let mut snapshot = character(&ch, v)?;
+        assignments.push(lh::get_character_layout(&snapshot, &index, &map)?);
         let fid = lh::is_character_in_formula_layout(
             &snapshot,
             &babeldoc_il_types::Page::default(),
@@ -610,6 +824,12 @@ fn process_page(
             &map,
         )?;
         ch.set_formula_layout_id(v, fid)?;
+        snapshot.formula_layout_id = fid;
+        snapshots.push(snapshot);
+    }
+    reconcile_token_layouts(&snapshots, &mut assignments, &original_layouts);
+    for (child_index, (snapshot, layout)) in snapshots.iter().zip(assignments).enumerate() {
+        let ch = page.pdf_character_at(v, child_index)?.retain(v)?;
         if !lh::is_text_layout(layout.as_ref())
             || matches!(
                 snapshot.char_unicode.as_deref(),
@@ -702,13 +922,14 @@ fn process_page(
             )?;
         }
     }
+    let mut trusted_lines = Vec::with_capacity(page.pdf_paragraph_len(v)?);
     for child_index in 0..page.pdf_paragraph_len(v)? {
         let p = page.pdf_paragraph_at(v, child_index)?;
-        split_lines(&p, v)?;
+        trusted_lines.push(split_lines(&p, v)?);
     }
     for child_index in 0..page.pdf_paragraph_len(v)? {
         let p = page.pdf_paragraph_at(v, child_index)?;
-        add_spaces(&p, v)?;
+        add_spaces_with_trusted_lines(&p, v, trusted_lines[child_index])?;
         spacing(&p, v)?;
         update(&p, v, false)?;
     }
@@ -998,3 +1219,11 @@ fn fix_overlap(paras: &[P], page: &Page, v: &mut View<'_>) -> Result<(), StageEr
 #[cfg(test)]
 #[path = "../../tests/support/paragraph_spacing_cases.rs"]
 mod paragraph_spacing_cases;
+
+#[cfg(test)]
+#[path = "../../tests/support/synthetic_spacing_cases.rs"]
+mod synthetic_spacing_cases;
+
+#[cfg(test)]
+#[path = "../../tests/support/paragraph_reading_cases.rs"]
+mod paragraph_reading_cases;

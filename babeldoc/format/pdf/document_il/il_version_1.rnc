@@ -69,6 +69,7 @@ PDFCharacter =
     attribute vertical { xsd:boolean }?,
     attribute scale { xsd:float }?,
     attribute pdfCharacterId { xsd:int }?,
+    attribute synthetic_spacing { xsd:boolean }?,
     attribute char_unicode { xsd:string },
     attribute advance { xsd:float }?,
     # xobject nesting depth

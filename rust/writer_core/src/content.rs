@@ -47,6 +47,54 @@ pub struct PageOutput {
     pub forms: Vec<FormOutput>,
     pub counts: BuildCounts,
 }
+/// Limited writer observations; an empty list is not a safety proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriterDiagnosticKind {
+    MissingCharacterId,
+    FontUnavailable,
+    FontRejectedByGate,
+    MissingEncodingLength,
+    MissingFormScope,
+    FormFontObservationUnavailable,
+    EncodingFromOtherScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriterDiagnostic {
+    pub page_number: i64,
+    pub scope: Option<i64>,
+    pub output_scope: Option<i64>,
+    pub output_is_form: bool,
+    pub object_kind: &'static str,
+    /// Stage-local cursor identity; valid only for this document generation.
+    pub object_id: u64,
+    pub render_order: i64,
+    pub sub_render_order: i64,
+    pub font_id: Option<String>,
+    pub kind: WriterDiagnosticKind,
+}
+
+struct Diagnostics<'a> {
+    available: &'a AvailableFonts,
+    page_number: i64,
+    issues: Vec<WriterDiagnostic>,
+}
+
+impl Diagnostics<'_> {
+    fn record(&mut self, context: DiagnosticContext, font_id: FontId, kind: WriterDiagnosticKind) {
+        self.issues.push(WriterDiagnostic { page_number: self.page_number, scope: context.scope, output_scope: context.output_scope, output_is_form: context.output_is_form, object_kind: context.object_kind, object_id: context.object_id, render_order: context.order, sub_render_order: context.sub, font_id, kind });
+    }
+}
+#[derive(Clone, Copy)]
+struct DiagnosticContext {
+    scope: Scope,
+    output_scope: Scope,
+    output_is_form: bool,
+    object_kind: &'static str,
+    object_id: u64,
+    order: i64,
+    sub: i64,
+}
 enum Unit {
     Character(Cursor<types::PdfCharacter>),
     Form(Cursor<types::PdfForm>),
@@ -60,6 +108,8 @@ struct Ordered {
     unit: Unit,
 }
 const LAST: i64 = 9_999_999_999_999_999;
+pub(crate) const ORIGINAL_ROTATED_TEXT: &str = "babeldoc:original-rotated-text";
+pub(crate) const ORIGINAL_ROTATED_STREAM_MARKER: &[u8] = b"% babeldoc:original-rotated-text\n";
 
 struct FmtBytes<'a>(&'a mut Vec<u8>);
 
@@ -294,33 +344,38 @@ fn units(v: &View<'_>, p: &Cursor<types::Page>, o: &BuildOptions) -> Result<Vec<
             });
         }
     }
-    if !o.skip_curve_render {
-        for (i, curve) in p
-            .pdf_curve_iter(v)?
-            .chain(curves.into_iter().map(Ok))
-            .enumerate()
-        {
-            let c = curve?;
-            let debug =
-                c.debug_info(v)?
-                    .as_ref()
-                    .is_some_and(|d| match serde_json::to_value(d).ok() {
-                        Some(serde_json::Value::Bool(b)) => b,
-                        Some(serde_json::Value::String(s)) => !s.is_empty(),
-                        _ => false,
-                    });
-            if c.passthrough_paint(v)?.unwrap_or(false) || debug || o.debug {
-                units.push(Ordered {
-                    order: c.render_order(v)?.unwrap_or(LAST),
-                    sub: i as i64,
-                    scope: c.xobj_id(v)?,
-                    unit: Unit::Curve(c),
-                });
-            }
+    for (i, curve) in p
+        .pdf_curve_iter(v)?
+        .chain(curves.into_iter().map(Ok))
+        .enumerate()
+    {
+        let c = curve?;
+        let original_text = is_original_rotated_text(v, &c)?;
+        if o.skip_curve_render && !original_text {
+            continue;
+        }
+        let debug = c.debug_info(v)?.as_ref().is_some_and(|d| match serde_json::to_value(d).ok() {
+            Some(serde_json::Value::Bool(b)) => b,
+            Some(serde_json::Value::String(s)) => !s.is_empty(),
+            _ => false,
+        });
+        if c.passthrough_paint(v)?.unwrap_or(false) || debug || o.debug {
+            units.push(Ordered {
+                order: c.render_order(v)?.unwrap_or(LAST),
+                sub: i as i64,
+                scope: c.xobj_id(v)?,
+                unit: Unit::Curve(c),
+            });
         }
     }
     units.sort_by_key(|u| (u.order, u.sub));
     Ok(units)
+}
+
+fn is_original_rotated_text(v: &View<'_>, curve: &Cursor<types::PdfCurve>) -> Result<bool> {
+    Ok(curve.debug_info(v)?.as_ref()
+        .and_then(|value| serde_json::to_value(value).ok())
+        .is_some_and(|value| value == ORIGINAL_ROTATED_TEXT))
 }
 
 /// Pure IR navigation and stream construction. No PDF mutations or Python calls.
@@ -328,6 +383,28 @@ pub fn build_page_output(
     v: &View<'_>,
     page: &Cursor<types::Page>,
     o: &BuildOptions,
+) -> Result<PageOutput> {
+    build_page_output_inner(v, page, o, None)
+}
+
+/// Builds a diagnostic observation and records selected losses without failing on them.
+/// Font names are caller-provided observations, not proof of usable saved resources.
+pub fn build_page_output_with_diagnostics(
+    v: &View<'_>,
+    page: &Cursor<types::Page>,
+    o: &BuildOptions,
+    available: &AvailableFonts,
+) -> Result<(PageOutput, Vec<WriterDiagnostic>)> {
+    let mut diagnostics = Diagnostics { available, page_number: required(page.page_number(v)?, "page_number")?, issues: Vec::new() };
+    let output = build_page_output_inner(v, page, o, Some(&mut diagnostics))?;
+    Ok((output, diagnostics.issues))
+}
+
+fn build_page_output_inner(
+    v: &View<'_>,
+    page: &Cursor<types::Page>,
+    o: &BuildOptions,
+    mut diagnostics: Option<&mut Diagnostics<'_>>,
 ) -> Result<PageOutput> {
     let crop = required(
         required(page.cropbox(v)?, "page.cropbox")?.r#box(v)?,
@@ -367,9 +444,54 @@ pub fn build_page_output(
         form_streams.insert(id, form_stream.clone());
         form_refs.push((id, required(x.xref_id(v)?, "xref_id")?));
     }
+    let ordered_units = units(v, page, o)?;
+    let mut original_text_forms = BTreeSet::new();
+    for unit in &ordered_units {
+        if let Unit::Curve(curve) = &unit.unit {
+            let original_text = is_original_rotated_text(v, curve)?;
+            if original_text && unit.scope != Some(0) {
+                original_text_forms.insert(unit.scope);
+            }
+        }
+    }
+    for &(scope, xref) in &form_refs {
+        if original_text_forms.contains(&scope)
+            && form_refs.iter().filter(|(_, other)| *other == xref).count() > 1
+        {
+            return Err(WriterError::Invalid(format!(
+                "original rotated text belongs to shared Form xref {xref}; separate invocation scopes cannot safely replace one stream"
+            )));
+        }
+    }
     let mut counts = BuildCounts::default();
-    for u in units(v, page, o)? {
+    for u in ordered_units {
         counts.units += 1;
+        let output_is_form = form_streams.contains_key(&u.scope);
+        let output_scope = if output_is_form { u.scope } else { None };
+        if let Unit::Curve(curve) = &u.unit {
+            let original_text = is_original_rotated_text(v, curve)?;
+            if original_text && u.scope != Some(0) && !output_is_form {
+                return Err(WriterError::Invalid("original rotated text has no matching Form scope".into()));
+            }
+        }
+        let (object_kind, object_id) = match &u.unit {
+            Unit::Character(c) => ("character", c.identity()),
+            Unit::Form(f) => ("form", f.identity()),
+            Unit::Rectangle(r, _) => ("rectangle", r.identity()),
+            Unit::Curve(c) => ("curve", c.identity()),
+        };
+        let context = DiagnosticContext { scope: u.scope, output_scope, output_is_form, object_kind, object_id, order: u.order, sub: u.sub };
+        if u.scope.is_some() && !output_is_form {
+            if let Some(d) = diagnostics.as_deref_mut() {
+                let skipped_spacing = match &u.unit {
+                    Unit::Character(c) => is_synthetic_spacing(v, c)?,
+                    _ => false,
+                };
+                if !skipped_spacing {
+                    d.record(context, None, WriterDiagnosticKind::MissingFormScope);
+                }
+            }
+        }
         let target = if let Some(out) = form_streams.get_mut(&u.scope) {
             counts.form_units += 1;
             out
@@ -381,12 +503,15 @@ pub fn build_page_output(
                 v,
                 &c,
                 u.scope,
+                output_scope,
+                output_is_form,
                 target,
                 &page_fonts,
                 &scoped,
                 &all_encoding,
                 o,
                 false,
+                diagnostics.as_deref_mut().map(|d| (d, context)),
             )?,
             Unit::Form(f) => {
                 if render_form(v, &f, target)? {
@@ -415,33 +540,90 @@ pub fn build_page_output(
     })
 }
 
+fn is_synthetic_spacing(v: &View<'_>, c: &Cursor<types::PdfCharacter>) -> Result<bool> {
+    Ok(c.synthetic_spacing(v)? == Some(true)
+        && c.pdf_character_id(v)?.is_none()
+        && matches!(c.char_unicode(v)?.as_deref(), Some(" " | "\n")))
+}
+
 fn render_character(
     v: &View<'_>,
     c: &Cursor<types::PdfCharacter>,
     scope: Scope,
+    output_scope: Scope,
+    output_is_form: bool,
     out: &mut Vec<u8>,
     page: &Fonts,
     scoped: &HashMap<Scope, (Fonts, HashMap<FontId, Option<i64>>)>,
     all: &HashMap<FontId, Option<i64>>,
     o: &BuildOptions,
     debug: bool,
+    mut diagnostics: Option<(&mut Diagnostics<'_>, DiagnosticContext)>,
 ) -> Result<()> {
-    if c.char_unicode(v)?.as_deref() == Some("\n") {
+    if is_synthetic_spacing(v, c)? {
         return Ok(());
     }
     let Some(id) = c.pdf_character_id(v)? else {
-        return Ok(());
+        if let Some((d, context)) = diagnostics.as_mut() {
+            d.record(*context, None, WriterDiagnosticKind::MissingCharacterId);
+            return Ok(());
+        }
+        if debug { return Ok(()); }
+        return Err(WriterError::Invalid(format!("writer.missing_character_id: object {} scope {scope:?}", c.identity())));
     };
     let style = required(c.pdf_style(v)?, "char.pdf_style")?;
     let font_id = style.font_id(v)?;
+    if let Some((d, context)) = diagnostics.as_mut() {
+        let names = if context.output_is_form { d.available.forms.get(&context.output_scope) } else { Some(&d.available.page) };
+        if let Some(names) = names {
+            if !font_id.as_ref().is_some_and(|font| names.contains(font)) {
+                d.record(*context, font_id.clone(), WriterDiagnosticKind::FontUnavailable);
+            }
+        } else {
+            d.record(*context, font_id.clone(), WriterDiagnosticKind::FormFontObservationUnavailable);
+        }
+    }
     let mut size = required(style.font_size(v)?, "font_size")?;
     if o.check_font_exists || debug {
         let available = required(o.available.as_ref(), "available font names")?;
-        let names = available.forms.get(&scope).unwrap_or(&available.page);
+        let names = if output_is_form { available.forms.get(&output_scope).unwrap_or(&available.page) } else { &available.page };
         if !font_id.as_ref().is_some_and(|f| names.contains(f)) {
-            return Ok(());
+            if let Some((d, context)) = diagnostics.as_mut() {
+                d.record(*context, font_id.clone(), WriterDiagnosticKind::FontRejectedByGate);
+                return Ok(());
+            }
+            if debug { return Ok(()); }
+            return Err(WriterError::Invalid(format!("writer.font_rejected_by_gate: object {} font {font_id:?} scope {output_scope:?}", c.identity())));
         }
     }
+    if font_id.is_none() && diagnostics.is_none() && !debug {
+        return Err(WriterError::Invalid(format!("writer.missing_font_id: object {} scope {output_scope:?}", c.identity())));
+    }
+    let scoped_encoding = scoped.get(&scope)
+        .map(|(_, e)| e.get(&font_id).copied().flatten())
+        .unwrap_or_else(|| page.get(&font_id).and_then(|f| f.encoding));
+    let encoding = if debug {
+        page.get(&font_id).and_then(|f| f.encoding)
+    } else {
+        scoped_encoding.or_else(|| all.get(&font_id).copied().flatten())
+    };
+    if !debug && scoped_encoding.is_none() && encoding.is_some() {
+        if let Some((d, context)) = diagnostics.as_mut() {
+            d.record(*context, font_id.clone(), WriterDiagnosticKind::EncodingFromOtherScope);
+        }
+    }
+    let Some(encoding) = encoding else {
+        if debug {
+            return Err(WriterError::Invalid("missing debug encoding length".into()));
+        }
+        if let Some((d, context)) = diagnostics.as_mut() {
+            d.record(*context, font_id.clone(), WriterDiagnosticKind::MissingEncodingLength);
+            return Ok(());
+        }
+        return Err(WriterError::Invalid(format!("writer.missing_encoding_length: object {} font {font_id:?} scope {scope:?}", c.identity())));
+    };
+    let width = usize::try_from((encoding * 2).max(0))
+        .map_err(|_| WriterError::Invalid("encoding width".into()))?;
     if !debug {
         if let Some(font) = scoped
             .get(&scope)
@@ -480,23 +662,6 @@ fn render_character(
         x,
         y,
     );
-    let encoding = if debug {
-        page.get(&font_id).and_then(|f| f.encoding)
-    } else {
-        scoped
-            .get(&scope)
-            .map(|(_, e)| e.get(&font_id).copied().flatten())
-            .unwrap_or_else(|| page.get(&font_id).and_then(|f| f.encoding))
-            .or_else(|| all.get(&font_id).copied().flatten())
-    };
-    let Some(encoding) = encoding else {
-        if debug {
-            return Err(WriterError::Invalid("missing debug encoding length".into()));
-        }
-        return Ok(());
-    };
-    let width = usize::try_from((encoding * 2).max(0))
-        .map_err(|_| WriterError::Invalid("encoding width".into()))?;
     append_character_glyph(out, id, width);
     Ok(())
 }
@@ -546,6 +711,9 @@ fn render_rectangle(
     Ok(())
 }
 fn render_curve(v: &View<'_>, c: &Cursor<types::PdfCurve>, out: &mut Vec<u8>) -> Result<()> {
+    if is_original_rotated_text(v, c)? {
+        out.extend(ORIGINAL_ROTATED_STREAM_MARKER);
+    }
     out.extend(b"q n ");
     relocation(out, c.relocation_transform(v)?);
     out.extend(b" ");
@@ -717,12 +885,15 @@ pub fn build_debug_stream(
                 v,
                 &c,
                 None,
+                None,
+                false,
                 &mut out,
                 &fonts,
                 &HashMap::new(),
                 &HashMap::new(),
                 &o,
                 true,
+                None,
             )?;
         }
     }

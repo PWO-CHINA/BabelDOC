@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 mod pdf_font_flags;
+pub mod glyph_bounds_evidence;
 
 use sha3::{Digest, Sha3_256};
 use skrifa::instance::Size;

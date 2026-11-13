@@ -4,15 +4,12 @@ The document objects persist between calls. Branches and retry belong to Rust;
 PDF operations retain the existing writer's subprocess and fallback behavior.
 """
 
-import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pymupdf
 
 from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
-
-logger = logging.getLogger(__name__)
 
 
 class WriterFileService:
@@ -35,8 +32,14 @@ class WriterFileService:
     def open_translated(self, path):
         self.translated = self._own(pymupdf.open(path))
 
+    def open_translated_bytes(self, data):
+        self.translated = self._own(pymupdf.open(stream=data, filetype="pdf"))
+
     def open_original(self, path):
         self.original = self._own(pymupdf.open(path))
+
+    def open_original_bytes(self, data):
+        self.original = self._own(pymupdf.open(stream=data, filetype="pdf"))
 
     def subset_mono(self):
         self.translated = self._own(
@@ -53,10 +56,9 @@ class WriterFileService:
         )
 
     def restore_media_box(self):
-        try:
-            self.creator.restore_media_box(self.translated, self.mediabox_data)
-        except Exception:
-            logger.exception("restore media box failed")
+        for xref, page_box_data in self.mediabox_data.items():
+            for name, box in page_box_data.items():
+                self.translated.xref_set_key(xref, name, box)
 
     def keep_translated(self, pages):
         self.translated.delete_pages(

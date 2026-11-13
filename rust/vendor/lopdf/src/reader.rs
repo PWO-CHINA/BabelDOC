@@ -583,6 +583,13 @@ pub struct Reader<'a> {
     loaded_object_stream_containers: HashSet<u32>,
 }
 
+impl Reader<'_> {
+    /// The complete input from the shared file read, before header trimming.
+    pub fn full_input(&self) -> Option<&[u8]> {
+        self.shared_buffer.as_deref().map(Vec::as_slice)
+    }
+}
+
 fn collect_encrypted_object_ranges(
     buffer: &[u8],
     object_offsets: Vec<usize>,

@@ -9,13 +9,15 @@ use babeldoc_ir_core::{Document, ReadOnlyView, WriterView};
 use babeldoc_p2_stages::ProgressReporter;
 use babeldoc_writer_core as core;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyTuple};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::path::Path;
 use std::time::Duration;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct WriteConfig {
     pub source: String,
     pub translated: String,
@@ -41,17 +43,45 @@ pub struct WriteConfig {
     #[serde(default)]
     pub dual_translate_first: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AssetSpec {
     id: String,
     metadata: Metadata,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Metadata {
     font_name: String,
     ascent: f64,
     descent: f64,
     encoding_length: i64,
+}
+
+impl AssetSpec {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn writer_metadata(&self) -> core::FontMetadata {
+        core::FontMetadata {
+            font_name: self.metadata.font_name.clone(),
+            ascent: self.metadata.ascent,
+            descent: self.metadata.descent,
+            encoding_length: self.metadata.encoding_length,
+        }
+    }
+}
+
+impl WriteConfig {
+    pub(crate) fn build_options(&self, checked: bool) -> core::BuildOptions {
+        core::BuildOptions {
+            check_font_exists: checked,
+            debug: self.debug,
+            ocr_workaround: self.ocr_workaround,
+            skip_form_render: self.skip_form_render,
+            skip_curve_render: self.skip_curve_render,
+            ..Default::default()
+        }
+    }
 }
 
 /// The file layer is replaceable for fault injection; it never owns Rust IR.
@@ -85,10 +115,70 @@ impl FileLayer for E2FileLayer<'_> {
     }
 }
 fn ordinary(error: &PyErr) -> bool {
-    Python::attach(|py| error.is_instance_of::<pyo3::exceptions::PyException>(py))
+    Python::attach(|py| {
+        if !error.is_instance_of::<pyo3::exceptions::PyException>(py) {
+            return false;
+        }
+        match py
+            .import("concurrent.futures")
+            .and_then(|module| module.getattr("CancelledError"))
+        {
+            Ok(cancelled) => !error.is_instance(py, &cancelled),
+            Err(_) => false,
+        }
+    })
 }
 fn core_error(error: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(error.to_string())
+}
+
+/// Load the source for one writer attempt. A supplied digest binds the PDF
+/// parser to the exact bytes read here, independently on every retry.
+pub fn load_writer_source(
+    source: &Path,
+    source_sha256: Option<&[u8; 32]>,
+) -> Result<core::PdfDocument, String> {
+    load_writer_source_with_bytes(source, source_sha256).map(|(pdf, _)| pdf)
+}
+
+#[doc(hidden)]
+pub fn load_writer_source_with_bytes(
+    source: &Path,
+    source_sha256: Option<&[u8; 32]>,
+) -> Result<(core::PdfDocument, Option<Vec<u8>>), String> {
+    match source_sha256 {
+        None => core::PdfDocument::load(source).map(|pdf| (pdf, None)).map_err(|error| error.to_string()),
+        Some(expected) => {
+            let bytes = std::fs::read(source).map_err(|_| "failed to read writer source".to_owned())?;
+            let actual: [u8; 32] = Sha256::digest(&bytes).into();
+            if &actual != expected {
+                return Err("writer source SHA-256 mismatch".to_owned());
+            }
+            core::PdfDocument::load_mem(&bytes).map(|pdf| (pdf, Some(bytes))).map_err(|error| error.to_string())
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn open_writer_original<F: FileLayer>(file: &F, path: &str, bytes: Option<&[u8]>) -> PyResult<()> {
+    match bytes {
+        Some(bytes) => {
+            let data = Python::attach(|py| PyBytes::new(py, bytes).unbind());
+            file.call("Save PDF", "open_original_bytes", (data,)).map(|_| ())
+        }
+        None => file.call("Save PDF", "open_original", (path.to_owned(),)).map(|_| ()),
+    }
+}
+
+#[doc(hidden)]
+pub fn open_writer_translated<F: FileLayer>(file: &F, path: &str, bytes: Option<&[u8]>) -> PyResult<()> {
+    match bytes {
+        Some(bytes) => {
+            let data = Python::attach(|py| PyBytes::new(py, bytes).unbind());
+            file.call("write", "open_translated_bytes", (data,)).map(|_| ())
+        }
+        None => file.call("write", "open_translated", (path.to_owned(),)).map(|_| ()),
+    }
 }
 fn stage<T>(
     run: &ProgressRun,
@@ -178,14 +268,7 @@ fn drawing(
             for page in v.document().page_iter(&v).map_err(core_error)? {
                 let page = page.map_err(core_error)?;
                 flag.checkpoint()?;
-                let mut opts = core::BuildOptions {
-                    check_font_exists: checked,
-                    debug: cfg.debug,
-                    ocr_workaround: cfg.ocr_workaround,
-                    skip_form_render: cfg.skip_form_render,
-                    skip_curve_render: cfg.skip_curve_render,
-                    ..Default::default()
-                };
+                let mut opts = cfg.build_options(checked);
                 if checked {
                     let forms = page
                         .pdf_xobject_iter(&v)
@@ -228,6 +311,7 @@ fn drawing(
 fn debug<F: FileLayer>(
     ir: &mut Document,
     page_objects: Option<&core::PageObjectMap>,
+    source_bytes: Option<&[u8]>,
     cfg: &WriteConfig,
     assets: &[core::FontAsset<'_>],
     flag: &CancelFlag,
@@ -235,7 +319,11 @@ fn debug<F: FileLayer>(
     monitor: &Py<PyAny>,
     file: &F,
 ) -> PyResult<()> {
-    let mut pdf = core::PdfDocument::load(&cfg.source).map_err(core_error)?;
+    let mut pdf = match source_bytes {
+        Some(bytes) => core::PdfDocument::load_mem(bytes)
+            .map_err(|_| callbacks::BridgeError::new_err("failed to reload bound writer source"))?,
+        None => load_writer_source(Path::new(&cfg.source), None).map_err(core_error)?,
+    };
     let page_objects = page_objects_for(page_objects, &pdf);
     fonts(ir, &mut pdf, &page_objects, assets, progress, monitor)?;
     let v = ir.view::<ReadOnlyView>();
@@ -259,8 +347,15 @@ fn debug<F: FileLayer>(
         core::replace_stream(&mut pdf, id, stream).map_err(core_error)?;
     }
     flag.checkpoint()?;
-    pdf.save(&cfg.debug_original).map_err(core_error)?;
-    file.call("Save PDF", "open_original", (cfg.debug_original.clone(),))?;
+    if source_bytes.is_some() {
+        let mut debug_bytes = Vec::new();
+        pdf.save_to(&mut debug_bytes).map_err(core_error)?;
+        std::fs::write(&cfg.debug_original, &debug_bytes).map_err(pyo3::exceptions::PyOSError::new_err)?;
+        open_writer_original(file, &cfg.debug_original, Some(&debug_bytes))?;
+    } else {
+        pdf.save(&cfg.debug_original).map_err(core_error)?;
+        open_writer_original(file, &cfg.debug_original, None)?;
+    }
     if !cfg.skip_clean {
         file.call("Save PDF", "subset_debug", ())?;
     }
@@ -278,6 +373,7 @@ fn page_objects_for<'a>(
 fn attempt<F: FileLayer>(
     ir: &mut Document,
     page_objects: Option<&core::PageObjectMap>,
+    source_sha256: Option<&[u8; 32]>,
     cfg: &WriteConfig,
     assets: &[core::FontAsset<'_>],
     checked: bool,
@@ -286,7 +382,8 @@ fn attempt<F: FileLayer>(
     monitor: &Py<PyAny>,
     file: &F,
 ) -> PyResult<Py<PyAny>> {
-    let mut pdf = core::PdfDocument::load(&cfg.source).map_err(core_error)?;
+    let (mut pdf, source_bytes) = load_writer_source_with_bytes(Path::new(&cfg.source), source_sha256)
+        .map_err(pyo3::exceptions::PyOSError::new_err)?;
     let page_objects = page_objects_for(page_objects, &pdf);
     fonts(ir, &mut pdf, &page_objects, assets, progress, monitor)?;
     drawing(
@@ -300,8 +397,15 @@ fn attempt<F: FileLayer>(
         monitor,
     )?;
     flag.checkpoint()?;
-    pdf.save(&cfg.translated).map_err(core_error)?;
-    file.call("write", "open_translated", (cfg.translated.clone(),))?;
+    if source_bytes.is_some() {
+        let mut translated_bytes = Vec::new();
+        pdf.save_to(&mut translated_bytes).map_err(core_error)?;
+        std::fs::write(&cfg.translated, &translated_bytes).map_err(pyo3::exceptions::PyOSError::new_err)?;
+        open_writer_translated(file, &cfg.translated, Some(&translated_bytes))?;
+    } else {
+        pdf.save(&cfg.translated).map_err(core_error)?;
+        open_writer_translated(file, &cfg.translated, None)?;
+    }
     flag.checkpoint()?;
     let garbage = if cfg.ocr_workaround { 4 } else { 1 };
     stage(progress, monitor, "Subset font", 1, |p| {
@@ -335,12 +439,13 @@ fn attempt<F: FileLayer>(
         if let Some(path) = &cfg.dual {
             flag.checkpoint()?;
             // Opening the resource lies outside the ordinary debug fallback.
-            file.call("Save PDF", "open_original", (cfg.source.clone(),))?;
+            open_writer_original(file, &cfg.source, source_bytes.as_deref())?;
             if cfg.debug {
                 flag.checkpoint()?;
                 if let Err(error) = debug(
                     ir,
                     Some(page_objects.as_ref()),
+                    source_bytes.as_deref(),
                     cfg,
                     assets,
                     flag,
@@ -351,10 +456,14 @@ fn attempt<F: FileLayer>(
                     if !ordinary(&error) {
                         return Err(error);
                     }
-                    log::warn!("Failed to write debug info to dual PDF: {error}");
+                    if source_bytes.is_some() {
+                        log::warn!("Failed to write debug info to dual PDF");
+                    } else {
+                        log::warn!("Failed to write debug info to dual PDF: {error}");
+                    }
                     progress.acknowledge_ended_errors();
                     // Ex8: an ordinary debug failure retains an unmodified source.
-                    file.call("Save PDF", "open_original", (cfg.source.clone(),))?;
+                    open_writer_original(file, &cfg.source, source_bytes.as_deref())?;
                 }
             }
             if cfg.only_include_translated_page {
@@ -401,7 +510,7 @@ pub fn process(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<Value> {
-    process_impl(py, ir, None, cfg, mapper, specs, dispatcher, flag, monitor)
+    process_impl(py, ir, None, None, cfg, mapper, specs, dispatcher, flag, monitor)
 }
 
 pub fn process_with_page_objects(
@@ -415,10 +524,28 @@ pub fn process_with_page_objects(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<Value> {
+    process_with_page_objects_bound(py, ir, page_objects, None, cfg, mapper, specs, dispatcher, flag, monitor)
+}
+
+/// Bind each production writer attempt to the parser's source digest when provided.
+/// Bound dual and debug output reuse the bytes verified for that attempt.
+pub fn process_with_page_objects_bound(
+    py: Python<'_>,
+    ir: &mut Document,
+    page_objects: &core::PageObjectMap,
+    source_sha256: Option<&[u8; 32]>,
+    cfg: WriteConfig,
+    mapper: &FontMapperHandle,
+    specs: Vec<AssetSpec>,
+    dispatcher: Py<PyAny>,
+    flag: CancelFlag,
+    monitor: Py<PyAny>,
+) -> PyResult<Value> {
     process_impl(
         py,
         ir,
         Some(page_objects),
+        source_sha256,
         cfg,
         mapper,
         specs,
@@ -439,6 +566,7 @@ fn process_impl(
     py: Python<'_>,
     ir: &mut Document,
     page_objects: Option<&core::PageObjectMap>,
+    source_sha256: Option<&[u8; 32]>,
     cfg: WriteConfig,
     mapper: &FontMapperHandle,
     specs: Vec<AssetSpec>,
@@ -459,12 +587,7 @@ fn process_impl(
         .collect::<PyResult<Vec<_>>>()?;
     let metadata = specs
         .iter()
-        .map(|a| core::FontMetadata {
-            font_name: a.metadata.font_name.clone(),
-            ascent: a.metadata.ascent,
-            descent: a.metadata.descent,
-            encoding_length: a.metadata.encoding_length,
-        })
+        .map(AssetSpec::writer_metadata)
         .collect::<Vec<_>>();
     let recorder = Recorder::for_dispatcher(py, dispatcher.bind(py));
     callbacks::run(py, 1, move |runtime, progress| {
@@ -487,6 +610,7 @@ fn process_impl(
         struct Execution<'a, 'b, F: FileLayer> {
             ir: &'a mut Document,
             page_objects: Option<&'a core::PageObjectMap>,
+            source_sha256: Option<&'a [u8; 32]>,
             cfg: &'a WriteConfig,
             assets: &'a [core::FontAsset<'b>],
             flag: &'a CancelFlag,
@@ -501,6 +625,7 @@ fn process_impl(
                 let value = attempt(
                     self.ir,
                     self.page_objects,
+                    self.source_sha256,
                     self.cfg,
                     self.assets,
                     checked,
@@ -518,7 +643,11 @@ fn process_impl(
                 ordinary(error)
             }
             fn failed(&mut self, error: &PyErr) {
-                log::error!("Failed to create PDF: {}: {error}", self.cfg.source);
+                if self.source_sha256.is_some() {
+                    log::error!("Failed to create PDF: {}", self.cfg.source);
+                } else {
+                    log::error!("Failed to create PDF: {}: {error}", self.cfg.source);
+                }
             }
             fn recovered(&mut self) {
                 self.progress.acknowledge_ended_errors();
@@ -527,6 +656,7 @@ fn process_impl(
         let (glossary, attempts) = core::write_with_retry(&mut Execution {
             ir,
             page_objects,
+            source_sha256,
             cfg: &cfg,
             assets: &assets,
             flag: &flag,

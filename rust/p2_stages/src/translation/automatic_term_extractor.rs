@@ -1,5 +1,5 @@
 use crate::translation::{
-    glossary::Glossary,
+    glossary::{Glossary, TermContext, term_context},
     python_semantics::{
         PythonJsonValue, clean_json_output, format_named_template, json_dumps, json_loads,
     },
@@ -48,6 +48,7 @@ Result:
 pub struct TermParagraphFacts {
     pub debug_id: Option<String>,
     pub unicode: Option<String>,
+    pub layout_label: Option<String>,
     pub cid: bool,
     pub pure_numeric: bool,
     pub placeholder_only: bool,
@@ -75,6 +76,7 @@ pub struct TermBatch {
     pub page_index: usize,
     pub tracking_index: usize,
     pub paragraphs: Vec<String>,
+    pub layout_labels: Vec<Option<String>>,
     pub token_count: usize,
     pub prompt: String,
 }
@@ -164,6 +166,7 @@ pub fn plan_page_actions(
 ) -> Vec<PageAction> {
     let mut actions = Vec::new();
     let mut paragraphs = Vec::new();
+    let mut layout_labels = Vec::new();
     let mut tokens = 0;
     let page_tracking = &mut tracking.page[page_index];
     for facts in facts {
@@ -177,16 +180,19 @@ pub fn plan_page_actions(
         }
         tokens += count_tokens(text);
         paragraphs.push(text.to_owned());
+        layout_labels.push(facts.layout_label.clone());
         if tokens > 600 || paragraphs.len() > 12 {
             actions.push(PageAction::Batch(make_batch(
                 page_index,
                 paragraphs,
+                layout_labels,
                 tokens,
                 lang_out,
                 user_glossaries,
                 page_tracking,
             )));
             paragraphs = Vec::new();
+            layout_labels = Vec::new();
             tokens = 0;
         }
     }
@@ -194,6 +200,7 @@ pub fn plan_page_actions(
         actions.push(PageAction::Batch(make_batch(
             page_index,
             paragraphs,
+            layout_labels,
             tokens,
             lang_out,
             user_glossaries,
@@ -206,6 +213,7 @@ pub fn plan_page_actions(
 fn make_batch(
     page_index: usize,
     paragraphs: Vec<String>,
+    layout_labels: Vec<Option<String>>,
     token_count: usize,
     lang_out: &str,
     user_glossaries: &[Glossary],
@@ -234,9 +242,26 @@ fn make_batch(
         page_index,
         tracking_index,
         paragraphs,
+        layout_labels,
         token_count,
         prompt,
     }
+}
+
+pub fn source_contexts(batch: &TermBatch, source: &str) -> Vec<TermContext> {
+    if batch.paragraphs.len() != 1 || batch.layout_labels.len() != 1 {
+        return Vec::new();
+    }
+    term_context(&batch.paragraphs[0], source, batch.layout_labels[0].clone())
+        .into_iter()
+        .collect()
+}
+
+pub fn sourced_terms(batch: &TermBatch, terms: Vec<(String, String)>) -> Vec<super::glossary::ScopedTerm> {
+    terms.into_iter().map(|(source, target)| {
+        let contexts = source_contexts(batch, &source);
+        super::glossary::ScopedTerm { source, target, contexts }
+    }).collect()
 }
 
 pub fn record_input(tracking: &mut TermTracking, batch: &TermBatch) {

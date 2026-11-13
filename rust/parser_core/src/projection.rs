@@ -4,6 +4,19 @@ use ir::{InstructionView, Instructions};
 use std::sync::Arc;
 
 pub(super) const MAX_FONT_ALIAS_BYTES: usize = 4096;
+const ORIGINAL_ROTATED_TEXT: &str = "babeldoc:original-rotated-text";
+
+fn original_resource_name(name: &str) -> String {
+    let mut escaped = String::new();
+    for character in name.chars() {
+        if character.is_ascii() {
+            escaped.push(character);
+        } else {
+            escaped.push_str(&format!("#{:02X}", character as u32));
+        }
+    }
+    escaped
+}
 
 impl ScopeFonts {
     fn find_entry(&mut self, name: &str) -> (Option<usize>, bool) {
@@ -111,6 +124,14 @@ fn formatted_clips(clips: Option<&ClipList>, target: Option<Matrix>) -> Vec<Stri
 pub(super) enum Buffered {
     // Projection filters these chars, but they still count toward a native batch.
     FilteredChar,
+    OriginalText {
+        operation: String,
+        ctm: Matrix,
+        xid: i64,
+        order: i64,
+        snap: Snapshot,
+        clips: Option<Arc<ClipList>>,
+    },
     Char {
         bbox: [f64; 4],
         size: f64,
@@ -728,6 +749,45 @@ impl Parser {
         }
         Ok(())
     }
+    pub(super) fn advance_original(
+        &mut self,
+        st: &mut State,
+        seq: &[Token],
+        fonts: &mut ScopeFonts,
+    ) -> Result<()> {
+        let Some(font) = self.find_font(st, fonts).cloned() else {
+            st.original_line_trusted = false;
+            return Ok(());
+        };
+        let backend = &font.backend;
+        let horizontal_scale = st.tz * 0.01;
+        let index = if backend.vertical { 1 } else { 0 };
+        for token in seq {
+            match token {
+                Token::Int(_) | Token::Real(_) => {
+                    let scale = if backend.vertical { 1. } else { horizontal_scale };
+                    st.original_line[index] -= token.number()? * 0.001 * st.size * scale;
+                }
+                Token::Str(bytes, _) => {
+                    let codes = backend.decode(bytes);
+                    if (backend.multibyte || backend.vertical) && !bytes.is_empty() {
+                        st.original_line_trusted = false;
+                    }
+                    for code in codes {
+                        let advance = backend.width_with_policy(code, self.pdf.parser_policy.as_ref())?
+                            * st.size + st.tc + if code == 32 { st.tw } else { 0. };
+                        st.original_line[index] += if backend.vertical {
+                            advance
+                        } else {
+                            advance * horizontal_scale
+                        };
+                    }
+                }
+                _ => return Err(Error::new("ValueError", "Expected string or numeric text segment")),
+            }
+        }
+        Ok(())
+    }
     pub(super) fn text(
         &mut self,
         st: &State,
@@ -735,14 +795,58 @@ impl Parser {
         fonts: &mut ScopeFonts,
         xid: i64,
         snap: &Snapshot,
-        _clips: Option<&ClipList>,
+        clips: Option<Arc<ClipList>>,
         buffer: &mut Vec<Buffered>,
     ) -> Result<()> {
+        let matrix = mul(st.tm, st.ctm);
+        let rotation = matrix[1].atan2(matrix[0]).to_degrees();
+        let unsupported_rotation = !((-0.1..=0.1).contains(&rotation)
+            || (89.9..=90.1).contains(&rotation));
         let Some(f) = self.find_font(st, fonts).cloned() else {
+            if unsupported_rotation {
+                return Err(Error::new("UnsupportedOriginalText", "rotated text font cannot be resolved"));
+            }
             return Ok(());
         };
         let b = &f.backend;
-        let matrix = mul(st.tm, st.ctm);
+        if unsupported_rotation && !(self.config.visual_roundtrip_mode && st.mode == 3) {
+            if (4..=7).contains(&st.mode) || st.original_has_text_clip {
+                return Err(Error::new("UnsupportedOriginalText", "rotated text uses an unsupported text clipping path"));
+            }
+            if !st.original_line_trusted {
+                return Err(Error::new("UnsupportedOriginalText", "rotated text position follows an untracked multibyte or vertical text show"));
+            }
+            let font = st.original_font.as_ref().filter(|_| f.name != "UNKNOW" && st.font.as_ref() == Some(&f.name))
+                .ok_or_else(|| Error::new("UnsupportedOriginalText", "rotated text font is not present in its resource scope"))?;
+            let determinant = st.ctm[0] * st.ctm[3] - st.ctm[1] * st.ctm[2];
+            if !determinant.is_finite() || determinant.abs() < 1e-10 {
+                return Err(Error::new("UnsupportedOriginalText", "rotated text has a singular transformation"));
+            }
+            let text_matrix = translate(st.tm, st.original_line);
+            let mut encoded = Vec::new();
+            for token in seq {
+                encoded.push(match token {
+                    Token::Str(bytes, _) => Token::Str(bytes.clone(), true).pdf(),
+                    Token::Int(_) | Token::Real(_) => token.pdf(),
+                    _ => return Err(Error::new("ValueError", "Expected string or numeric text segment")),
+                });
+            }
+            let operation = format!(
+                "BT /{} {} Tf {} Tc {} Tw {} Tz {} TL {} Ts {} Tr {} Tm [{}] TJ ET",
+                original_resource_name(font), st.size, st.tc, st.tw, st.tz, -st.leading, st.rise, st.mode,
+                cm(text_matrix), encoded.join(" ")
+            );
+            let order = self.order();
+            buffer.push(Buffered::OriginalText {
+                operation,
+                ctm: st.ctm,
+                xid,
+                order,
+                snap: snap.clone(),
+                clips,
+            });
+            return Ok(());
+        }
         let scale = st.tz * 0.01;
         let cs = st.tc * scale;
         let ws = if b.multibyte { 0. } else { st.tw * scale };
@@ -965,6 +1069,23 @@ impl Parser {
         for item in buffer.drain(..) {
             match item {
                 Buffered::FilteredChar => continue,
+                Buffered::OriginalText { operation, ctm, xid, order, snap, clips } => {
+                    self.charge_clip_output(clips.as_deref(), expansion, None)?;
+                    let gs = self.graphic(&snap, true, Some(ctm), clips.as_deref(), Some(operation), true);
+                    let curve_ctm = self.curve_ctm(ctm);
+                    self.page.pdf_curve.push(self.table.attach(Node::new(NodeData::PdfCurve(
+                        ir::DataPdfCurve {
+                            r#box: Some(box_edge([0.; 4])),
+                            graphic_state: Some(gs),
+                            passthrough_paint: Some(true),
+                            debug_info: Some(CurveDebugInfo::Text(ORIGINAL_ROTATED_TEXT.into())),
+                            xobj_id: Some(xid),
+                            render_order: Some(order),
+                            ctm: curve_ctm,
+                            ..Default::default()
+                        },
+                    ))));
+                }
                 Buffered::Char {
                     bbox,
                     size,

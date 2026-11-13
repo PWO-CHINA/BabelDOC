@@ -1,10 +1,15 @@
 import contextlib
+import hashlib
 import logging
 import threading
 import time
 import unicodedata
 from abc import ABC
 from abc import abstractmethod
+from urllib.parse import parse_qsl
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 import httpx
 import openai
@@ -23,6 +28,39 @@ logger = logging.getLogger(__name__)
 
 def remove_control_characters(s):
     return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+
+
+def _cache_endpoint_id(base_url):
+    endpoint = urlsplit(str(base_url))
+    sensitive_names = (
+        "key",
+        "token",
+        "secret",
+        "pass",
+        "auth",
+        "sig",
+        "credential",
+        "code",
+        "jwt",
+        "session",
+    )
+    query = urlencode(
+        [
+            (name, value)
+            for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+            if not any(part in name.casefold() for part in sensitive_names)
+        ]
+    )
+    endpoint_without_credentials = urlunsplit(
+        (endpoint.scheme, endpoint.netloc.rsplit("@", 1)[-1], endpoint.path, query, "")
+    )
+    return hashlib.sha256(endpoint_without_credentials.encode("utf-8")).hexdigest()
+
+
+def _request_checkpoint(params):
+    flag = (params or {}).get("cancel_flag")
+    if flag is not None:
+        flag.checkpoint()
 
 
 class RateLimiter:
@@ -45,18 +83,14 @@ class RateLimiter:
         Blocks until the next request can be processed, ensuring the rate limit is not exceeded.
         """
         with self.lock:
-            now = time.monotonic()
-
-            wait_duration = self.next_request_time - now
-            if wait_duration > 0:
-                time.sleep(wait_duration)
-
-            # Update the next allowed request time.
-            # If the limiter has been idle, the next request should start from 'now'.
-            now = time.monotonic()
-            self.next_request_time = (
-                max(self.next_request_time, now) + self.min_interval
-            )
+            target = max(self.next_request_time, time.monotonic())
+            self.next_request_time = target + self.min_interval
+        while True:
+            _request_checkpoint(_rate_limit_params)
+            remaining = target - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.05))
 
     def set_max_qps(self, max_qps: int):
         """
@@ -117,6 +151,20 @@ class BaseTranslator(ABC):
         """
         self.cache.add_params(k, v)
 
+    def _cache_for_request(self, rate_limit_params: dict | None):
+        request_params = {}
+        base_url = getattr(self, "base_url", None)
+        if base_url:
+            request_params["base_url_sha256"] = _cache_endpoint_id(base_url)
+        if rate_limit_params and rate_limit_params.get("request_json_mode", False):
+            request_params["request_json_mode"] = True
+        if request_params:
+            return TranslationCache(
+                self.cache.translate_engine,
+                {**self.cache.params, **request_params},
+            )
+        return self.cache
+
     def translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
         Translate the text, and the other part should call this method.
@@ -124,18 +172,30 @@ class BaseTranslator(ABC):
         :return: translated text
         """
         self.translate_call_count += 1
-        if not (self.ignore_cache or ignore_cache):
+        use_cache = not (
+            self.ignore_cache
+            or ignore_cache
+            or (rate_limit_params or {}).get("cross_boundary_request", False)
+        )
+        cache = self._cache_for_request(rate_limit_params) if use_cache else None
+        if use_cache:
             try:
-                cache = self.cache.get(text)
-                if cache is not None:
+                cached_translation = cache.get(text)
+                if cached_translation is not None:
                     self.translate_cache_call_count += 1
-                    return cache
+                    return cached_translation
             except Exception as e:
-                logger.debug(f"try get cache failed, ignore it: {e}")
-        _translate_rate_limiter.wait()
+                logger.debug("try get cache failed, ignore it: %s", type(e).__name__)
+        _request_checkpoint(rate_limit_params)
+        if (rate_limit_params or {}).get("cancel_flag") is None:
+            _translate_rate_limiter.wait()
+        else:
+            _translate_rate_limiter.wait(rate_limit_params)
         translation = self.do_translate(text, rate_limit_params)
-        if not (self.ignore_cache or ignore_cache):
-            self.cache.set(text, translation)
+        _request_checkpoint(rate_limit_params)
+        if use_cache:
+            cache = self._cache_for_request(rate_limit_params)
+            cache.set(text, translation)
         return translation
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
@@ -145,23 +205,33 @@ class BaseTranslator(ABC):
         :return: translated text
         """
         self.translate_call_count += 1
-        if not (self.ignore_cache or ignore_cache):
+        use_cache = not (
+            self.ignore_cache
+            or ignore_cache
+            or (rate_limit_params or {}).get("cross_boundary_request", False)
+        )
+        cache = self._cache_for_request(rate_limit_params) if use_cache else None
+        if use_cache:
             try:
-                cache = self.cache.get(text)
-                if cache is not None:
+                cached_translation = cache.get(text)
+                if cached_translation is not None:
                     self.translate_cache_call_count += 1
-                    return cache
+                    return cached_translation
             except Exception as e:
-                logger.debug(f"try get cache failed, ignore it: {e}")
-        _translate_rate_limiter.wait()
+                logger.debug("try get cache failed, ignore it: %s", type(e).__name__)
+        _request_checkpoint(rate_limit_params)
+        if (rate_limit_params or {}).get("cancel_flag") is None:
+            _translate_rate_limiter.wait()
+        else:
+            _translate_rate_limiter.wait(rate_limit_params)
         translation = self.do_llm_translate(text, rate_limit_params)
-        if not (self.ignore_cache or ignore_cache):
+        _request_checkpoint(rate_limit_params)
+        if use_cache:
             try:
-                self.cache.set(text, translation)
+                cache = self._cache_for_request(rate_limit_params)
+                cache.set(text, translation)
             except Exception as e:
-                logger.debug(
-                    f"try set cache failed, ignore it: {e}, text: {text}, translation: {translation}"
-                )
+                logger.debug("try set cache failed, ignore it: %s", type(e).__name__)
         return translation
 
     @abstractmethod
@@ -237,6 +307,9 @@ class OpenAITranslator(BaseTranslator):
                 timeout=600,
             ),
         )
+        self.add_cache_impact_parameters(
+            "base_url_sha256", _cache_endpoint_id(self.client.base_url)
+        )
         if send_temperature:
             self.add_cache_impact_parameters("temperature", self.options["temperature"])
         self.model = model
@@ -304,13 +377,18 @@ class OpenAITranslator(BaseTranslator):
         if text is None:
             return None
 
+        _request_checkpoint(rate_limit_params)
+
         options = {}
         if self.send_temperature:
             options.update(self.options)
+        rate_limit_params = rate_limit_params or {}
         if self.enable_json_mode_if_requested and rate_limit_params.get(
             "request_json_mode", False
         ):
             options["response_format"] = {"type": "json_object"}
+        if not rate_limit_params.get("cross_boundary_request", False):
+            options["max_tokens"] = 2048
 
         extra_headers = {}
         if self.send_dashscope_header:
@@ -321,7 +399,6 @@ class OpenAITranslator(BaseTranslator):
             response = self.client.chat.completions.create(
                 model=self.model,
                 **options,
-                max_tokens=2048,
                 messages=[
                     {
                         "role": "user",
@@ -332,7 +409,16 @@ class OpenAITranslator(BaseTranslator):
                 extra_body=self.extra_body,
             )
             self.update_token_count(response)
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            if rate_limit_params.get("cross_boundary_request", False) and (
+                response.choices[0].finish_reason != "stop"
+                or not content
+                or not content.strip()
+            ):
+                raise RuntimeError(
+                    "Cross-boundary model response was incomplete; retry or review this boundary."
+                )
+            return content.strip()
         except openai.BadRequestError as e:
             if (
                 "系统检测到输入或生成内容可能包含不安全或敏感内容，请您避免输入易产生敏感内容的提示语，感谢您的配合。"

@@ -400,6 +400,7 @@ pub struct MDocument {
     pub(crate) page_count: usize,
     pub(crate) diagnostics: babeldoc_parser_core::ParserDiagnostics,
     pub(crate) page_objects: babeldoc_writer_core::PageObjectMap,
+    pub(crate) source_sha256: Option<[u8; 32]>,
 }
 
 #[pymethods]
@@ -552,6 +553,14 @@ impl MDocument {
         );
         if result.is_ok() {
             self.document.compact();
+            if config.getattr("experimental_cross_page_context").ok()
+                .and_then(|value| value.extract::<bool>().ok()).unwrap_or(false) {
+                crate::llm_only_translation::write_enhancement_report(config, &serde_json::json!({
+                    "version":2, "status":"needs_review", "stage":"translation", "baseline_completed":true,
+                    "candidate_state":"not_supported", "applied_groups":0, "decisions":[],
+                    "unresolved":[{"kind":"enhancement", "reason":"non-LLM translator; ordinary translation retained", "locations":[]}]
+                }));
+            }
         }
         result
     }
@@ -569,7 +578,16 @@ impl MDocument {
         flag: CancelFlag,
         monitor: Py<PyAny>,
     ) -> PyResult<(usize, usize, usize)> {
-        let result = crate::llm_only_translation::process(
+        let graphics_evidence = config.getattr("experimental_cross_page_context").ok()
+            .and_then(|value| value.extract::<bool>().ok()).filter(|enabled| *enabled)
+            .and_then(|_| config.call_method1("get_working_file_path", ("input.pdf",)).ok())
+            .and_then(|value| value.str().ok().and_then(|path| path.to_str().ok().map(str::to_owned)))
+            .and_then(|path| self.source_sha256.as_ref().and_then(|digest| {
+                crate::boundary_apply::boundary_graphics::Evidence::load(
+                    std::path::Path::new(&path), digest, &self.page_objects,
+                )
+            }));
+        let result = crate::llm_only_translation::process_with_graphics_evidence(
             py,
             &mut self.document,
             config,
@@ -580,6 +598,7 @@ impl MDocument {
             translator_service,
             flag,
             monitor,
+            graphics_evidence,
         );
         if result.is_ok() {
             self.document.compact();
@@ -659,6 +678,7 @@ impl MDocument {
                 py,
                 &mut self.document,
                 &self.page_objects,
+                self.source_sha256.as_ref(),
                 writer_cfg,
                 writer_assets,
                 &mapper,
@@ -774,24 +794,27 @@ impl MDocument {
         // their own behavior and the original exception/logging policy.
         let supports_llm_translate =
             probe_llm_support(py, executor("probe_translate")?, "translation")?;
-        let supports_llm_terms = probe_llm_support(py, executor("probe_terms")?, "term")?;
-        if supports_llm_terms && config.getattr("auto_extract_glossary")?.extract::<bool>()? {
-            let term_executor = executor("term")?;
-            let term_service = executors
-                .get_item("term")?
-                .ok_or_else(|| PyValueError::new_err("missing term callback executor"))?
-                .getattr("service")?
-                .unbind();
-            self.extract_terms(
-                py,
-                config,
-                shared_context.bind(py),
-                term_executor,
-                term_service,
-                flag.clone(),
-                monitor.clone_ref(py),
-            )?;
+        if config.getattr("auto_extract_glossary")?.extract::<bool>()? {
+            let result = (|| -> PyResult<()> {
+                if probe_llm_support(py, executor("probe_terms")?, "term")? {
+                    let term_executor = executor("term")?;
+                    let term_service = executors
+                        .get_item("term")?
+                        .ok_or_else(|| PyValueError::new_err("missing term callback executor"))?
+                        .getattr("service")?
+                        .unbind();
+                    self.extract_terms(
+                        py, config, shared_context.bind(py), term_executor, term_service,
+                        flag.clone(), monitor.clone_ref(py),
+                    )?;
+                }
+                Ok(())
+            })();
+            crate::term_extractor::optional_extraction_result(result, &flag)?;
         }
+        let mut baseline_replay = None;
+        let mut enhancement_graphics = None;
+        let mut enhancement_service = None;
         if !config.getattr("skip_translation")?.extract::<bool>()? {
             let translation_mapper = font_mapper
                 .bind(py)
@@ -802,17 +825,31 @@ impl MDocument {
                 .getattr("service")?
                 .unbind();
             if supports_llm_translate {
-                self.translate_paragraphs_llm_only(
+                let context_enabled = config.getattr("experimental_cross_page_context").ok()
+                    .and_then(|value| value.extract::<bool>().ok()).unwrap_or(false);
+                let graphics_evidence = config.getattr("experimental_cross_page_context").ok()
+                    .and_then(|value| value.extract::<bool>().ok()).filter(|enabled| *enabled)
+                    .and_then(|_| self.source_sha256.as_ref())
+                    .and_then(|digest| crate::boundary_apply::boundary_graphics::Evidence::load(
+                        std::path::Path::new(&writer_cfg.source), digest, &self.page_objects,
+                    ));
+                let (_, replay) = crate::llm_only_translation::process_baseline(
                     py,
+                    &mut self.document,
                     config,
                     shared_context.bind(py),
-                    translation_mapper,
+                    &translation_mapper,
                     dispatcher_a.clone_ref(py),
                     dispatcher_b.clone_ref(py),
                     translation_service.clone_ref(py),
                     flag.clone(),
                     monitor.clone_ref(py),
+                    context_enabled,
                 )?;
+                baseline_replay = replay;
+                enhancement_graphics = graphics_evidence;
+                enhancement_service = Some(translation_service);
+                if !context_enabled { self.document.compact(); }
             } else {
                 self.translate_paragraphs(
                     py,
@@ -848,21 +885,24 @@ impl MDocument {
             )?;
         }
         let typesetting_config = stages["typesetting"].clone();
+        let baseline_typesetting_config = typesetting_config.clone();
         let typesetting_mapper = crate::font_mapper::FontMapperHandle::from_shared(
             std::sync::Arc::clone(&mapper.mapper),
         );
         let typesetting_monitor = monitor.clone_ref(py);
         let typesetting_flag = flag.clone();
-        let document = &mut self.document;
+        let mut typesetting_document = self.document.fork();
+        let document = &mut typesetting_document;
         py.detach(move || {
             crate::production_stages::typesetting(
                 document,
-                &typesetting_config,
+                &baseline_typesetting_config,
                 &typesetting_mapper,
                 typesetting_monitor,
                 &typesetting_flag,
             )
         })?;
+        self.document = typesetting_document;
         writer_cfg.ocr_workaround = config.getattr("ocr_workaround")?.extract::<bool>()?;
         if debug {
             dump_at(
@@ -877,18 +917,124 @@ impl MDocument {
         if capture_stages {
             capture_at(&self.document, &capture_paths, "typesetting")?;
         }
-        write_part(
+        let baseline_result = write_part(
             py,
             &mut self.document,
             &self.page_objects,
-            writer_cfg,
-            writer_assets,
+            self.source_sha256.as_ref(),
+            writer_cfg.clone(),
+            writer_assets.clone(),
             &mapper,
             executor("writer")?,
-            flag,
-            monitor,
-        )
+            flag.clone(),
+            monitor.clone_ref(py),
+        )?;
+        let Some(replay) = baseline_replay else { return Ok(baseline_result) };
+        flag.checkpoint()?;
+        validate_output_files(&baseline_result, &writer_cfg, self.page_objects.len(), None)?;
+        let mut candidate = crate::llm_only_translation::prepare_enhancements(
+            py, replay, config, shared_context.bind(py), &mapper,
+            dispatcher_a.clone_ref(py), enhancement_service.expect("baseline replay has a translator"),
+            &flag, &typesetting_config, enhancement_graphics.as_ref(),
+        )?;
+        if let Some(mut candidate_document) = candidate.document.take() {
+            let candidate_config = candidate_writer_config(&writer_cfg)?;
+            let (lang, progress, styles) = crate::production_stages::typesetting_configuration(&typesetting_config)?;
+            let typesetter = babeldoc_p2_stages::stages::typesetting::Typesetting::new(
+                &lang, mapper.mapper.clone(), progress, styles);
+            let mut context = babeldoc_p2_stages::StageContext::new(&flag, &babeldoc_p2_stages::NoopProgress);
+            let typesetting = py.detach(|| typesetter.process(&mut candidate_document, &mut context));
+            flag.checkpoint()?;
+            match typesetting {
+                Err(error) => crate::llm_only_translation::finish_enhancement_report(
+                    &mut candidate.report, false, &format!("candidate typesetting failed: {error}")),
+                Ok(()) => {
+                    let written = write_part(py, &mut candidate_document, &self.page_objects,
+                        self.source_sha256.as_ref(), candidate_config.clone(), writer_assets.clone(),
+                        &mapper, executor("writer")?, flag.clone(), monitor.clone_ref(py));
+                    flag.checkpoint()?;
+                    match written {
+                        Ok(paths) => match validate_output_files(&paths, &candidate_config, self.page_objects.len(), Some(&baseline_result)) {
+                            Ok(()) => {
+                                candidate.report["candidate_state"] = serde_json::json!("written");
+                                candidate.report["candidate_outputs"] = serde_json::json!({"mono":paths.0, "dual":paths.1});
+                            }
+                            Err(error) if recoverable_candidate_error(py, &error) => {
+                                crate::llm_only_translation::finish_enhancement_report(&mut candidate.report, false,
+                                    &format!("candidate output invalid: {error}"));
+                                remove_candidate_outputs(&candidate_config);
+                            }
+                            Err(error) => return Err(error),
+                        },
+                        Err(error) if recoverable_candidate_error(py, &error) => {
+                            crate::llm_only_translation::finish_enhancement_report(&mut candidate.report, false,
+                                &format!("candidate writer failed: {error}"));
+                            remove_candidate_outputs(&candidate_config);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        crate::llm_only_translation::write_enhancement_report(config, &candidate.report);
+        flag.checkpoint()?;
+        Ok(baseline_result)
     }
+}
+
+fn recoverable_candidate_error(py: Python<'_>, error: &PyErr) -> bool {
+    error.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+}
+
+fn candidate_writer_config(config: &crate::writer::WriteConfig) -> PyResult<crate::writer::WriteConfig> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let mut candidate = config.clone();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!(".boundary-candidate-{}-{sequence}.pdf", std::process::id());
+    let alternate = |path: &str| -> PyResult<String> {
+        let original = std::path::Path::new(path);
+        let name = original.file_name().ok_or_else(|| PyValueError::new_err("invalid output path"))?.to_string_lossy();
+        let next = original.with_file_name(format!("{name}{suffix}"));
+        if next.exists() { return Err(pyo3::exceptions::PyFileExistsError::new_err("candidate path already exists")); }
+        Ok(next.to_string_lossy().into_owned())
+    };
+    candidate.translated = alternate(&config.translated)?;
+    candidate.debug_original = alternate(&config.debug_original)?;
+    candidate.mono = config.mono.as_deref().map(alternate).transpose()?;
+    candidate.dual = config.dual.as_deref().map(alternate).transpose()?;
+    Ok(candidate)
+}
+
+fn remove_candidate_outputs(config: &crate::writer::WriteConfig) {
+    for path in [Some(&config.translated), Some(&config.debug_original), config.mono.as_ref(), config.dual.as_ref()].into_iter().flatten() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn validate_output_files(
+    result: &(Option<String>, Option<String>, Option<String>),
+    config: &crate::writer::WriteConfig,
+    source_pages: usize,
+    baseline: Option<&(Option<String>, Option<String>, Option<String>)>,
+) -> PyResult<()> {
+    let expected_mono = if config.only_include_translated_page { config.keep_pages.len() } else { source_pages };
+    for (path, base, expected) in [
+        (result.0.as_ref(), baseline.and_then(|result| result.0.as_ref()), expected_mono),
+        (result.1.as_ref(), baseline.and_then(|result| result.1.as_ref()), expected_mono * if config.use_alternating_pages_dual { 2 } else { 1 }),
+    ] {
+        if let Some(path) = path {
+            let bytes = std::fs::read(path).map_err(pyo3::exceptions::PyOSError::new_err)?;
+            let pdf = babeldoc_writer_core::PdfDocument::load_mem(&bytes).map_err(|error| PyValueError::new_err(format!("cannot reopen output: {error}")))?;
+            let pages = pdf.get_pages().len();
+            let expected = if let Some(base) = base {
+                let bytes = std::fs::read(base).map_err(pyo3::exceptions::PyOSError::new_err)?;
+                babeldoc_writer_core::PdfDocument::load_mem(&bytes).map_err(|error| PyValueError::new_err(format!("cannot reopen baseline: {error}")))?.get_pages().len()
+            } else { expected };
+            if pages != expected { return Err(PyValueError::new_err(format!("output has {pages} pages, expected {expected}"))); }
+        }
+    }
+    Ok(())
 }
 
 fn probe_llm_support(
@@ -1029,6 +1175,7 @@ fn write_part(
     py: Python<'_>,
     document: &mut ir::Document,
     page_objects: &babeldoc_writer_core::PageObjectMap,
+    source_sha256: Option<&[u8; 32]>,
     config: crate::writer::WriteConfig,
     assets: Vec<crate::writer::AssetSpec>,
     mapper: &crate::font_mapper::FontMapperHandle,
@@ -1036,10 +1183,11 @@ fn write_part(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<(Option<String>, Option<String>, Option<String>)> {
-    let result = crate::writer::process_with_page_objects(
+    let result = crate::writer::process_with_page_objects_bound(
         py,
         document,
         page_objects,
+        source_sha256,
         config,
         mapper,
         assets,
@@ -1076,5 +1224,6 @@ pub(crate) fn transfer_document(
         page_count,
         diagnostics: babeldoc_parser_core::ParserDiagnostics::default(),
         page_objects: babeldoc_writer_core::PageObjectMap::default(),
+        source_sha256: None,
     })
 }

@@ -2,7 +2,6 @@ import asyncio
 import logging
 import threading
 import time
-from asyncio import CancelledError
 from collections.abc import Callable
 from typing import Optional
 
@@ -139,12 +138,8 @@ class ProgressMonitor:
     def on_finish(self):
         if self.disable or self.parent_monitor and self.parent_monitor.disable:
             return
-        if self.cancel_event:
-            self.cancel_event.set()
         if self.finish_event and self.loop:
             self.loop.call_soon_threadsafe(self.finish_event.set)
-        if self.cancel_event and self.cancel_event.is_set():
-            self.finish_callback(type="error", error=CancelledError)
 
     def stage_done(self, stage):
         if self.disable or self.parent_monitor and self.parent_monitor.disable:

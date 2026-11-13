@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
@@ -26,6 +27,28 @@ pub struct Glossary {
     pub name: String,
     pub entries: Vec<GlossaryEntry>,
     matcher: Option<AhoCorasick>,
+    automatic: bool,
+    contexts: HashMap<String, Vec<TermContext>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TermContext {
+    pub text: String,
+    pub layout_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedTerm {
+    pub source: String,
+    pub target: String,
+    pub contexts: Vec<TermContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlossarySuggestion {
+    pub source: String,
+    pub target: String,
+    pub context: TermContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,10 +145,15 @@ impl Glossary {
             name: name.into(),
             entries: unique,
             matcher,
+            automatic: false,
+            contexts: HashMap::new(),
         })
     }
 
     pub fn active_entries_for_text(&self, text: &str) -> Vec<(String, String)> {
+        if self.automatic {
+            return Vec::new();
+        }
         let Some(matcher) = &self.matcher else {
             return Vec::new();
         };
@@ -143,6 +171,31 @@ impl Glossary {
                 })
             })
             .collect()
+    }
+
+    pub fn active_suggestions_for_text(&self, text: &str) -> Vec<GlossarySuggestion> {
+        if !self.automatic {
+            return Vec::new();
+        }
+        let normalized_text = normalize_match_text(text);
+        let mut suggestions = Vec::new();
+        for entry in &self.entries {
+            if let Some(contexts) = self.contexts.get(&normalize_source(&entry.source)) {
+                for context in contexts {
+                    if normalized_text == normalize_match_text(&context.text) {
+                        let suggestion = GlossarySuggestion {
+                            source: entry.source.clone(),
+                            target: entry.target.clone(),
+                            context: context.clone(),
+                        };
+                        if !suggestions.contains(&suggestion) {
+                            suggestions.push(suggestion);
+                        }
+                    }
+                }
+            }
+        }
+        suggestions
     }
 
     pub fn to_csv(&self) -> String {
@@ -203,7 +256,6 @@ fn csv_field(field: &str) -> String {
     }
 }
 
-/// Preserves insertion-ordered source groups and chooses the codepoint-smallest tied target.
 pub fn finalize_terms(
     name: impl Into<String>,
     raw_terms: &[(String, String)],
@@ -211,46 +263,100 @@ pub fn finalize_terms(
     if raw_terms.is_empty() {
         return Ok(None);
     }
-    let mut source_indices: HashMap<&str, usize> = HashMap::new();
-    let mut groups: Vec<(&str, usize, Vec<(&str, usize)>)> = Vec::new();
+    let mut source_indices: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(&str, &str, bool)> = Vec::new();
     for (source, target) in raw_terms {
-        let index = if let Some(index) = source_indices.get(source.as_str()) {
-            *index
-        } else {
-            let index = groups.len();
-            source_indices.insert(source, index);
-            groups.push((source, 0, Vec::new()));
-            index
-        };
-        let group = &mut groups[index];
-        group.1 += 1;
-        let targets = &mut group.2;
-        if let Some((_, count)) = targets
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == target)
-        {
-            *count += 1;
-        } else {
-            targets.push((target, 1));
+        let normalized = normalize_source(source);
+        if normalized.is_empty() || target.trim().is_empty() {
+            continue;
         }
-    }
-    let mut entries = Vec::with_capacity(raw_terms.len());
-    for (source, source_count, targets) in groups {
-        let mut targets = targets.into_iter();
-        let (mut target, mut best_count) = targets.next().expect("each source group has a target");
-        for (candidate, count) in targets {
-            if count > best_count
-                || (count == best_count && candidate.chars().cmp(target.chars()).is_lt())
-            {
-                target = candidate;
-                best_count = count;
+        if let Some(index) = source_indices.get(&normalized).copied() {
+            if groups[index].1 != target {
+                groups[index].2 = true;
             }
-        }
-        for _ in 0..source_count {
-            entries.push(GlossaryEntry::new(source, target));
+        } else {
+            source_indices.insert(normalized, groups.len());
+            groups.push((source, target, false));
         }
     }
-    Glossary::new_with_source_spelling_votes(name, entries, true).map(Some)
+    let entries = groups
+        .into_iter()
+        .filter(|(_, _, conflicted)| !conflicted)
+        .map(|(source, target, _)| GlossaryEntry::new(source, target))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut glossary = Glossary::new(name, entries)?;
+    glossary.automatic = true;
+    Ok(Some(glossary))
+}
+
+pub fn finalize_scoped_terms(
+    name: impl Into<String>,
+    raw_terms: &[(String, String)],
+    scoped_terms: &[ScopedTerm],
+) -> Result<Option<Glossary>, GlossaryError> {
+    let Some(mut glossary) = finalize_terms(name, raw_terms)? else {
+        return Ok(None);
+    };
+    for term in scoped_terms {
+        let key = normalize_source(&term.source);
+        if glossary.entries.iter().any(|entry| {
+            normalize_source(&entry.source) == key && entry.target == term.target
+        }) {
+            glossary.contexts.entry(key).or_default().extend(term.contexts.clone());
+        }
+    }
+    Ok(Some(glossary))
+}
+
+pub fn term_context(text: &str, source: &str, layout_label: Option<String>) -> Option<TermContext> {
+    if term_occurrences(text, source) != 1 {
+        return None;
+    }
+    let context = text.trim();
+    if context.chars().count() < source.trim().chars().count() + 16
+        || context.chars().count() < 32
+    {
+        return None;
+    }
+    Some(TermContext { text: context.to_owned(), layout_label })
+}
+
+pub(super) fn term_occurrences(text: &str, source: &str) -> usize {
+    let text = normalize_source(text);
+    let source = normalize_source(source);
+    if source.is_empty() {
+        return 0;
+    }
+    let matcher = AhoCorasickBuilder::new()
+        .build([source.as_bytes()])
+        .expect("a nonempty source is a valid pattern");
+    let mut matches = 0;
+    for found in matcher.find_overlapping_iter(text.as_bytes()) {
+        let before = text[..found.start()].chars().next_back();
+        let after = text[found.end()..].chars().next();
+        let starts_word = source.chars().next().is_some_and(is_word_character);
+        let ends_word = source.chars().next_back().is_some_and(is_word_character);
+        if (starts_word && before.is_some_and(is_word_character))
+            || (ends_word && after.is_some_and(is_word_character))
+        {
+            continue;
+        }
+        matches += 1;
+        if matches > 1 {
+            break;
+        }
+    }
+    matches
+}
+
+fn is_word_character(character: char) -> bool {
+    static WORD_CHARACTER: OnceLock<regex::Regex> = OnceLock::new();
+    let matcher = WORD_CHARACTER.get_or_init(|| regex::Regex::new(r"^\w$").unwrap());
+    let mut buffer = [0; 4];
+    matcher.is_match(character.encode_utf8(&mut buffer))
 }
 
 #[cfg(test)]

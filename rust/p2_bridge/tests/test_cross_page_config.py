@@ -1,5 +1,4 @@
 import ast
-import re
 import unittest
 from pathlib import Path
 
@@ -24,16 +23,7 @@ class CrossPageConfigContractTest(unittest.TestCase):
         self.assertIs(ast.literal_eval(defaults["experimental_cross_page_context"]), False)
 
         bridge = (ROOT / "rust/p2_bridge/src/ordinary_translation.rs").read_text(encoding="utf-8")
-        gate = re.search(
-            r'let cross_page_experiment = config\s*\.getattr\("([^"]+)"\)'
-            r'.*?\.unwrap_or\(false\);\s*if cross_page_experiment\s*\{'
-            r'.*?return Err\(.*?ordinary translators are not supported',
-            bridge,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(gate, "ordinary bridge must reject the default-off experiment")
-        self.assertEqual(gate.group(1), "experimental_cross_page_context")
-        self.assertLess(gate.start(), bridge.index('let _native_font_mapper', gate.start()))
+        self.assertNotIn("ordinary translators are not supported", bridge)
 
 
 if __name__ == "__main__":

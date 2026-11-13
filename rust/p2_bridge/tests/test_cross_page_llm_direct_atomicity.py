@@ -2,9 +2,11 @@ import asyncio
 import json
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
+import pymupdf
 import pytest
 from babeldoc import _rust_il
 from babeldoc.format.pdf.document_il import il_version_1 as il
@@ -15,8 +17,12 @@ LEFT_PREFIX = "Earlier findings were clear. "
 LEFT_TAIL = "The results demonstrate a substantial improvement across"
 RIGHT_CONTINUATION = "several independent experiments. Additional observations follow."
 TRANSLATED_PREFIX = "此前的研究结论十分明确。"
-TRANSLATED_SENTENCE = "研究结果表明，在多个相互独立的实验中均取得了显著改进。"
+TRANSLATED_SENTENCE = "增强实验结果多个独立实验得到改进。"
 TRANSLATED_FOLLOWING = "后续还发现了其他现象。"
+BASE_PREFIX = "基础前文。"
+BASE_LEFT = "基础左页译文"
+BASE_RIGHT = "基础右页译文"
+BASE_FOLLOWING = "基础后文。"
 
 
 class DirectTranslator:
@@ -25,6 +31,12 @@ class DirectTranslator:
         self.page_requests = 0
         self.cross_page_requests = 0
         self.fallback_requests = 0
+        self.boundary_requests = []
+        self.translation_items = []
+        self.left_tail = LEFT_TAIL
+        self.continuation = RIGHT_CONTINUATION.partition(". ")[0]
+        if ". " in RIGHT_CONTINUATION:
+            self.continuation += "."
 
     def do_llm_translate(self, text, rate_limit_params=None):
         return None
@@ -39,26 +51,68 @@ class DirectTranslator:
     def get_rich_text_right_placeholder(self, identifier):
         return f"</b{identifier}>"
 
+    def ordinary(self, text):
+        left = BASE_LEFT
+        right = BASE_RIGHT + "。"
+        match = re.fullmatch(r"The measured value reached (.+) during", self.left_tail)
+        if match:
+            left += match.group(1)
+        elif self.left_tail.startswith("After analysis, 7"):
+            left += "7份"
+        if self.continuation.startswith("11 "):
+            right = BASE_RIGHT + "11次。"
+        elif "-0.5" in self.continuation:
+            right = BASE_RIGHT + "-0.5。"
+        return (text.replace(LEFT_PREFIX.strip(), BASE_PREFIX)
+                .replace(self.left_tail, left)
+                .replace(self.continuation, right)
+                .replace("Additional observations follow.", BASE_FOLLOWING))
+
+    def enhanced(self, text):
+        left = "增强实验结果"
+        right = "多个独立实验得到改进。"
+        match = re.fullmatch(r"The measured value reached (.+) during", self.left_tail)
+        if match:
+            left = f"增强测量值为{match.group(1)}期间"
+        if self.continuation.startswith("11 independent experiments"):
+            right = "完成11次独立实验。"
+        elif "-0.5" in self.continuation:
+            right = "独立组测量值为-0.5。"
+        elif self.continuation.startswith("11 samples"):
+            left = "分析后7份来自回收的"
+            right = "11份样本通过检查。"
+        return (text.replace(LEFT_PREFIX.strip(), TRANSLATED_PREFIX)
+                .replace(self.left_tail, left)
+                .replace(self.continuation, right)
+                .replace("Additional observations follow.", TRANSLATED_FOLLOWING))
+
     def llm_translate(self, prompt, rate_limit_params=None):
         self.requests.append(prompt)
+        if (rate_limit_params or {}).get("cross_boundary_request"):
+            self.boundary_requests.append((prompt, rate_limit_params))
+            if "Metadata: " in prompt:
+                metadata = json.loads(prompt.split("Metadata: ", 1)[1].split(" Formula markers and source characters: ", 1)[0])
+                left = next(item for item in metadata["left"] if self.left_tail in item["text"])
+                right = next(item for item in metadata["right"] if self.continuation in item["text"])
+                preceding = left["text"][:left["text"].find(self.left_tail)]
+                start = preceding.rfind("[[BABEL_F_") if preceding.rstrip().endswith("]]") else -1
+                left_range = left["text"][start:] if start >= 0 else self.left_tail
+                return json.dumps({"status": "selected", "ranges": [
+                    {"page": left["page"], "paragraph": left["paragraph"], "text": left_range},
+                    {"page": right["page"], "paragraph": right["paragraph"], "text": self.continuation},
+                ], "joins": ["space"]}, ensure_ascii=False)
+            self.cross_page_requests += 1
+            items = json.loads(prompt.split(" Input: ", 1)[1])
+            self.translation_items.append(items)
+            return json.dumps({"outputs": [{"id": item["id"], "text": self.enhanced(item["text"])}
+                                          for item in items]}, ensure_ascii=False)
         if "## Here is the input:" not in prompt:
             self.fallback_requests += 1
-            return prompt.rsplit("Now translate the following text:", 1)[1].strip()
-        if "## Cross-page continuation" in prompt:
-            self.cross_page_requests += 1
-        else:
-            self.page_requests += 1
+            return self.ordinary(prompt.rsplit("Now translate the following text:", 1)[1].strip())
+        self.page_requests += 1
         items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            item["output"] = item.pop("input").replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
-                LEFT_TAIL + " several independent experiments.", TRANSLATED_SENTENCE,
-            ).replace(LEFT_TAIL, "研究结果表明，在多项实验中取得了显著改进").replace(
-                "several independent experiments.", "多个相互独立的实验。",
-            ).replace(" Additional observations follow.", TRANSLATED_FOLLOWING).replace(
-                "Additional observations follow.", TRANSLATED_FOLLOWING,
-            )
-            item.pop("layout_label", None)
-        return json.dumps(items)
+        return json.dumps([{"id": item["id"], "output": self.ordinary(item["input"])}
+                           for item in items], ensure_ascii=False)
 
 
 class DirectApplicationService(RustTranslatorService):
@@ -76,9 +130,9 @@ class DirectApplicationService(RustTranslatorService):
 
     def regex_finditer(self, pattern_id, text):
         if pattern_id in self.parse_patterns:
-            if text.startswith("{v1}") and TRANSLATED_PREFIX in text:
+            if BASE_LEFT in text:
                 side = "left"
-            elif "{v3}" in text and TRANSLATED_FOLLOWING in text:
+            elif BASE_RIGHT in text:
                 side = "right"
             else:
                 side = None
@@ -106,37 +160,67 @@ class Monitor:
             self.on_end()
 
 
-def make_direct_document(split_following=True):
+@lru_cache(maxsize=1)
+def fixture_font():
+    path = Path.home() / ".cache/babeldoc/fonts/GoNotoKurrent-Regular.ttf"
+    return pymupdf.Font(fontfile=str(path))
+
+
+def source_characters(text, style, bounds):
+    font = fixture_font()
+    position, baseline = bounds[0], bounds[3] - 12
+    characters = []
+    for index, character in enumerate(text):
+        advance = font.glyph_advance(ord(character)) * style.font_size
+        word = text[index:].split(" ", 1)[0] if index == 0 or text[index - 1] == " " else ""
+        width = sum(font.glyph_advance(ord(letter)) * style.font_size for letter in word)
+        if word and position > bounds[0] and position + width > bounds[2]:
+            position, baseline = bounds[0], baseline - 12
+        box = il.Box(x=position, y=baseline, x2=position + advance, y2=baseline + 10)
+        characters.append(il.PdfCharacter(
+            pdf_style=style, char_unicode=character, box=box, visual_bbox=il.VisualBbox(box=box),
+            advance=advance, pdf_character_id=font.has_glyph(ord(character)), vertical=False,
+        ))
+        position += advance
+    return characters
+
+
+def make_direct_document(split_following=True, *, formula_before=False):
     pages = []
+    continuation, separator, _following = RIGHT_CONTINUATION.partition(". ")
+    continuation += "." if separator else ""
     for index in range(2):
         base_style = il.PdfStyle(font_id="regular", font_size=10.0)
-        formula = il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[
-            il.PdfCharacter(pdf_style=base_style, char_unicode="x"),
-        ]))
+        rich_style = il.PdfStyle(font_id="regular", font_size=10.0,
+            graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"))
+        bounds = (60, 100 if index == 0 else 650, 540, 150 if index == 0 else 700)
+        text = (("x " + LEFT_PREFIX + LEFT_TAIL if formula_before else LEFT_PREFIX + "x " + LEFT_TAIL)
+                if index == 0 else RIGHT_CONTINUATION + " y")
+        characters = source_characters(text, base_style, bounds)
+        formula_index = (0 if formula_before else len(LEFT_PREFIX)) if index == 0 else len(text) - 1
+        formula_character = characters[formula_index]
+        formula = il.PdfParagraphComposition(pdf_formula=il.PdfFormula(
+            pdf_character=[formula_character], box=formula_character.box,
+            x_offset=0, y_offset=0, x_advance=formula_character.advance,
+        ))
         if index == 0:
-            text = LEFT_PREFIX + LEFT_TAIL
-            compositions = [formula, il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
-                pdf_style=base_style, char_unicode=text,
-            ))]
+            compositions = [il.PdfParagraphComposition(pdf_character=character)
+                            for character in characters[:formula_index]] + [formula] + [
+                il.PdfParagraphComposition(pdf_character=character) for character in characters[formula_index + 1:]
+            ]
         else:
-            text = RIGHT_CONTINUATION
-            rich_style = il.PdfStyle(
-                font_id="regular", font_size=10.0,
-                graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"),
-            )
-            continued, separator, following = text.partition(". ") if split_following else (text, "", "")
-            continued = continued + ("." if separator else "")
+            rich_end = len(continuation) if split_following and separator else len(RIGHT_CONTINUATION)
+            rich_characters = characters[:rich_end]
+            for character in rich_characters:
+                character.pdf_style = rich_style
+            rich_box = il.Box(x=min(c.box.x for c in rich_characters), y=min(c.box.y for c in rich_characters),
+                              x2=max(c.box.x2 for c in rich_characters), y2=max(c.box.y2 for c in rich_characters))
             compositions = [il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
-                pdf_style=rich_style,
-                pdf_character=[il.PdfCharacter(pdf_style=rich_style, char_unicode=continued)],
-            ))]
-            if separator:
-                compositions.append(il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
-                    pdf_style=base_style, char_unicode=" " + following,
-                )))
-            compositions.append(formula)
+                box=rich_box, pdf_style=rich_style, pdf_character=rich_characters,
+            ))] + [il.PdfParagraphComposition(pdf_character=character)
+                   for character in characters[rich_end:formula_index]] + [formula]
         paragraph = il.PdfParagraph(
-            box=il.Box(x=60, y=100 if index == 0 else 650, x2=540, y2=150 if index == 0 else 700),
+            box=il.Box(x=bounds[0], y=bounds[1], x2=bounds[2], y2=bounds[3]),
             pdf_style=base_style, unicode=text, debug_id=f"p{index}", layout_label="text",
             pdf_paragraph_composition=compositions,
         )
@@ -149,8 +233,10 @@ def make_direct_document(split_following=True):
 
 
 def run_bridge(document, tmp_path, service, flag, monitor, cross_page=True):
-    font = (Path("C:/Windows/Fonts/arial.ttf") if sys.platform == "win32"
-            else Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+    font = Path.home() / ".cache/babeldoc/fonts/GoNotoKurrent-Regular.ttf"
+    if not font.exists():
+        font = (Path("C:/Windows/Fonts/arial.ttf") if sys.platform == "win32"
+                else Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
     if not font.exists():
         pytest.skip("test font is unavailable")
     mapper = _rust_il.font_mapper_handle(
@@ -175,123 +261,117 @@ def run_bridge(document, tmp_path, service, flag, monitor, cross_page=True):
         second.close()
 
 
+def pages_of(document):
+    return json.loads(document.parser_artifact_json())["document"]["page"]
+
+
+def page_texts(document):
+    return [page["pdf_paragraph"][0]["unicode"] for page in pages_of(document)]
+
+
+def report_of(tmp_path):
+    return json.loads((tmp_path / "cross_boundary_report.json").read_text(encoding="utf-8"))
+
+
 def assert_direct_request(service):
-    assert service.translator.cross_page_requests == 1
-    assert service.translator.fallback_requests == 0
-    prompt = service.translator.requests[0]
-    assert "second input starts with a complete sentence" in prompt
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    assert LEFT_TAIL not in items[0]["input"]
-    assert LEFT_TAIL + " several independent experiments." in items[1]["input"]
+    translator = service.translator
+    assert translator.page_requests > 0
+    assert translator.cross_page_requests == 1
+    assert len(translator.boundary_requests) == 2
+    items = translator.translation_items[0]
+    assert len(items) == 3
+    assert all(set(item) == {"id", "text"} for item in items)
+    assert len({item["id"] for item in items}) == 3
+    assert translator.left_tail in items[0]["text"]
+    assert translator.continuation in items[0]["text"]
+    assert "Additional observations follow." not in items[0]["text"]
+    assert any("Additional observations follow." in item["text"] for item in items[1:])
+    return items
 
 
-def test_direct_whole_sentence_success(tmp_path):
-    document = make_direct_document()
+def assert_baseline(document, tmp_path):
+    left, right = page_texts(document)
+    assert BASE_PREFIX in left and BASE_LEFT in left
+    assert BASE_RIGHT in right and BASE_FOLLOWING in right
+    assert "增强" not in left + right
+    assert TRANSLATED_FOLLOWING not in left + right
+    report = report_of(tmp_path)
+    assert report["baseline_completed"] is True
+    assert report["applied_groups"] == 0
+    assert any(decision["result"] == "fallback" for decision in report["decisions"])
+    assert report["unresolved"]
+
+
+def formula_texts(page):
+    return ["".join(character["char_unicode"] for character in composition["pdf_formula"]["pdf_character"])
+            for paragraph in page["pdf_paragraph"] for composition in paragraph["pdf_paragraph_composition"]
+            if composition.get("pdf_formula")]
+
+
+@pytest.mark.parametrize("split_following", [True, False])
+def test_direct_whole_sentence_success_and_ownership(tmp_path, split_following):
+    document = make_direct_document(split_following)
     before = document.parser_artifact_hash()
     service = DirectApplicationService()
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert_direct_request(service)
-    assert service.application_outputs == ["left", "left", "right"]
+    items = assert_direct_request(service)
+    assert "[[BABEL_" in items[0]["text"]
+    assert report_of(tmp_path)["applied_groups"] == 1
     assert document.parser_artifact_hash() != before
-    tracking = json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))
-    assert len(tracking["cross_page"]) == 1
-
-
-def test_same_style_following_sentence_has_its_own_request_item(tmp_path):
-    document = make_direct_document(split_following=False)
-    service = DirectApplicationService()
-    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert_direct_request(service)
-    items = json.loads(service.translator.requests[0].rsplit("## Here is the input:", 1)[1].strip())
-    assert len(items) == 3
-    assert "Additional observations follow." not in items[1]["input"]
-    assert "Additional observations follow." in items[2]["input"]
-    assert service.application_outputs == ["left", "left", "right"]
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    left, right = [page["pdf_paragraph"][0]["unicode"] for page in pages]
-    assert TRANSLATED_FOLLOWING not in left
-    assert TRANSLATED_FOLLOWING in right
+    left, right = page_texts(document)
+    assert TRANSLATED_PREFIX in left
+    assert TRANSLATED_FOLLOWING not in left and TRANSLATED_FOLLOWING in right
+    assert BASE_LEFT not in left and BASE_RIGHT not in right
+    pages = pages_of(document)
+    assert formula_texts(pages[0]) == ["x"]
+    assert formula_texts(pages[1]) == ["y"]
+    right_parts = pages[1]["pdf_paragraph"][0]["pdf_paragraph_composition"]
+    assert any((part.get("pdf_same_style_unicode_characters") or {}).get("pdf_style", {})
+               .get("graphic_state", {}).get("passthrough_per_char_instruction") == "0 g"
+               for part in right_parts)
+    assert (tmp_path / "translate_tracking.json").is_file()
 
 
 def test_formula_before_sentence_does_not_hide_its_boundary(tmp_path):
-    pages = []
-    for index in range(2):
-        base = il.PdfStyle(font_id="regular", font_size=10.0)
-        formula_text = "observations" if index == 0 else "x"
-        formula = il.PdfParagraphComposition(pdf_formula=il.PdfFormula(pdf_character=[
-            il.PdfCharacter(pdf_style=base, char_unicode=formula_text),
-        ]))
-        if index == 0:
-            text = "Previous findings confirmed observations. The treatment improved outcomes across"
-            compositions = [
-                il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
-                    pdf_style=base, char_unicode="Previous findings confirmed ",
-                )),
-                formula,
-                il.PdfParagraphComposition(pdf_character=il.PdfCharacter(
-                    pdf_style=base, char_unicode=". The treatment improved outcomes across",
-                )),
-            ]
-        else:
-            text = "multiple independent groups. A later finding follows."
-            rich = il.PdfStyle(
-                font_id="regular", font_size=10.0,
-                graphic_state=il.GraphicState(passthrough_per_char_instruction="0 g"),
-            )
-            compositions = [
-                il.PdfParagraphComposition(pdf_same_style_characters=il.PdfSameStyleCharacters(
-                    pdf_style=rich, pdf_character=[il.PdfCharacter(pdf_style=rich, char_unicode=text)],
-                )),
-                formula,
-            ]
-        paragraph = il.PdfParagraph(
-            box=il.Box(x=60, y=80 if index == 0 else 650, x2=540, y2=150 if index == 0 else 720),
-            pdf_style=base, unicode=text, debug_id=f"formula-boundary-{index}", layout_label="text",
-            pdf_paragraph_composition=compositions,
-        )
-        pages.append(il.Page(
-            page_number=index, cropbox=il.Cropbox(box=il.Box(x=0, y=0, x2=600, y2=800)),
-            pdf_font=[il.PdfFont(font_id="regular", bold=False, italic=False, monospace=False, serif=False)],
-            pdf_paragraph=[paragraph],
-        ))
-    document = _rust_il.transfer_document(il.Document(page=pages, total_pages=2))
+    document = make_direct_document(formula_before=True)
     service = DirectApplicationService()
-
-    def translate(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        if "## Here is the input:" not in prompt:
-            service.translator.fallback_requests += 1
-            return prompt.rsplit("Now translate the following text:", 1)[1].strip()
-        service.translator.cross_page_requests += "## Cross-page continuation" in prompt
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            item["output"] = item.pop("input").replace(
-                "Previous findings confirmed {v1}.", "此前的结果已确认{v1}。",
-            ).replace(
-                "The treatment improved outcomes across multiple independent groups.",
-                "研究显示多个独立群体的结果有所改善。",
-            ).replace(" A later finding follows.", "后续发现保留在第二页。")
-            item.pop("layout_label", None)
-        return json.dumps(items)
-
-    service.translator.llm_translate = translate
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests == 1
-    assert service.translator.fallback_requests == 0
-    items = json.loads(service.translator.requests[0].rsplit("## Here is the input:", 1)[1].strip())
-    assert len(items) == 3
-    assert "The treatment improved outcomes across multiple independent groups." in items[1]["input"]
-    assert "A later finding follows." in items[2]["input"]
-    output_pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    first, second = [page["pdf_paragraph"][0]["unicode"] for page in output_pages]
-    assert "此前的结果已确认" in first
-    assert "后续发现" not in first
-    assert "后续发现保留在第二页。" in second
-    joined = re.sub(r"</?b\d+>", "", first + second)
-    assert "研究显示多个独立群体的结果有所改善。" in joined
+    items = assert_direct_request(service)
+    assert not re.search(r"\[\[BABEL_\d+_\d+_F\]\]", items[0]["text"])
+    assert re.search(r"\[\[BABEL_\d+_\d+_F\]\]", items[1]["text"])
+    assert report_of(tmp_path)["applied_groups"] == 1
+    pages = pages_of(document)
+    assert formula_texts(pages[0]) == ["x"] and formula_texts(pages[1]) == ["y"]
+    left, right = page_texts(document)
+    assert TRANSLATED_PREFIX in left and TRANSLATED_FOLLOWING not in left
+    assert TRANSLATED_FOLLOWING in right
 
 
-@pytest.mark.parametrize("damage", ["missing", "duplicate", "empty"])
+@pytest.mark.parametrize("selection", ["none", "uncertain"])
+def test_ambiguous_boundary_keeps_translated_baseline(tmp_path, selection):
+    document = make_direct_document()
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def undecided(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if (rate_limit_params or {}).get("cross_boundary_request") and "Metadata: " in prompt:
+            return json.dumps({"status": selection})
+        return response
+
+    service.translator.llm_translate = undecided
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 0
+    report = report_of(tmp_path)
+    assert report["applied_groups"] == 0
+    assert report["decisions"][0]["result"] == selection
+    left, right = page_texts(document)
+    assert BASE_PREFIX in left and BASE_LEFT in left
+    assert BASE_RIGHT in right and BASE_FOLLOWING in right
+    assert BASE_FOLLOWING not in left
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "empty", "unidentified"])
 def test_invalid_following_item_falls_back_for_both_pages(tmp_path, damage):
     document = make_direct_document(split_following=False)
     service = DirectApplicationService()
@@ -299,333 +379,253 @@ def test_invalid_following_item_falls_back_for_both_pages(tmp_path, damage):
 
     def damaged(prompt, rate_limit_params=None):
         response = translate(prompt, rate_limit_params)
-        if "## Cross-page continuation" not in prompt:
+        if not (rate_limit_params or {}).get("cross_boundary_request") or " Input: " not in prompt:
             return response
-        items = json.loads(response)
+        outputs = json.loads(response)["outputs"]
+        if damage == "unidentified":
+            return json.dumps({"outputs": [item["text"] for item in outputs]})
+        target = next((item for item in outputs if TRANSLATED_FOLLOWING in item["text"]), outputs[-1])
         if damage == "missing":
-            items.pop()
+            outputs.remove(target)
         elif damage == "duplicate":
-            items[2]["id"] = 1
+            outputs.append(dict(target))
         else:
-            items[2]["output"] = ""
-        return json.dumps(items)
+            target["text"] = ""
+        return json.dumps({"outputs": outputs}, ensure_ascii=False)
 
     service.translator.llm_translate = damaged
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests == 2
-    assert service.translator.fallback_requests == 2
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    left, right = [page["pdf_paragraph"][0]["unicode"] for page in pages]
-    assert "Additional observations follow." not in left
-    assert "Additional observations follow." in right
+    assert service.translator.cross_page_requests >= 2
+    assert_baseline(document, tmp_path)
 
 
-def test_normalization_cannot_move_a_suffix_when_sentence_boundary_disappears(tmp_path):
+def test_damaged_style_markers_fall_back_without_moving_following_sentence(tmp_path):
     document = make_direct_document(split_following=False)
     service = DirectApplicationService()
     translate = service.translator.llm_translate
 
     def damaged(prompt, rate_limit_params=None):
         response = translate(prompt, rate_limit_params)
-        if "## Cross-page continuation" not in prompt:
-            return response
-        items = json.loads(response)
-        items[1]["output"] = items[1]["output"].replace(TRANSLATED_SENTENCE, "研究结果" + "。" * 20 + "另有无句界内容")
-        return json.dumps(items)
+        if (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt:
+            outputs = json.loads(response)["outputs"]
+            for item in outputs:
+                item["text"] = re.sub(r"\[\[BABEL_\d+_\d+_R\]\]", "", item["text"])
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return response
 
     service.translator.llm_translate = damaged
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests == 2
-    assert service.translator.fallback_requests == 2
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    assert "Additional observations follow." not in pages[0]["pdf_paragraph"][0]["unicode"]
-    assert "Additional observations follow." in pages[1]["pdf_paragraph"][0]["unicode"]
+    assert service.translator.cross_page_requests >= 2
+    assert_baseline(document, tmp_path)
+    assert BASE_FOLLOWING not in page_texts(document)[0]
 
 
-def test_direct_whole_sentence_keeps_the_next_sentence_on_its_page(tmp_path, monkeypatch):
-    sentence = "经过充分分析，这些独立实验的结论最终到达 the end."
-    following = " Another unrelated finding must stay entirely on the next page."
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE", sentence)
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING", following)
-    document = make_direct_document()
+def test_ambiguous_translated_punctuation_cannot_move_following_sentence(tmp_path):
+    document = make_direct_document(split_following=False)
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def ambiguous(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt:
+            outputs = json.loads(response)["outputs"]
+            for item in outputs:
+                item["text"] = item["text"].replace("增强实验结果", "研究结果。另有无句界内容")
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return response
+
+    service.translator.llm_translate = ambiguous
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    items = assert_direct_request(service)
+    assert "Additional observations follow." not in items[0]["text"]
+    assert report_of(tmp_path)["applied_groups"] == 1
+    left, right = page_texts(document)
+    assert TRANSLATED_FOLLOWING not in left and TRANSLATED_FOLLOWING in right
+
+
+@pytest.mark.parametrize("split_following", [True, False])
+def test_numeric_sentence_is_present_once_across_original_pages(tmp_path, monkeypatch, split_following):
+    monkeypatch.setitem(globals(), "LEFT_TAIL", "After analysis, 7 of the recovered")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "11 samples were checked successfully. Additional observations follow.")
+    document = make_direct_document(split_following)
     service = DirectApplicationService()
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert_direct_request(service)
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    left = pages[0]["pdf_paragraph"][0]["unicode"]
-    right = pages[1]["pdf_paragraph"][0]["unicode"]
-    assert "Another unrelated finding" not in left
-    assert following in right
+    assert report_of(tmp_path)["applied_groups"] == 1
+    left, right = page_texts(document)
+    assert (left + right).count("7") == 1 and (left + right).count("11") == 1
+    assert TRANSLATED_FOLLOWING not in left and TRANSLATED_FOLLOWING in right
 
 
-def test_direct_ambiguous_sentence_boundary_falls_back(tmp_path, monkeypatch):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE", "Dr.")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING",
-        " Another unrelated finding must stay entirely on the next page.",
-    )
+NUMERIC_DAMAGE = [
+    ("-7", "7"), ("−7", "7"), ("–7", "7"), ("7", "–7"),
+    ("≪7", "7"), ("7%", "7"), ("7٪", "7"), ("7", "7٪"),
+    ("1e-3", "1e3"), ("1e-3", "1e-2"), ("1,000", "1.000"),
+    ("-0.5", "0.5"), ("7 × 3", "7 ÷ 3"), ("7 +/- 3", "7 - 3"),
+    ("7 $", "7"), ("7", "-7"), ("7-", "7"),
+]
+
+
+@pytest.mark.parametrize("damage_numeric", [False, True])
+@pytest.mark.parametrize(("quantity", "translated_quantity"), NUMERIC_DAMAGE)
+def test_numeric_expression_validation_is_atomic(tmp_path, monkeypatch, quantity, translated_quantity, damage_numeric):
+    monkeypatch.setitem(globals(), "LEFT_TAIL", f"The measured value reached {quantity} during")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "11 independent experiments. Additional observations follow.")
     document = make_direct_document()
     service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def damage_response(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if damage_numeric and (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt:
+            outputs = json.loads(response)["outputs"]
+            for item in outputs:
+                item["text"] = item["text"].replace(quantity, translated_quantity)
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return response
+
+    service.translator.llm_translate = damage_response
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests >= 1
-    assert service.translator.fallback_requests >= 1
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    assert "Another unrelated finding" not in pages[0]["pdf_paragraph"][0]["unicode"]
-
-
-def test_numeric_multistyle_missing_boundary_fails_without_mutation(tmp_path, monkeypatch):
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "LEFT_TAIL",
-        "After analysis, 7 of the recovered",
-    )
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "11 samples were checked successfully. Additional observations follow.",
-    )
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "TRANSLATED_SENTENCE",
-        "A later finding appears first and the numeric sentence ends",
-    )
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "TRANSLATED_FOLLOWING", "",
-    )
-    document = make_direct_document()
-    before = document.parser_artifact_hash()
-    service = DirectApplicationService()
-    def malformed(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        service.translator.cross_page_requests += 1
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            item["output"] = item.pop("input").replace(
-                "After analysis, 7 of the recovered 11 samples were checked successfully.",
-                "A later finding appears first and the numeric sentence ends",
-            ).replace(" Additional observations follow.", "")
-            item.pop("layout_label", None)
-        return json.dumps(items)
-
-    service.translator.llm_translate = malformed
-    with pytest.raises(RuntimeError, match="跨页数值续句"):
-        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests >= 1
-    assert document.parser_artifact_hash() == before
-    assert not (tmp_path / "translate_tracking.json").exists()
-
-
-def test_numeric_sentence_is_present_once_across_original_pages(tmp_path, monkeypatch):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "After analysis, 7 of the recovered")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "11 samples were checked successfully. Additional observations follow.",
-    )
-    document = make_direct_document()
-    service = DirectApplicationService()
-    def translate(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        service.translator.cross_page_requests += 1
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            output = item["input"].replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
-                "After analysis, 7 of the recovered 11 samples were checked successfully.",
-                "分析后，7份来自回收的11份样本，通过了检查。",
-            ).replace(" Additional observations follow.", TRANSLATED_FOLLOWING)
-            item["output"] = output
-            item.pop("input")
-            item.pop("layout_label", None)
-        return json.dumps(items)
-
-    service.translator.llm_translate = translate
-    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests == 1
-    assert service.translator.fallback_requests == 0
-    prompt = service.translator.requests[0]
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    assert any("After analysis, 7 of the recovered 11 samples were checked successfully." in item["input"] for item in items)
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    left = pages[0]["pdf_paragraph"][0]["unicode"]
-    right = pages[1]["pdf_paragraph"][0]["unicode"]
-    assert left.count("7") == 1 and "7" not in right
-    assert right.count("11") == 1 and "11" not in left
-    assert TRANSLATED_FOLLOWING in right
-    assert TRANSLATED_FOLLOWING not in left
-
-
-def test_numeric_sentence_with_a_dropped_number_fails_without_mutation(tmp_path, monkeypatch):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "After analysis, 7 of the recovered")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "11 samples were checked successfully. Additional observations follow.",
-    )
-    document = make_direct_document()
-    before = document.parser_artifact_hash()
-    service = DirectApplicationService()
-    with pytest.raises(RuntimeError, match="跨页数值续句"):
-        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests >= 1
-    assert document.parser_artifact_hash() == before
-    assert not (tmp_path / "translate_tracking.json").exists()
-
-
-@pytest.mark.parametrize(
-    ("quantity", "translated_quantity", "accepted"),
-    [
-        ("-7", "-7", True),
-        ("-7", "7", False),
-        ("−7", "7", False),
-        ("–7", "7", False),
-        ("≪7", "7", False),
-        ("7%", "7", False),
-        ("7٪", "7", False),
-        ("1e-3", "1e3", False),
-        ("1,000", "1.000", False),
-        ("7 × 3", "7 ÷ 3", False),
-        ("7 +/- 3", "7 - 3", False),
-        ("7 $", "7", False),
-        ("7", "-7", False),
-    ],
-)
-def test_numeric_expression_validation_is_atomic(tmp_path, monkeypatch, quantity, translated_quantity, accepted):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", f"The measured value reached {quantity} during")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "11 independent experiments. Additional observations follow.",
-    )
-    document = make_direct_document()
-    before = document.parser_artifact_hash()
-    service = DirectApplicationService()
-
-    def translate(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        service.translator.cross_page_requests += 1
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            item["output"] = item.pop("input").replace(
-                f"The measured value reached {quantity} during 11 independent experiments.",
-                f"测量值达到{translated_quantity}，涉及11次独立实验。",
-            ).replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
-                " Additional observations follow.", TRANSLATED_FOLLOWING,
-            )
-            item.pop("layout_label", None)
-        return json.dumps(items)
-
-    service.translator.llm_translate = translate
-    if accepted:
-        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-        pages = json.loads(document.parser_artifact_json())["document"]["page"]
-        assert quantity in pages[0]["pdf_paragraph"][0]["unicode"]
-        assert "11" in pages[1]["pdf_paragraph"][0]["unicode"]
-        assert TRANSLATED_FOLLOWING in pages[1]["pdf_paragraph"][0]["unicode"]
-        assert document.parser_artifact_hash() != before
-        assert (tmp_path / "translate_tracking.json").exists()
+    if damage_numeric:
+        assert service.translator.cross_page_requests >= 2
+        assert_baseline(document, tmp_path)
+        assert "numeric expression or mathematical symbol changed" in str(report_of(tmp_path)["unresolved"])
+        assert quantity in page_texts(document)[0]
     else:
-        with pytest.raises(RuntimeError, match="跨页数值续句"):
-            run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-        assert document.parser_artifact_hash() == before
-        assert not (tmp_path / "translate_tracking.json").exists()
-    assert service.translator.cross_page_requests >= 1
-    assert service.translator.fallback_requests == 0
+        assert service.translator.cross_page_requests == 1
+        report = report_of(tmp_path)
+        if quantity == "≪7" and not fixture_font().has_glyph(ord("≪")):
+            item = next(item for item in service.translator.translation_items[0] if quantity in item["text"])
+            batch = report["decisions"][0]["translation_batches"][0]
+            assert item["id"] in batch["accepted_ids"]
+            assert "TypesettingFailed" in report["unresolved"][0]["reason"]
+            assert_baseline(document, tmp_path)
+            return
+        assert report["applied_groups"] == 1, json.dumps(report, ensure_ascii=False)
+        left, right = page_texts(document)
+        assert quantity in left + right and "11" in left + right
+        assert TRANSLATED_FOLLOWING not in left and TRANSLATED_FOLLOWING in right
+
+
+def test_missing_numeric_item_retains_multistyle_baseline(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "LEFT_TAIL", "After analysis, 7 of the recovered")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "11 samples were checked successfully. Additional observations follow.")
+    document = make_direct_document(split_following=False)
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def damaged(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt:
+            outputs = json.loads(response)["outputs"]
+            for item in outputs:
+                item["text"] = item["text"].replace("11", "")
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return response
+
+    service.translator.llm_translate = damaged
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests >= 2
+    assert_baseline(document, tmp_path)
+    assert "numeric expression or mathematical symbol changed" in str(report_of(tmp_path)["unresolved"])
+    left, right = page_texts(document)
+    assert "7" in left and "11" in right
+
+
+def test_dotted_step_range_cannot_cut_a_decimal(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "LEFT_TAIL", "The checklist includes the following step 1.2")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "applies to sample collection. Additional observations follow.")
+    document = make_direct_document()
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def truncated(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if (rate_limit_params or {}).get("cross_boundary_request") and "Metadata: " in prompt:
+            decision = json.loads(response)
+            decision["ranges"][0]["text"] = decision["ranges"][0]["text"][:-1]
+            return json.dumps(decision, ensure_ascii=False)
+        return response
+
+    service.translator.llm_translate = truncated
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert service.translator.cross_page_requests == 0
+    assert len(service.translator.boundary_requests) == 2
+    report = report_of(tmp_path)
+    assert report["applied_groups"] == 0 and report["unresolved"]
+    left, right = page_texts(document)
+    assert BASE_LEFT in left and BASE_RIGHT in right and BASE_FOLLOWING in right
 
 
 def test_numeric_expression_retry_commits_only_corrected_response(tmp_path, monkeypatch):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "The measured value reached -7 during")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "11 independent experiments. Additional observations follow.",
-    )
+    monkeypatch.setitem(globals(), "LEFT_TAIL", "The measured value reached -7 during")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "11 independent experiments. Additional observations follow.")
     document = make_direct_document()
-    before = document.parser_artifact_hash()
     service = DirectApplicationService()
+    translate = service.translator.llm_translate
 
-    def translate(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        service.translator.cross_page_requests += 1
-        value = "7" if service.translator.cross_page_requests == 1 else "-7"
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        for item in items:
-            item["output"] = item.pop("input").replace(
-                "The measured value reached -7 during 11 independent experiments.",
-                f"测量值达到{value}，涉及11次独立实验。",
-            ).replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
-                " Additional observations follow.", TRANSLATED_FOLLOWING,
-            )
-            item.pop("layout_label", None)
-        return json.dumps(items)
+    def damaged_first(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        if (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt and service.translator.cross_page_requests == 1:
+            outputs = json.loads(response)["outputs"]
+            for item in outputs:
+                item["text"] = item["text"].replace("-7", "7")
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return response
 
-    service.translator.llm_translate = translate
+    service.translator.llm_translate = damaged_first
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    pages = json.loads(document.parser_artifact_json())["document"]["page"]
-    assert "-7" in pages[0]["pdf_paragraph"][0]["unicode"]
-    assert "11" in pages[1]["pdf_paragraph"][0]["unicode"]
-    assert TRANSLATED_FOLLOWING in pages[1]["pdf_paragraph"][0]["unicode"]
-    assert document.parser_artifact_hash() != before
-    assert (tmp_path / "translate_tracking.json").exists()
     assert service.translator.cross_page_requests == 2
-    assert service.translator.fallback_requests == 0
+    first, retry = service.translator.translation_items
+    assert len(first) == 3 and len(retry) == 1
+    bad = next(item for item in first if "-7" in item["text"])
+    assert retry == [bad]
+    assert report_of(tmp_path)["applied_groups"] == 1
+    left, right = page_texts(document)
+    assert "-7" in left + right and "11" in left + right
+    assert TRANSLATED_FOLLOWING not in left and TRANSLATED_FOLLOWING in right
 
 
 @pytest.mark.parametrize("following", [False, True])
 @pytest.mark.parametrize("damaged", [False, True])
 def test_signed_decimal_at_sentence_end_is_validated(tmp_path, monkeypatch, following, damaged):
-    left_tail = "The final measurement was reported for"
-    continuation = "the independent group as -0.5."
-    right_text = continuation + (" Additional observations follow." if following else "")
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", left_tail)
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION", right_text)
+    monkeypatch.setitem(globals(), "LEFT_TAIL", "The final measurement was reported for")
+    monkeypatch.setitem(globals(), "RIGHT_CONTINUATION", "the independent group as -0.5." +
+                        (" Additional observations follow." if following else ""))
     document = make_direct_document()
-    before = document.parser_artifact_hash()
     service = DirectApplicationService()
+    translate = service.translator.llm_translate
 
-    def translate(prompt, rate_limit_params=None):
-        service.translator.requests.append(prompt)
-        assert "## Cross-page continuation" in prompt
-        service.translator.cross_page_requests += 1
-        items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-        assert any(f"{left_tail} {continuation}" in item["input"] for item in items)
-        for item in items:
-            item["output"] = item.pop("input").replace(
-                f"{left_tail} {continuation}",
-                "最终独立组的测量值为0.5。" if damaged else "最终独立组的测量值为-0.5。",
-            ).replace(LEFT_PREFIX, TRANSLATED_PREFIX).replace(
-                " Additional observations follow.", TRANSLATED_FOLLOWING,
-            )
-            item.pop("layout_label", None)
-        return json.dumps(items)
+    def response(prompt, rate_limit_params=None):
+        result = translate(prompt, rate_limit_params)
+        if damaged and (rate_limit_params or {}).get("cross_boundary_request") and " Input: " in prompt:
+            outputs = json.loads(result)["outputs"]
+            for item in outputs:
+                item["text"] = item["text"].replace("-0.5", "0.5")
+            return json.dumps({"outputs": outputs}, ensure_ascii=False)
+        return result
 
-    service.translator.llm_translate = translate
+    service.translator.llm_translate = response
+    run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    left, right = page_texts(document)
+    assert "-0.5" in left + right
+    report = report_of(tmp_path)
     if damaged:
-        with pytest.raises(RuntimeError, match="跨页数值续句"):
-            run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-        assert document.parser_artifact_hash() == before
-        assert not (tmp_path / "translate_tracking.json").exists()
+        assert report["applied_groups"] == 0 and report["unresolved"]
+        assert "numeric expression or mathematical symbol changed" in str(report["unresolved"])
+        assert BASE_LEFT in left and BASE_RIGHT in right
+        assert service.translator.cross_page_requests >= 2
     else:
-        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-        pages = json.loads(document.parser_artifact_json())["document"]["page"]
-        assert "-0.5" in pages[1]["pdf_paragraph"][0]["unicode"]
-        assert document.parser_artifact_hash() != before
-        assert (tmp_path / "translate_tracking.json").exists()
-    assert service.translator.cross_page_requests in ((1, 2) if damaged else (1,))
-    assert service.translator.fallback_requests == 0
+        assert report["applied_groups"] == 1
+        assert service.translator.cross_page_requests == 1
+    if following:
+        expected = BASE_FOLLOWING if damaged else TRANSLATED_FOLLOWING
+        assert expected not in left and expected in right
 
 
-def test_dotted_step_number_does_not_form_a_cross_page_sentence(tmp_path, monkeypatch):
-    monkeypatch.setitem(DirectTranslator.llm_translate.__globals__, "LEFT_TAIL", "The checklist includes the following step 1.2")
-    monkeypatch.setitem(
-        DirectTranslator.llm_translate.__globals__, "RIGHT_CONTINUATION",
-        "applies to sample collection. Additional observations follow.",
-    )
-    document = make_direct_document()
-    before = document.parser_artifact_hash()
-    service = DirectApplicationService()
-    with pytest.raises(RuntimeError, match="跨页数值续句"):
-        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
-    assert service.translator.cross_page_requests == 0
-    assert document.parser_artifact_hash() == before
-    assert not (tmp_path / "translate_tracking.json").exists()
-
-
-@pytest.mark.parametrize("split_following", [True, False])
 @pytest.mark.parametrize("failure", ["cancel", "second_output"])
-def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure, split_following):
+@pytest.mark.parametrize("split_following", [True, False])
+def test_baseline_apply_failure_rolls_back(tmp_path, failure, split_following):
     flag = _rust_il.CancelFlag()
     fired = []
 
@@ -639,26 +639,27 @@ def test_direct_whole_sentence_apply_failure_rolls_back(tmp_path, failure, split
             fired.append(side)
             raise RuntimeError("injected direct second-output failure")
 
-    document = make_direct_document(split_following=split_following)
+    document = make_direct_document(split_following)
     before = document.parser_artifact_hash()
+    tracking = tmp_path / "translate_tracking.json"
+    tracking.write_bytes(b"existing tracking")
     service = DirectApplicationService(fail)
     expected = asyncio.CancelledError if failure == "cancel" else RuntimeError
     with pytest.raises(expected) as error:
         run_bridge(document, tmp_path, service, flag, Monitor())
-    assert_direct_request(service)
     assert fired == ["left" if failure == "cancel" else "right"]
-    assert service.application_outputs == (["left", "left"] if failure == "cancel" else ["left", "left", "right"])
     if failure == "cancel":
         assert flag.observation_delay() is not None
     else:
         assert str(error.value) == "injected direct second-output failure"
-    assert not (tmp_path / "translate_tracking.json").exists()
     assert document.parser_artifact_hash() == before
+    assert tracking.read_bytes() == b"existing tracking"
+    assert not service.translator.boundary_requests
 
 
 @pytest.mark.parametrize("split_following", [True, False])
-def test_direct_whole_sentence_tracking_publish_failure_rolls_back(tmp_path, split_following):
-    document = make_direct_document(split_following=split_following)
+def test_baseline_tracking_publish_failure_rolls_back(tmp_path, split_following):
+    document = make_direct_document(split_following)
     before = document.parser_artifact_hash()
     destination = tmp_path / "translate_tracking.json"
     service = DirectApplicationService()
@@ -671,10 +672,76 @@ def test_direct_whole_sentence_tracking_publish_failure_rolls_back(tmp_path, spl
 
     with pytest.raises(RuntimeError):
         run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor(block_publish))
-    assert_direct_request(service)
     assert blocked == [True]
     assert document.parser_artifact_hash() == before
     assert not list(tmp_path.glob("translate_tracking.json.*.tmp"))
+    assert not service.translator.boundary_requests
+
+
+@pytest.mark.parametrize("split_following", [True, False])
+def test_baseline_cancellation_at_commit_preserves_tracking(tmp_path, split_following):
+    document = make_direct_document(split_following)
+    before = document.parser_artifact_hash()
+    tracking = tmp_path / "translate_tracking.json"
+    tracking.write_bytes(b"existing tracking")
+    flag = _rust_il.CancelFlag()
+    service = DirectApplicationService()
+    with pytest.raises(asyncio.CancelledError):
+        run_bridge(document, tmp_path, service, flag, Monitor(flag.cancel))
+    assert flag.observation_delay() is not None
+    assert document.parser_artifact_hash() == before
+    assert tracking.read_bytes() == b"existing tracking"
+    assert not list(tmp_path.glob("translate_tracking.json.*.tmp"))
+    assert not service.translator.boundary_requests
+
+
+@pytest.mark.parametrize("stage", ["selection", "translation"])
+def test_enhancement_cancellation_preserves_completed_baseline(tmp_path, stage):
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    baseline = make_direct_document()
+    run_bridge(baseline, baseline_dir, DirectApplicationService(), _rust_il.CancelFlag(), Monitor(), False)
+    expected_hash = baseline.parser_artifact_hash()
+    expected_tracking = (baseline_dir / "translate_tracking.json").read_bytes()
+    document = make_direct_document()
+    flag = _rust_il.CancelFlag()
+    service = DirectApplicationService()
+    translate = service.translator.llm_translate
+
+    def cancel(prompt, rate_limit_params=None):
+        response = translate(prompt, rate_limit_params)
+        is_boundary = (rate_limit_params or {}).get("cross_boundary_request")
+        if is_boundary and ((stage == "selection") == ("Metadata: " in prompt)):
+            flag.cancel()
+        return response
+
+    service.translator.llm_translate = cancel
+    with pytest.raises(asyncio.CancelledError):
+        run_bridge(document, tmp_path, service, flag, Monitor())
+    assert flag.observation_delay() is not None
+    assert document.parser_artifact_hash() == expected_hash
+    assert (tmp_path / "translate_tracking.json").read_bytes() == expected_tracking
+    assert not list(tmp_path.glob("translate_tracking.json.*.tmp"))
+
+
+def test_baseline_provider_failure_is_terminal(tmp_path):
+    document = make_direct_document()
+    before = document.parser_artifact_hash()
+    tracking = tmp_path / "translate_tracking.json"
+    tracking.write_bytes(b"existing tracking")
+    service = DirectApplicationService()
+    calls = []
+
+    def fail(prompt, rate_limit_params=None):
+        calls.append((prompt, rate_limit_params))
+        raise ConnectionError("offline synthetic baseline failure")
+
+    service.translator.llm_translate = fail
+    with pytest.raises(ConnectionError, match="offline synthetic baseline failure"):
+        run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
+    assert calls and not any((params or {}).get("cross_boundary_request") for _, params in calls)
+    assert document.parser_artifact_hash() == before
+    assert tracking.read_bytes() == b"existing tracking"
 
 
 def test_default_off_matches_explicit_false_in_production(tmp_path):
@@ -686,13 +753,11 @@ def test_default_off_matches_explicit_false_in_production(tmp_path):
         before = document.parser_artifact_hash()
         service = DirectApplicationService()
         run_bridge(document, directory, service, _rust_il.CancelFlag(), Monitor(), setting)
-        assert service.translator.cross_page_requests == 0
-        assert service.translator.fallback_requests == 0
+        assert not service.translator.boundary_requests
         assert service.translator.page_requests > 0
-        assert all("## Cross-page continuation" not in prompt for prompt in service.translator.requests)
-        after = document.parser_artifact_hash()
-        assert after != before
-        results.append((after, service.translator.requests))
+        assert document.parser_artifact_hash() != before
+        assert BASE_LEFT in page_texts(document)[0] and BASE_RIGHT in page_texts(document)[1]
+        results.append((document.parser_artifact_hash(), service.translator.requests))
     assert results[0] == results[1]
 
 

@@ -79,8 +79,9 @@ impl PySharedContextCrossSplitPart {
         auto_extract_enabled: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
+        let _ = auto_extract_enabled;
         self.root
-            .get_glossaries_for_translation(auto_extract_enabled)
+            .user_glossaries()
             .iter()
             .map(|g| glossary_to_python(py, g))
             .collect()

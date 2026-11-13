@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::translation::glossary::{Glossary, finalize_terms, normalize_source};
+use crate::translation::glossary::{
+    Glossary, ScopedTerm, TermContext, finalize_scoped_terms, normalize_source,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TitleContextSnapshot {
@@ -19,6 +21,7 @@ struct State {
     user_glossaries: Vec<Glossary>,
     auto_extracted_glossary: Option<Glossary>,
     raw_extracted_terms: Vec<(String, String)>,
+    scoped_terms: Vec<ScopedTerm>,
     auto_enabled_ocr_workaround: bool,
     valid_char_count_total: i64,
     total_valid_text_token_count: i64,
@@ -45,6 +48,7 @@ impl SharedContextRoot {
         state.user_glossaries = user_glossaries;
         state.auto_extracted_glossary = None;
         state.raw_extracted_terms.clear();
+        state.scoped_terms.clear();
         state.unique_name = unique_auto_name(&state.user_glossaries);
         state.norm_terms = state
             .user_glossaries
@@ -78,6 +82,24 @@ impl SharedContextRoot {
             .push((source, target));
     }
 
+    pub fn add_scoped_extracted_term(
+        &self,
+        source: String,
+        target: String,
+        contexts: Vec<TermContext>,
+    ) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.raw_extracted_terms.push((source.clone(), target.clone()));
+        state.scoped_terms.push(ScopedTerm {
+            source,
+            target,
+            contexts,
+        });
+    }
+
     pub fn raw_extracted_terms(&self) -> Vec<(String, String)> {
         self.0
             .lock()
@@ -107,9 +129,12 @@ impl SharedContextRoot {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.auto_extracted_glossary =
-            finalize_terms(state.unique_name.clone(), &state.raw_extracted_terms)
-                .map_err(|error| error.to_string())?;
+        state.auto_extracted_glossary = finalize_scoped_terms(
+            state.unique_name.clone(),
+            &state.raw_extracted_terms,
+            &state.scoped_terms,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -146,11 +171,8 @@ impl SharedContextRoot {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if auto_extract_enabled && let Some(glossary) = &state.auto_extracted_glossary {
-            return vec![glossary.clone()];
-        }
         let mut result = state.user_glossaries.clone();
-        if let Some(glossary) = &state.auto_extracted_glossary {
+        if auto_extract_enabled && let Some(glossary) = &state.auto_extracted_glossary {
             result.push(glossary.clone());
         }
         result

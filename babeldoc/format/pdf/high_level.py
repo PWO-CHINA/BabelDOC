@@ -1,10 +1,12 @@
 import asyncio
+import concurrent.futures
 import copy
 import hashlib
 import json
 import logging
 import re
 import shutil
+import tempfile
 import threading
 import time
 from asyncio import CancelledError
@@ -284,6 +286,8 @@ def translator_supports_llm(translator) -> bool:
         return True
     except NotImplementedError:
         return False
+    except concurrent.futures.CancelledError:
+        raise
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.debug("translator %s failed llm detection: %s", translator, exc)
         return False
@@ -376,7 +380,7 @@ async def async_translate(translation_config: TranslationConfig):
     }
     - error: {
         "type": "error",
-        "error": str
+        "error": BaseException
     }
 
     Args:
@@ -385,41 +389,88 @@ async def async_translate(translation_config: TranslationConfig):
     Yields:
         dict: Progress events during translation
 
+    Close the generator explicitly, for example with contextlib.aclosing, when
+    stopping before the terminal event. Closing requests cancellation and waits
+    for the worker and its cleanup; it cannot force a blocked worker to exit.
+
     Raises:
-        CancelledError: If the translation is cancelled
-        Exception: Any other errors during translation
+        CancelledError: If the consuming task is cancelled
+        Exception: If the worker fails before a terminal event is delivered and
+            the generator is explicitly closed
     """
     _require_stage_capture_feature(translation_config)
     loop = asyncio.get_running_loop()
     callback = asynchronize.AsyncCallback()
 
-    finish_event = asyncio.Event()
     cancel_event = threading.Event()
     with ProgressMonitor(
         get_translation_stage(translation_config),
         progress_change_callback=callback.step_callback,
-        finish_callback=callback.finished_callback,
-        finish_event=finish_event,
         cancel_event=cancel_event,
         loop=loop,
         report_interval=translation_config.report_interval,
     ) as pm:
         future = loop.run_in_executor(None, do_translate, pm, translation_config)
+
+        def completion_error(error):
+            cleanup_error = getattr(error, "_babeldoc_cleanup_failure", None)
+            if isinstance(error, CancelledError) and cleanup_error is not None:
+                error.__cause__ = None
+                cleanup_error.__context__ = None
+                cleanup_error.__cause__ = error
+                return cleanup_error
+            return error
+
+        def notify_completion(completed):
+            try:
+                result = completed.result()
+            except BaseException as error:
+                if (
+                    not isinstance(error, CancelledError)
+                    or getattr(error, "_babeldoc_cleanup_failure", None) is not None
+                ):
+                    logger.error(
+                        "Translation worker failed after cleanup",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                callback.finished_callback(type="error", error=completion_error(error))
+            else:
+                callback.finished_callback(type="finish", translate_result=result)
+
+        future.add_done_callback(notify_completion)
+        terminal_received = False
         try:
             async for event in callback:
                 event = event.kwargs
+                terminal_received = event["type"] in ("finish", "error")
                 yield event
-                if event["type"] == "error":
-                    break
-        except CancelledError:
-            cancel_event.set()
-        except KeyboardInterrupt:
-            logger.info("Translation cancelled by user through keyboard interrupt")
-            cancel_event.set()
-    if cancel_event.is_set():
-        future.cancel()
-    logger.info("Waiting for translation to finish...")
-    await finish_event.wait()
+        finally:
+            if not terminal_received:
+                cancel_event.set()
+                interrupted = None
+                while True:
+                    try:
+                        await asyncio.shield(future)
+                        break
+                    except CancelledError as error:
+                        if future.cancelled():
+                            raise
+                        if not future.done():
+                            interrupted = error
+                            continue
+                        try:
+                            future.result()
+                        except CancelledError as worker_error:
+                            cleanup_error = completion_error(worker_error)
+                            if cleanup_error is not worker_error:
+                                raise cleanup_error from worker_error
+                            if error is not worker_error:
+                                interrupted = error
+                        else:
+                            interrupted = error
+                        break
+                if interrupted is not None:
+                    raise interrupted
 
 
 class MemoryMonitor:
@@ -570,16 +621,410 @@ def update_page_bbox(doc, page, box, key):
         doc.xref_set_key(page.xref, key, f"[{box.x0} {box.y0} {box.x1} {box.y1}]")
 
 
+def _read_cross_boundary_report(source: Path, expected_stage: str) -> dict:
+    try:
+        report = json.loads(source.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Cross-boundary report is missing or invalid") from error
+
+    if (
+        not isinstance(report, dict)
+        or type(report.get("version")) is not int
+        or report["version"] != 2
+        or report.get("status") not in ("complete", "needs_review", "failed")
+        or report.get("stage") != expected_stage
+        or not isinstance(report.get("decisions"), list)
+        or not isinstance(report.get("unresolved"), list)
+    ):
+        raise RuntimeError("Cross-boundary report has an invalid version or structure")
+    decisions = report["decisions"]
+    unresolved = report["unresolved"]
+    if any(
+        not isinstance(decision, dict)
+        or not isinstance(decision.get("kind"), str)
+        or "result" not in decision
+        for decision in decisions
+    ) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("kind"), str)
+        or not isinstance(item.get("reason"), str)
+        or not isinstance(item.get("locations"), list)
+        or any(
+            not isinstance(location, dict)
+            or type(location.get("page")) is not int
+            or location["page"] < 0
+            or type(location.get("paragraph")) is not int
+            or location["paragraph"] < 0
+            for location in item.get("locations", [])
+        )
+        for item in unresolved
+    ):
+        raise RuntimeError("Cross-boundary report has invalid decisions or locations")
+    if report["status"] == "complete" and unresolved:
+        raise RuntimeError("Cross-boundary report marks unresolved boundaries complete")
+    return report
+
+
+def _persist_cross_boundary_report(
+    translation_config: TranslationConfig,
+    result: TranslateResult | None = None,
+    *,
+    error: BaseException | None = None,
+    output_completed: bool = False,
+    read_persisted_output: bool = False,
+) -> bool:
+    filename = (
+        f"{Path(translation_config.input_file).stem}.{translation_config.lang_out}"
+        ".cross_boundary_report.json"
+    )
+    destination = translation_config.get_output_file_path(filename)
+    source = (
+        destination
+        if read_persisted_output
+        else translation_config.get_working_file_path("cross_boundary_report.json")
+    )
+    source_valid = True
+    try:
+        if not read_persisted_output and not getattr(
+            translation_config, "_boundary_report_source_usable", True
+        ):
+            raise RuntimeError("Cross-boundary report source could not be reset")
+        report = _read_cross_boundary_report(
+            source, "output" if read_persisted_output else "translation"
+        )
+    except RuntimeError:
+        if error is None:
+            raise
+        try:
+            if output_completed and not read_persisted_output:
+                report = _read_cross_boundary_report(destination, "output")
+            else:
+                raise RuntimeError("no output report")
+        except RuntimeError:
+            source_valid = False
+            report = {
+                "version": 2,
+                "decisions": [],
+                "unresolved": [],
+                "details_available": False,
+            }
+
+    if error is None and report["status"] == "failed":
+        raise RuntimeError("Cross-boundary translation report indicates failure")
+
+    if error is not None and report.get("candidate_state") == "written":
+        _finish_part_boundary_report(report, False, "candidate was not published")
+
+    report["stage"] = "output" if output_completed else "translation"
+    if error is not None:
+        report["status"] = "failed"
+        try:
+            detail = " ".join(str(error).split())[:512]
+        except Exception:
+            detail = ""
+        reason = type(error).__name__
+        if detail:
+            reason = f"{reason}: {detail}"
+        report.setdefault("reason", reason)
+        report["error_type"] = type(error).__name__
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=f".{destination.name}.", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(json.dumps(report, ensure_ascii=False).encode("utf-8"))
+        temporary_path.replace(destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    if result is not None:
+        result.cross_boundary_report_path = destination
+        result.cross_boundary_report_status = report["status"]
+        result.cross_boundary_report_stage = report["stage"]
+        result.cross_boundary_unresolved_count = len(report["unresolved"])
+        result.cross_boundary_unresolved = report["unresolved"]
+    if report["status"] == "needs_review":
+        logger.warning(
+            "Cross-boundary report requires review: %d unresolved; see %s",
+            len(report["unresolved"]),
+            destination,
+        )
+    return source_valid
+
+
+def _load_part_boundary_report(config):
+    try:
+        if not getattr(config, "_boundary_report_source_usable", True):
+            raise RuntimeError("Cross-boundary report source could not be reset")
+        report = _read_cross_boundary_report(
+            config.get_working_file_path("cross_boundary_report.json"), "translation"
+        )
+        if report["status"] == "failed":
+            raise RuntimeError("enhancement reported failure")
+        return report
+    except RuntimeError as error:
+        logger.warning("Cross-boundary details unavailable: %s", error)
+        return {
+            "version": 2, "status": "needs_review", "stage": "translation",
+            "baseline_completed": True, "candidate_state": "unknown",
+            "details_available": False, "applied_groups": 0, "decisions": [],
+            "unresolved": [{"kind": "enhancement", "reason": "enhancement report unavailable", "locations": []}],
+        }
+
+
+def _finish_part_boundary_report(report, applied, reason):
+    groups = report.get("prepared_groups", [])
+    for decision in report["decisions"]:
+        if decision.get("result") == "prepared":
+            decision["result"] = "applied" if applied else "fallback"
+            if not applied:
+                decision["reason"] = reason
+    if not applied:
+        for group in groups:
+            report["unresolved"].append({
+                "kind": "enhancement", "group": group["group"],
+                "locations": group["locations"], "reason": reason,
+            })
+    report["applied_groups"] = len(groups) if applied else 0
+    report["candidate_state"] = "applied" if applied else "fallback"
+    report["status"] = "needs_review" if report["unresolved"] else "complete"
+    report.pop("candidate_outputs", None)
+
+
+def _candidate_result(result, report):
+    if report.get("candidate_state") != "written":
+        return None
+    candidate = copy.copy(result)
+    outputs = report["candidate_outputs"]
+    baseline_paths = {
+        Path(path).resolve()
+        for name in ("mono_pdf_path", "dual_pdf_path", "no_watermark_mono_pdf_path", "no_watermark_dual_pdf_path")
+        if (path := getattr(result, name, None))
+    }
+    used_candidates = set()
+    for primary, no_watermark, key in (
+        ("mono_pdf_path", "no_watermark_mono_pdf_path", "mono"),
+        ("dual_pdf_path", "no_watermark_dual_pdf_path", "dual"),
+    ):
+        path = outputs.get(key)
+        old_primary = getattr(result, primary)
+        old_no_watermark = getattr(result, no_watermark)
+        if not old_primary and not old_no_watermark:
+            continue
+        if not path:
+            raise ValueError(f"candidate is missing {key} output")
+        path = Path(path)
+        resolved = path.resolve()
+        if resolved in baseline_paths or resolved in used_candidates:
+            raise ValueError(f"candidate {key} output aliases another output")
+        used_candidates.add(resolved)
+        if old_primary and old_no_watermark and old_primary != old_no_watermark:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=f".{path.stem}.variant-", suffix=".pdf", delete=False
+            ) as temporary:
+                variant = Path(temporary.name)
+            shutil.copyfile(path, variant)
+            setattr(candidate, no_watermark, variant)
+            setattr(candidate, primary, path)
+        else:
+            if old_no_watermark:
+                setattr(candidate, no_watermark, path)
+            if old_primary:
+                setattr(candidate, primary, path)
+    return candidate
+
+
+def _postprocess_outputs(result, config):
+    fix_cmap(result, config)
+    add_metadata(result, config)
+    try:
+        migrate_toc(config, result)
+    except concurrent.futures.CancelledError:
+        raise
+    except Exception as error:
+        logger.error("Failed to migrate TOC from %s: %s", config.input_file, error)
+    if config.deterministic_output:
+        finalize_deterministic_pdf_outputs(result)
+
+
+def _verify_outputs(result, reference=None, config=None):
+    if config is not None:
+        if not getattr(config, "no_mono", False) and not result.mono_pdf_path:
+            raise OSError("missing baseline monolingual PDF")
+        if not getattr(config, "no_dual", False) and not result.dual_pdf_path:
+            raise OSError("missing baseline dual-language PDF")
+    for name in ("mono_pdf_path", "dual_pdf_path", "no_watermark_mono_pdf_path", "no_watermark_dual_pdf_path"):
+        path = getattr(result, name, None)
+        reference_path = getattr(reference, name, None) if reference is not None else None
+        if reference_path and not path:
+            raise ValueError(f"missing {name}")
+        if path:
+            with Path(path).open("rb"):
+                pass
+            with pymupdf.open(path) as pdf:
+                count = len(pdf)
+            if count == 0:
+                raise ValueError(f"empty {name}")
+            if reference_path:
+                with Path(reference_path).open("rb"):
+                    pass
+                with pymupdf.open(reference_path) as baseline:
+                    if count != len(baseline):
+                        raise ValueError(f"page count changed for {name}")
+
+
+def _merge_candidate_parts(config, results, reports):
+    candidate_results = {}
+    changed = False
+    for part_index, _offset, report in reports:
+        baseline = results[part_index]
+        candidate = _candidate_result(baseline, report)
+        candidate_results[part_index] = candidate or baseline
+        changed = changed or candidate is not None
+    if not changed:
+        return None
+    merge_dir = Path(config.working_dir) / "boundary-candidate-merge"
+    merge_dir.mkdir(exist_ok=True)
+    merge_config = copy.copy(config)
+    merge_config.output_dir = merge_dir
+    merge_config.save_auto_extracted_glossary = False
+    merged = ResultMerger(merge_config).merge_results(candidate_results)
+    if not config.no_mono and not merged.mono_pdf_path:
+        raise OSError("failed to merge candidate monolingual PDF")
+    if not config.no_dual and not merged.dual_pdf_path:
+        raise OSError("failed to merge candidate dual-language PDF")
+    return merged
+
+
+def _publish_candidate_outputs(pm, baseline, candidate):
+    prepared = []
+    destinations = {}
+    published = []
+    rollback_failed = False
+    try:
+        for name in ("mono_pdf_path", "dual_pdf_path", "no_watermark_mono_pdf_path", "no_watermark_dual_pdf_path"):
+            target = getattr(baseline, name, None)
+            source = getattr(candidate, name, None)
+            if not target and not source:
+                continue
+            if not target or not source:
+                raise ValueError(f"missing candidate or baseline {name}")
+            target, source = Path(target), Path(source)
+            target_key, source_key = target.resolve(), source.resolve()
+            if target_key == source_key:
+                raise ValueError(f"candidate aliases baseline {name}")
+            if target_key in destinations:
+                if destinations[target_key] != source_key:
+                    raise ValueError(f"conflicting candidate for {name}")
+                continue
+            destinations[target_key] = source_key
+            with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.baseline-", delete=False) as file:
+                backup = Path(file.name)
+            prepared.append((target, backup, None))
+            shutil.copyfile(target, backup)
+            with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.candidate-", delete=False) as file:
+                staged = Path(file.name)
+            prepared[-1] = (target, backup, staged)
+            shutil.copyfile(source, staged)
+        pm.raise_if_cancelled()
+        for target, backup, staged in prepared:
+            pm.raise_if_cancelled()
+            staged.replace(target)
+            published.append((target, backup))
+        pm.raise_if_cancelled()
+    except BaseException:
+        for target, backup in reversed(published):
+            try:
+                backup.replace(target)
+            except OSError:
+                rollback_failed = True
+                logger.exception("Could not restore baseline output; backup retained at %s", backup)
+        raise
+    finally:
+        for _target, backup, staged in prepared:
+            if not rollback_failed:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove candidate backup %s", backup, exc_info=True)
+            if staged is not None:
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove staged candidate %s", staged, exc_info=True)
+
+
+def _reset_boundary_report(config):
+    path = config.get_working_file_path("cross_boundary_report.json")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        config._boundary_report_source_usable = False
+        logger.warning("Could not reset cross-boundary report: %s", error)
+    else:
+        config._boundary_report_source_usable = True
+    config._boundary_report = None
+    return path
+
+
 def do_translate(
+    pm: ProgressMonitor, translation_config: TranslationConfig
+) -> TranslateResult:
+    try:
+        result = _do_translate_with_cleanup(pm, translation_config)
+        try:
+            pm.translate_done(result)
+        except Exception as error:
+            if (
+                getattr(translation_config, "experimental_cross_page_context", False)
+                and not translation_config.only_parse_generate_pdf
+                and not translation_config.skip_translation
+            ):
+                try:
+                    _persist_cross_boundary_report(
+                        translation_config,
+                        error=error,
+                        output_completed=True,
+                        read_persisted_output=True,
+                    )
+                except Exception as report_error:
+                    logger.warning(
+                        "Could not persist notification failure in cross-boundary report: %s",
+                        type(report_error).__name__,
+                    )
+            raise
+        return result
+    except Exception as error:
+        pm.disable = False
+        pm.translate_error(error)
+        raise
+
+
+def _do_translate_with_cleanup(
     pm: ProgressMonitor, translation_config: TranslationConfig
 ) -> TranslateResult:
     _require_stage_capture_feature(translation_config)
     run_context = None
     rust_module = None
     rust_logging_started = False
+    cross_boundary_report_path = None
+    cross_boundary_output_completed = False
+    cross_boundary_output_persisted = False
+    cross_boundary_failure = None
+    part_boundary_reports = None
+    preserve_boundary_evidence = False
     try:
         translation_config.progress_monitor = pm
         original_pdf_path = translation_config.input_file
+        if (
+            getattr(translation_config, "experimental_cross_page_context", False)
+            and not translation_config.only_parse_generate_pdf
+            and not translation_config.skip_translation
+        ):
+            cross_boundary_report_path = _reset_boundary_report(translation_config)
         logger.info(f"start to translate: {original_pdf_path}")
         try:
             check_metadata(Document(original_pdf_path))
@@ -622,6 +1067,8 @@ def do_translate(
                         )
                     else:
                         pm.total_parts = len(split_points)
+                        if cross_boundary_report_path is not None:
+                            part_boundary_reports = []
 
                         # Process parts serially
                         results: dict[int, TranslateResult | None] = {}
@@ -663,6 +1110,8 @@ def do_translate(
                                 part_config.working_dir = (
                                     translation_config.get_part_working_dir(i)
                                 )
+                                if part_boundary_reports is not None:
+                                    _reset_boundary_report(part_config)
                                 part_config.output_dir = (
                                     translation_config.get_part_output_dir(i)
                                 )
@@ -721,10 +1170,12 @@ def do_translate(
                                     run_context,
                                 )
                                 results[i] = result
+                                if part_boundary_reports is not None:
+                                    part_report = part_config._boundary_report or _load_part_boundary_report(part_config)
+                                    part_boundary_reports.append((i, split_point.start_page, part_report))
 
                             except Exception as e:
                                 logger.error(f"Error in part {i}: {e}")
-                                pm.translate_error(e)
                                 raise
                             finally:
                                 # Clean up part working directory
@@ -739,6 +1190,9 @@ def do_translate(
                         merger = ResultMerger(translation_config)
                         logger.info("start merge results")
                         result = merger.merge_results(results)
+                        for output_name, disabled in (("mono_pdf_path", translation_config.no_mono), ("dual_pdf_path", translation_config.no_dual)):
+                            if not disabled and not getattr(result, output_name):
+                                raise OSError(f"failed to merge {output_name}")
                         logger.info("finish merge results")
             peak_memory_usage = memory_monitor.peak_memory_usage
 
@@ -768,42 +1222,142 @@ def do_translate(
         result.original_pdf_path = translation_config.input_file
         result.peak_memory_usage = peak_memory_usage
 
-        fix_cmap(result, translation_config)
-        add_metadata(result, translation_config)
-        try:
-            migrate_toc(translation_config, result)
-        except Exception as e:
-            logger.error(
-                f"Failed to migrate TOC from {translation_config.input_file}: {e}"
-            )
-        if translation_config.deterministic_output:
-            finalize_deterministic_pdf_outputs(result)
-        pm.translate_done(result)
+        boundary_report = None
+        if cross_boundary_report_path is not None:
+            if part_boundary_reports is None:
+                boundary_report = getattr(translation_config, "_boundary_report", None) or _load_part_boundary_report(translation_config)
+        _postprocess_outputs(result, translation_config)
+        if cross_boundary_report_path is not None:
+            _verify_outputs(result, config=translation_config)
+            reports = ([part for _index, _offset, part in part_boundary_reports]
+                       if part_boundary_reports is not None else [boundary_report])
+            if any(report.get("candidate_state") == "written" for report in reports):
+                try:
+                    candidate = (_merge_candidate_parts(translation_config, results, part_boundary_reports)
+                                 if part_boundary_reports is not None else _candidate_result(result, boundary_report))
+                    _postprocess_outputs(candidate, translation_config)
+                    _verify_outputs(candidate, result)
+                except (OSError, concurrent.futures.CancelledError):
+                    raise
+                except Exception as error:
+                    for report in reports:
+                        if report.get("candidate_state") == "written":
+                            _finish_part_boundary_report(report, False, f"candidate postprocessing failed: {error}")
+                else:
+                    _publish_candidate_outputs(pm, result, candidate)
+                    for report in reports:
+                        if report.get("candidate_state") == "written":
+                            _finish_part_boundary_report(report, True, "")
+            if part_boundary_reports is not None:
+                boundary_report = {"version": 2, "status": "complete", "stage": "translation",
+                    "baseline_completed": True, "candidate_state": "split",
+                    "applied_groups": sum(report.get("applied_groups", 0) for report in reports),
+                    "decisions": [], "unresolved": []}
+                for part_index, page_offset, part_report in part_boundary_reports:
+                    for key in ("decisions", "unresolved"):
+                        for entry in part_report[key]:
+                            entry = copy.deepcopy(entry)
+                            entry["part"] = part_index
+                            for location in entry.get("locations", []):
+                                location["page"] += page_offset
+                            boundary_report[key].append(entry)
+                if boundary_report["unresolved"]:
+                    boundary_report["status"] = "needs_review"
+            try:
+                cross_boundary_report_path.write_text(json.dumps(boundary_report, ensure_ascii=False), encoding="utf-8")
+            except OSError as error:
+                logger.warning("Could not write cross-boundary report: %s", error)
+        if cross_boundary_report_path is not None:
+            pm.raise_if_cancelled()
+            cross_boundary_output_completed = True
+            try:
+                _persist_cross_boundary_report(
+                    translation_config, result, output_completed=True
+                )
+                cross_boundary_output_persisted = True
+            except (OSError, RuntimeError) as error:
+                logger.warning("Could not persist cross-boundary report: %s", error)
+                preserve_boundary_evidence = True
+            pm.raise_if_cancelled()
         return result
 
-    except Exception as e:
-        if translation_config.debug:
-            logger.exception("translate error:")
-        else:
-            logger.error(f"translate error: {e}")
-        pm.disable = False
-        pm.translate_error(e)
+    except BaseException as error:
+        cross_boundary_failure = error
+        if isinstance(error, Exception):
+            if translation_config.debug:
+                logger.exception("translate error:")
+            else:
+                logger.error(f"translate error: {error}")
         raise
     finally:
         logger.debug("do_translate finally")
-        try:
-            if run_context is not None:
-                run_context.close()
-        finally:
+        preserve_working_dir = preserve_boundary_evidence
+        if (
+            cross_boundary_report_path is not None
+            and cross_boundary_failure is not None
+        ):
             try:
-                if rust_logging_started:
-                    try:
-                        rust_module.flush_logging_run()
-                    finally:
-                        rust_module.stop_logging_run()
+                source_valid = _persist_cross_boundary_report(
+                    translation_config,
+                    error=cross_boundary_failure,
+                    output_completed=cross_boundary_output_completed,
+                )
+                preserve_working_dir = (
+                    not source_valid and cross_boundary_report_path.is_file()
+                )
+            except Exception as error:
+                preserve_working_dir = True
+                logger.warning(
+                    "Could not persist cross-boundary report: %s; "
+                    "retaining working directory %s",
+                    type(error).__name__,
+                    cross_boundary_report_path.parent,
+                )
+            if preserve_working_dir and cross_boundary_report_path.is_file():
+                logger.warning(
+                    "Retaining working directory for cross-boundary evidence: %s",
+                    cross_boundary_report_path.parent,
+                )
+        try:
+            try:
+                if run_context is not None:
+                    run_context.close()
             finally:
-                pm.on_finish()
-                translation_config.cleanup_temp_files()
+                try:
+                    if rust_logging_started:
+                        try:
+                            rust_module.flush_logging_run()
+                        finally:
+                            rust_module.stop_logging_run()
+                finally:
+                    try:
+                        if not preserve_working_dir:
+                            translation_config.cleanup_temp_files()
+                    finally:
+                        pm.on_finish()
+        except Exception as error:
+            if (
+                cross_boundary_report_path is not None
+                and cross_boundary_failure is None
+            ):
+                try:
+                    _persist_cross_boundary_report(
+                        translation_config,
+                        error=error,
+                        output_completed=cross_boundary_output_completed,
+                        read_persisted_output=cross_boundary_output_persisted,
+                    )
+                except Exception as report_error:
+                    logger.warning(
+                        "Could not persist cleanup failure in cross-boundary report: %s",
+                        type(report_error).__name__,
+                    )
+            if isinstance(cross_boundary_failure, CancelledError):
+                cross_boundary_failure._babeldoc_cleanup_failure = error
+                raise cross_boundary_failure from error
+            if error.__context__ is not None:
+                raise error from error.__context__
+            raise
 
 
 def migrate_toc(
@@ -1107,6 +1661,9 @@ def _do_translate_single(
                 only_include_translated_page=translation_config.only_include_translated_page,
                 capture_path=None if capture_path is None else str(capture_path),
                 debug_path=None if debug_path is None else str(debug_path),
+                capture_source_sha256=getattr(
+                    translation_config, "experimental_cross_page_context", False
+                ),
             )
             pm.raise_if_cancelled()
             logger.debug(f"finish parse il from {temp_pdf_path}")
@@ -1202,6 +1759,8 @@ def _do_translate_single(
                     translation_config.capture_stages,
                     json.dumps(capture_paths),
                 )
+                if getattr(translation_config, "experimental_cross_page_context", False):
+                    translation_config._boundary_report = _load_part_boundary_report(translation_config)
             finally:
                 # The Rust stages normally request these cleanups themselves. Keep
                 # service teardown idempotent for failures before those callbacks.

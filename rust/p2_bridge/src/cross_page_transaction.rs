@@ -68,8 +68,29 @@ impl<'a> StageTransaction<'a> {
     }
 
     pub(crate) fn commit_with_tracking(self, tracking: Option<PreparedTracking>) -> std::io::Result<()> {
-        if let Some(tracking) = tracking {
-            tracking.publish()?;
+        self.commit_with_files(tracking.into_iter().collect())
+    }
+
+    pub(crate) fn commit_with_files(self, files: Vec<PreparedTracking>) -> std::io::Result<()> {
+        let mut previous = Vec::new();
+        for file in &files {
+            let contents = match std::fs::read(&file.destination) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            previous.push((file.destination.clone(), contents));
+        }
+        for (index, file) in files.into_iter().enumerate() {
+            if let Err(error) = file.publish() {
+                for (path, contents) in previous[..index].iter().rev() {
+                    match contents {
+                        Some(contents) => std::fs::write(path, contents)?,
+                        None => std::fs::remove_file(path)?,
+                    }
+                }
+                return Err(error);
+            }
         }
         self.commit();
         Ok(())
