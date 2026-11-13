@@ -523,11 +523,12 @@ pub(crate) fn process(
                 }
                 prepared.insert(key, source);
             }
+            let selectable = crate::cross_boundary_candidates::selectable(&group, candidate);
             match prepared.get(&key).and_then(Option::as_ref) {
-                Some(source) if !auxiliary(candidate.label.as_deref()) => {
+                Some(source) if !auxiliary(candidate.label.as_deref()) && selectable => {
                     sources.push(source.clone());
                 }
-                _ => unavailable.push(json!({"page":key.0,"paragraph":key.1,"reason":if auxiliary(candidate.label.as_deref()) { "auxiliary page object" } else { preparation_errors.get(&key).map(String::as_str).unwrap_or("source unavailable") }})),
+                _ => unavailable.push(json!({"page":key.0,"paragraph":key.1,"reason":if auxiliary(candidate.label.as_deref()) { "auxiliary page object" } else if !selectable { "non-body or independent numbered paragraph" } else { preparation_errors.get(&key).map(String::as_str).unwrap_or("source unavailable") }})),
             }
         }
         let available = sources

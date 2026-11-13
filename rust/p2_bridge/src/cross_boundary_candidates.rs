@@ -159,9 +159,40 @@ pub(crate) fn focus(mut boundary: Boundary) -> Option<Boundary> {
     let locations = boundary.left.iter().chain(&boundary.right)
         .map(|candidate| (candidate.page, candidate.paragraph)).collect::<HashSet<_>>();
     for page in &mut boundary.context {
-        page.paragraphs.retain(|candidate| locations.contains(&(candidate.page, candidate.paragraph)));
+        page.paragraphs.retain(|candidate| locations.contains(&(candidate.page, candidate.paragraph))
+            || matches!(candidate.label.as_deref(), Some("caption" | "figure_caption" | "table_caption")));
     }
     Some(boundary)
+}
+
+fn related_caption(page: &PageContext, candidate: &Candidate) -> bool {
+    page.paragraphs.iter().any(|item| {
+        matches!(item.label.as_deref(), Some("caption" | "figure_caption" | "table_caption"))
+            && candidate.font_size.zip(item.font_size).is_some_and(|(first, second)| (first - second).abs() < 0.6)
+            && ((candidate.bounds.top - item.bounds.top).abs() < 0.02
+                && (candidate.bounds.bottom - item.bounds.bottom).abs() < 0.02
+                || candidate.label.as_deref() == Some("fallback_line")
+                    && candidate.bounds.bottom >= item.bounds.top
+                    && candidate.bounds.top - candidate.bounds.bottom < 0.025)
+    })
+}
+
+pub(crate) fn selectable(boundary: &Boundary, candidate: &Candidate) -> bool {
+    if candidate.heading_barrier || can_skip(boundary, candidate) { return false; }
+    let Some(page) = boundary.context.iter().find(|page| page.page == candidate.page) else { return false; };
+    let body_size = page.paragraphs.iter().filter(|item| body_label(item.label.as_deref()))
+        .filter_map(|item| item.font_size).fold(0.0_f64, f64::max);
+    if candidate.font_size.is_some_and(|size| size < body_size * 0.9) || related_caption(page, candidate) {
+        return false;
+    }
+    if boundary.right.iter().any(|item| item.page == candidate.page && item.paragraph == candidate.paragraph) {
+        let text = candidate.text.trim_start();
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && text[digits..].strip_prefix('.').is_some_and(|rest| rest.starts_with(char::is_whitespace)) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn can_skip(boundary: &Boundary, candidate: &Candidate) -> bool {
@@ -185,16 +216,7 @@ pub(crate) fn can_skip(boundary: &Boundary, candidate: &Candidate) -> bool {
     let body_size = page.paragraphs.iter().filter(|item| body_label(item.label.as_deref()))
         .filter_map(|item| item.font_size).fold(0.0_f64, f64::max);
     let small = candidate.font_size.is_some_and(|size| size < body_size * 0.9);
-    let related_caption = page.paragraphs.iter().any(|item| {
-        matches!(item.label.as_deref(), Some("caption" | "figure_caption" | "table_caption"))
-            && candidate.font_size.zip(item.font_size).is_some_and(|(first, second)| (first - second).abs() < 0.6)
-            && ((candidate.bounds.top - item.bounds.top).abs() < 0.02
-                && (candidate.bounds.bottom - item.bounds.bottom).abs() < 0.02
-                || candidate.label.as_deref() == Some("fallback_line")
-                    && candidate.bounds.bottom >= item.bounds.top
-                    && candidate.bounds.top - candidate.bounds.bottom < 0.025)
-    });
-    small && (related_caption || page.figures.iter().any(|figure| {
+    small && (!body_label(candidate.label.as_deref()) && related_caption(page, candidate) || page.figures.iter().any(|figure| {
             overlap(candidate.bounds, *figure) && candidate.bounds.top <= figure.bottom + 0.03
         }))
 }

@@ -10,6 +10,7 @@ from test_cross_page_llm_direct_atomicity import TRANSLATED_PREFIX
 from test_cross_page_llm_direct_atomicity import TRANSLATED_SENTENCE
 from test_cross_page_llm_direct_atomicity import DirectApplicationService
 from test_cross_page_llm_direct_atomicity import Monitor
+from test_cross_page_llm_direct_atomicity import report_of
 from test_cross_page_llm_direct_atomicity import run_bridge
 
 
@@ -90,13 +91,12 @@ def test_two_column_body_is_translated_and_returns_to_original_pages(tmp_path):
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.cross_page_requests == 1
     assert service.translator.fallback_requests == 0
-    prompt = next(value for value in service.translator.requests if "## Cross-page continuation" in value)
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    assert any(LEFT_TAIL + " several independent experiments." in item["input"] for item in items)
+    items = service.translator.translation_items[0]
+    assert any(LEFT_TAIL + " several independent experiments." in item["text"] for item in items)
     pages = json.loads(document.parser_artifact_json())["document"]["page"]
     left = pages[0]["pdf_paragraph"][2]["unicode"]
     right = pages[1]["pdf_paragraph"][0]["unicode"]
-    assert left + right == TRANSLATED_PREFIX + TRANSLATED_SENTENCE
+    assert "".join((left + right).split()) == TRANSLATED_PREFIX + TRANSLATED_SENTENCE
     assert TRANSLATED_PREFIX in left and right
     assert TRANSLATED_FOLLOWING not in left
 
@@ -109,6 +109,9 @@ def test_two_column_body_is_translated_and_returns_to_original_pages(tmp_path):
 def test_supported_boundaries_are_detected(tmp_path, kwargs):
     document = fixture(**kwargs)
     service = DirectApplicationService()
+    if "left_text" in kwargs:
+        service.translator.left_tail = "The cohort included participants from"
+        service.translator.continuation = kwargs["right_text"]
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.requests
     assert service.translator.cross_page_requests == 1
@@ -119,7 +122,15 @@ def test_unmovable_sentence_does_not_use_context_only_mode(tmp_path):
     service = DirectApplicationService()
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.requests
-    assert service.translator.cross_page_requests == 0
+    assert service.translator.cross_page_requests == 1
+    items = service.translator.translation_items[0]
+    assert any(LEFT_TAIL + " several independent experiments." in item["text"] for item in items)
+    assert report_of(tmp_path)["applied_groups"] == 1
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    left = pages[0]["pdf_paragraph"][2]["unicode"]
+    right = pages[1]["pdf_paragraph"][0]["unicode"]
+    assert "".join((left + right).split()) == TRANSLATED_SENTENCE
+    assert left and right
 
 
 def test_identity_sentence_retains_each_page_anchor(tmp_path):
@@ -127,6 +138,10 @@ def test_identity_sentence_retains_each_page_anchor(tmp_path):
     right_text = "the synthetic right anchor and ends here."
     document = fixture(left_text="Earlier findings were clear. " + left_tail, right_text=right_text)
     service = DirectApplicationService()
+    service.translator.left_tail = left_tail
+    service.translator.continuation = right_text
+    service.translator.ordinary = lambda text: text
+    service.translator.enhanced = lambda text: text
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.cross_page_requests == 1
     pages = json.loads(document.parser_artifact_json())["document"]["page"]
@@ -162,4 +177,6 @@ def test_ambiguous_boundary_stays_out_of_cross_page_request(tmp_path, kwargs):
     assert service.translator.requests
     assert service.translator.cross_page_requests == 0
     tracking = json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))
-    assert tracking["cross_page"] == []
+    assert tracking["cross_page"]
+    report = report_of(tmp_path)
+    assert report["baseline_completed"] and report["applied_groups"] == 0

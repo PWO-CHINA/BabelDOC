@@ -92,8 +92,10 @@ class DirectTranslator:
             self.boundary_requests.append((prompt, rate_limit_params))
             if "Metadata: " in prompt:
                 metadata = json.loads(prompt.split("Metadata: ", 1)[1].split(" Formula markers and source characters: ", 1)[0])
-                left = next(item for item in metadata["left"] if self.left_tail in item["text"])
-                right = next(item for item in metadata["right"] if self.continuation in item["text"])
+                left = next((item for item in metadata["left"] if self.left_tail in item["text"]), None)
+                right = next((item for item in metadata["right"] if self.continuation in item["text"]), None)
+                if left is None or right is None:
+                    return json.dumps({"status": "none"})
                 preceding = left["text"][:left["text"].find(self.left_tail)]
                 start = preceding.rfind("[[BABEL_F_") if preceding.rstrip().endswith("]]") else -1
                 left_range = left["text"][start:] if start >= 0 else self.left_tail
