@@ -3,7 +3,6 @@ import logging
 import shutil
 import tempfile
 import threading
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,22 +105,17 @@ class SharedContextCrossSplitPart:
                 self.raw_extracted_terms = []
                 return
 
-            term_translations: dict[str, list[str]] = {}
+            term_translations: dict[str, list[tuple[str, str]]] = {}
             for src, tgt in self.raw_extracted_terms:
-                term_translations.setdefault(src, []).append(tgt)
+                normalized = Glossary.normalize_source(src)
+                if normalized and tgt.strip():
+                    term_translations.setdefault(normalized, []).append((src, tgt))
 
             final_entries: list[GlossaryEntry] = []
-            for src, tgts in term_translations.items():
-                if not tgts:
-                    continue
-                counts = Counter(tgts)
-                highest_count = max(counts.values())
-                most_common_tgt = min(
-                    target for target, count in counts.items() if count == highest_count
-                )
-                entry = GlossaryEntry(src, most_common_tgt)
-                # Preserve each raw extraction occurrence as a source-spelling vote.
-                final_entries.extend([entry] * len(tgts))
+            for entries in term_translations.values():
+                if len({target for _, target in entries}) == 1:
+                    src, tgt = entries[0]
+                    final_entries.append(GlossaryEntry(src, tgt))
 
             if final_entries:
                 self.auto_extracted_glossary = Glossary.from_auto_extracted_entries(
@@ -139,13 +133,7 @@ class SharedContextCrossSplitPart:
         self, auto_extract_enabled: bool
     ) -> list[Glossary]:
         with self._lock:
-            if auto_extract_enabled and self.auto_extracted_glossary:
-                return [self.auto_extracted_glossary]
-            else:
-                all_glossaries = list(self.user_glossaries)
-                if self.auto_extracted_glossary:
-                    all_glossaries.append(self.auto_extracted_glossary)
-                return all_glossaries
+            return list(self.user_glossaries)
 
     def add_valid_counts(self, char_count: int, token_count: int):
         """Accumulate valid character and token counts in a threadsafe way."""
@@ -206,7 +194,7 @@ class TranslationConfig:
         add_formula_placehold_hint: bool = False,
         glossaries: list[Glossary] | None = None,
         pool_max_workers: int | None = None,
-        auto_extract_glossary: bool = True,
+        auto_extract_glossary: bool = False,
         auto_enable_ocr_workaround: bool = False,
         primary_font_family: str | None = None,
         only_include_translated_page: bool | None = False,
@@ -230,6 +218,7 @@ class TranslationConfig:
         deterministic_output: bool = False,
         disable_parser_resource_limits: bool = False,
         experimental_cross_page_context: bool = False,
+        cross_boundary_max_input_tokens: int = 24576,
     ):
         if type(disable_parser_resource_limits) is not bool:
             raise TypeError("disable_parser_resource_limits must be a bool")
@@ -237,6 +226,14 @@ class TranslationConfig:
             raise TypeError("experimental_cross_page_context must be a bool")
         self.disable_parser_resource_limits = disable_parser_resource_limits
         self.experimental_cross_page_context = experimental_cross_page_context
+        if (
+            type(cross_boundary_max_input_tokens) is not int
+            or cross_boundary_max_input_tokens < 1024
+        ):
+            raise ValueError(
+                "cross_boundary_max_input_tokens must be an integer >= 1024"
+            )
+        self.cross_boundary_max_input_tokens = cross_boundary_max_input_tokens
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
         initial_user_glossaries = list(glossaries) if glossaries else []
@@ -568,6 +565,11 @@ class TranslateResult:
     auto_extracted_glossary_path: Path | None
     total_valid_character_count: int | None
     total_valid_text_token_count: int | None
+    cross_boundary_report_path: Path | None
+    cross_boundary_report_status: str | None
+    cross_boundary_report_stage: str | None
+    cross_boundary_unresolved_count: int | None
+    cross_boundary_unresolved: list[dict] | None
 
     def __init__(
         self,
@@ -586,6 +588,11 @@ class TranslateResult:
         self.auto_extracted_glossary_path = auto_extracted_glossary_path
         self.total_valid_character_count = None
         self.total_valid_text_token_count = None
+        self.cross_boundary_report_path = None
+        self.cross_boundary_report_status = None
+        self.cross_boundary_report_stage = None
+        self.cross_boundary_unresolved_count = None
+        self.cross_boundary_unresolved = None
 
     def __str__(self):
         """Return a human-readable string representation of the translation result."""
@@ -601,6 +608,13 @@ class TranslateResult:
 
         if self.dual_pdf_path:
             result.append(f"\tDual-language PDF: {self.dual_pdf_path}")
+
+        if self.cross_boundary_report_path:
+            result.append(
+                f"\tCross-boundary report: {self.cross_boundary_report_path} "
+                f"({self.cross_boundary_report_status}, "
+                f"{self.cross_boundary_unresolved_count} unresolved)"
+            )
 
         if (
             hasattr(self, "no_watermark_mono_pdf_path")

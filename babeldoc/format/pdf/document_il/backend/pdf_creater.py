@@ -5,6 +5,7 @@ import os
 import re
 import time
 import unicodedata
+from concurrent.futures import CancelledError
 from multiprocessing import Process
 from pathlib import Path
 
@@ -414,39 +415,20 @@ class PDFCreater:
             if translation_config.dual_translate_first:
                 # Show translated page on left and original on right
                 rect_left, rect_right = rect_right, rect_left
-            try:
-                # Show original page on left and translated on right (default)
-                dual_page.show_pdf_page(
-                    rect_left,
-                    original_pdf,
-                    page_id,
-                    keep_proportion=True,
-                    rotate=-rotate_angle,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to show original page on left and translated on right (default). "
-                    f"Page ID: {page_id}. "
-                    f"Original PDF: {self.original_pdf_path}. "
-                    f"Translated PDF: {translation_config.input_file}. ",
-                    exc_info=e,
-                )
-            try:
-                dual_page.show_pdf_page(
-                    rect_right,
-                    translated_pdf,
-                    page_id,
-                    keep_proportion=True,
-                    rotate=-rotate_angle,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to show translated page on left and original on right. "
-                    f"Page ID: {page_id}. "
-                    f"Original PDF: {self.original_pdf_path}. "
-                    f"Translated PDF: {translation_config.input_file}. ",
-                    exc_info=e,
-                )
+            dual_page.show_pdf_page(
+                rect_left,
+                original_pdf,
+                page_id,
+                keep_proportion=True,
+                rotate=-rotate_angle,
+            )
+            dual_page.show_pdf_page(
+                rect_right,
+                translated_pdf,
+                page_id,
+                keep_proportion=True,
+                rotate=-rotate_angle,
+            )
         return dual
 
     def create_alternating_pages_dual_pdf(
@@ -663,6 +645,8 @@ class PDFCreater:
 
                 shutil.copy2(temp_output, output_path)
                 return True
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error copying saved PDF: {e}")
                 pdf.save(output_path)  # Fallback to direct save

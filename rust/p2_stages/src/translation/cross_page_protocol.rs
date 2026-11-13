@@ -3,13 +3,13 @@ use super::ordinary_translation::{InputPlaceholder, PlaceholderRegex, TranslateI
 
 static SENTENCE_TERMINATOR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[\p{Sentence_Terminal}…]").expect("literal sentence terminator regex"));
-static NUMERIC_EXPRESSION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(
+pub(crate) static NUMERIC_EXPRESSION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(
     r"(?x)
         (?:[\p{Sm}\p{Sc}\p{Pd}~～/⁄∶:]\s*)*
         \p{N}+
         (?:(?:\s*[\p{Sm}\p{Sc}\p{Pd}.,٫٬'’:/∶⁄~～⋅·*^]\s*[\p{Sm}\p{Pd}]*\s*|\s+)\p{N}+)*
         (?:\s*[eE]\s*[\p{Sm}\p{Pd}]*\s*\p{N}+)?
-        (?:\s*[\p{Sm}\p{Sc}%％٪‰‱])*
+        (?:\s*[\p{Sm}\p{Sc}\p{Pd}%％٪‰‱])*
     "
 ).expect("literal numeric expression regex"));
 

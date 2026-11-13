@@ -201,6 +201,11 @@
           <data type="int"/>
         </attribute>
       </optional>
+      <optional>
+        <attribute name="synthetic_spacing">
+          <data type="boolean"/>
+        </attribute>
+      </optional>
       <attribute name="char_unicode">
         <data type="string"/>
       </attribute>

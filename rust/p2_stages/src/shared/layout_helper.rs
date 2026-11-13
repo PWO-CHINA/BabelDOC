@@ -623,18 +623,30 @@ fn composition_box(
     Ok(None)
 }
 
-fn collapse_nfkc_spaces(text: &str) -> String {
-    let normalized = unicode::nfkc(text);
+pub fn expand_print_ligature(character: char) -> &'static str {
+    match character {
+        '\u{fb00}' => "ff",
+        '\u{fb01}' => "fi",
+        '\u{fb02}' => "fl",
+        '\u{fb03}' => "ffi",
+        '\u{fb04}' => "ffl",
+        '\u{fb05}' | '\u{fb06}' => "st",
+        _ => "",
+    }
+}
+
+pub fn normalize_source_text(text: &str) -> String {
     let mut output = String::new();
     let mut in_space = false;
-    for ch in normalized.chars() {
+    for ch in text.chars() {
         if unicode::is_whitespace(ch) {
             if !in_space {
                 output.push(' ');
             }
             in_space = true;
         } else {
-            output.push(ch);
+            let ligature = expand_print_ligature(ch);
+            if ligature.is_empty() { output.push(ch); } else { output.push_str(ligature); }
             in_space = false;
         }
     }
@@ -658,37 +670,93 @@ pub enum UnicodePart<'a> {
     Text(&'a str),
 }
 
-pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, LayoutHelperError> {
-    let mut distances = Vec::new();
-    for pair in parts.windows(2) {
-        if let [
-            UnicodePart::Character(first),
-            UnicodePart::Character(second),
-        ] = pair
-        {
-            let first_box = first
-                .r#box
-                .as_deref()
-                .ok_or(LayoutHelperError::MissingCoordinate("character.box"))?;
-            let second_box = second
-                .r#box
-                .as_deref()
-                .ok_or(LayoutHelperError::MissingCoordinate("character.box"))?;
-            let distance = coordinate(second_box.x, "box.x")? - coordinate(first_box.x2, "box.x2")?;
-            if distance > 1.0 {
-                distances.push(distance);
+#[derive(Clone, Copy)]
+pub struct SpacingUnit<'a> {
+    pub text: &'a str,
+    pub bounds: Option<(f64, f64, f64, f64)>,
+    pub font_id: Option<&'a str>,
+    pub font_size: Option<f64>,
+}
+
+fn same_line(left: (f64, f64, f64, f64), right: (f64, f64, f64, f64)) -> bool {
+    let overlap = left.3.min(right.3) - left.1.max(right.1);
+    overlap > 0.0 && overlap >= (left.3 - left.1).min(right.3 - right.1) * 0.5
+}
+
+fn compatible_font(left: Option<&str>, right: Option<&str>) -> bool {
+    !matches!((left, right), (Some(first), Some(second)) if first != second)
+}
+
+pub fn inferred_word_spaces(units: &[SpacingUnit<'_>]) -> Vec<bool> {
+    let mut spaces = vec![false; units.len()];
+    for index in 1..units.len() {
+        let left = units[index - 1];
+        let right = units[index];
+        if left.text.is_empty() || right.text.is_empty()
+            || left.text.chars().any(unicode::is_whitespace)
+            || right.text.chars().any(unicode::is_whitespace) {
+            continue;
+        }
+        let (Some(left_box), Some(right_box)) = (left.bounds, right.bounds) else { continue; };
+        let height = (left_box.3 - left_box.1).max(right_box.3 - right_box.1);
+        let width = (left_box.2 - left_box.0).max(right_box.2 - right_box.0);
+        if right_box.3 < left_box.1 || right_box.2 < left_box.0 - width * 10.0 {
+            spaces[index] = true;
+            continue;
+        }
+        if !same_line(left_box, right_box) { continue; }
+        let gap = right_box.0 - left_box.2;
+        if gap <= 0.0 { continue; }
+        let start = index.saturating_sub(24);
+        let end = (index + 25).min(units.len());
+        let mut widths = Vec::new();
+        let mut local_gaps = Vec::new();
+        for candidate in &units[start..end] {
+            if !compatible_font(left.font_id, candidate.font_id) { continue; }
+            if let Some(bounds) = candidate.bounds {
+                if same_line(left_box, bounds) && !candidate.text.is_empty()
+                    && candidate.text.chars().all(unicode::is_whitespace) {
+                    let count = candidate.text.chars().count() as f64;
+                    let width = (bounds.2 - bounds.0) / count;
+                    if width.is_finite() && width > 0.0 { widths.push(width); }
+                }
             }
         }
+        for pair in units[start..end].windows(2) {
+            if !compatible_font(left.font_id, pair[0].font_id) || !compatible_font(left.font_id, pair[1].font_id)
+                || pair.iter().any(|unit| unit.text.is_empty() || unit.text.chars().any(unicode::is_whitespace)) { continue; }
+            if let (Some(first), Some(second)) = (pair[0].bounds, pair[1].bounds) {
+                let distance = second.0 - first.2;
+                if same_line(left_box, first) && same_line(first, second) && distance >= 0.0 && distance < height * 0.15 {
+                    local_gaps.push(distance);
+                }
+            }
+        }
+        widths.sort_by(f64::total_cmp);
+        local_gaps.sort_by(f64::total_cmp);
+        let baseline = local_gaps.get(local_gaps.len() / 2).copied().unwrap_or(0.0);
+        let size = left.font_size.or(right.font_size).filter(|value| value.is_finite() && *value > 0.0).unwrap_or(height);
+        let threshold = widths.get(widths.len() / 2).map(|width| (width * 0.75).max(baseline + size * 0.08))
+            .unwrap_or_else(|| (size * 0.17).max(baseline + size * 0.10));
+        spaces[index] = gap >= threshold;
     }
-    distances.sort_by(f64::total_cmp);
-    distances.dedup_by(|a, b| a == b);
-    let median = match distances.as_slice() {
-        [] => 1.0,
-        [one] => *one,
-        many => many[1],
-    };
+    spaces
+}
+
+pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, LayoutHelperError> {
+    let units: Vec<_> = parts.iter().map(|part| match part {
+        UnicodePart::Character(character) => SpacingUnit {
+            text: character.char_unicode.as_deref().unwrap_or_default(),
+            bounds: character.r#box.as_deref().and_then(|bounds| coordinates(bounds).ok()),
+            font_id: character.pdf_style.as_deref().and_then(|style| style.font_id.as_deref()),
+            font_size: character.pdf_style.as_deref().and_then(|style| style.font_size),
+        },
+        UnicodePart::Text(text) => SpacingUnit { text, bounds: None, font_id: None, font_size: None },
+    }).collect();
+    let spaces = inferred_word_spaces(&units);
     let mut pieces = Vec::new();
     for (index, part) in parts.iter().enumerate() {
+        if spaces[index] { pieces.push(" ".to_owned()); }
         let UnicodePart::Character(character) = part else {
             if let UnicodePart::Text(text) = part {
                 pieces.push((*text).to_owned());
@@ -696,26 +764,9 @@ pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, Layo
             continue;
         };
         let text = character.char_unicode.as_deref().unwrap_or_default();
-        pieces.push(collapse_nfkc_spaces(text));
-        if text == " " {
-            continue;
-        }
-        if let Some(UnicodePart::Character(next)) = parts.get(index + 1) {
-            let current_box = character
-                .r#box
-                .as_deref()
-                .ok_or(LayoutHelperError::MissingCoordinate("character.box"))?;
-            let next_box = next
-                .r#box
-                .as_deref()
-                .ok_or(LayoutHelperError::MissingCoordinate("character.box"))?;
-            let distance = coordinate(next_box.x, "box.x")? - coordinate(current_box.x2, "box.x2")?;
-            if distance >= median || Layout::is_newline(Some(character), next) {
-                pieces.push(" ".to_owned());
-            }
-        }
+        pieces.push(normalize_source_text(text));
     }
-    Ok(trim_python_whitespace(collapse_nfkc_spaces(
+    Ok(trim_python_whitespace(normalize_source_text(
         &pieces.concat(),
     )))
 }

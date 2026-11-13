@@ -463,96 +463,25 @@ impl DocumentTracking {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum CompatKey {
-    Null,
-    Bool(bool),
-    Integer(String),
-    Float(f64),
-    String(String),
-    Nan(usize),
+#[derive(serde::Deserialize)]
+struct ResponseItem {
+    id: usize,
+    output: Option<serde_json::Value>,
 }
 
-fn compat_key(value: &V, nan_sequence: usize) -> CompatKey {
-    match value {
-        V::Null => CompatKey::Null,
-        V::Bool(value) => CompatKey::Bool(*value),
-        V::Integer(value) => CompatKey::Integer(value.clone()),
-        V::Float(value) if value.is_nan() => CompatKey::Nan(nan_sequence),
-        V::Float(value) => CompatKey::Float(*value),
-        V::String(value) => CompatKey::String(value.clone()),
-        _ => CompatKey::String(format!("container:{nan_sequence}")),
-    }
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum BatchResponse {
+    Many(Vec<ResponseItem>),
+    Single(ResponseItem),
 }
 
-fn keys_equal(left: &CompatKey, right: &CompatKey) -> bool {
-    fn bool_int(value: bool) -> &'static str {
-        if value { "1" } else { "0" }
-    }
-    fn int_float(integer: &str, float: f64) -> bool {
-        float.is_finite() && float.fract() == 0.0 && format!("{float:.0}") == integer
-    }
-    match (left, right) {
-        (CompatKey::Null, CompatKey::Null) => true,
-        (CompatKey::Bool(a), CompatKey::Bool(b)) => a == b,
-        (CompatKey::Integer(a), CompatKey::Integer(b)) => a == b,
-        (CompatKey::Float(a), CompatKey::Float(b)) => a == b,
-        (CompatKey::Bool(a), CompatKey::Integer(b))
-        | (CompatKey::Integer(b), CompatKey::Bool(a)) => bool_int(*a) == b,
-        (CompatKey::Bool(a), CompatKey::Float(b)) | (CompatKey::Float(b), CompatKey::Bool(a)) => {
-            int_float(bool_int(*a), *b)
-        }
-        (CompatKey::Integer(a), CompatKey::Float(b))
-        | (CompatKey::Float(b), CompatKey::Integer(a)) => int_float(a, *b),
-        (CompatKey::String(a), CompatKey::String(b)) => a == b,
-        (CompatKey::Nan(a), CompatKey::Nan(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn python_int(value: &V) -> Result<i64, String> {
-    match value {
-        V::Integer(value) => value.parse().map_err(|_| "int too large".into()),
-        V::Bool(value) => Ok(i64::from(*value)),
-        V::Float(value) if value.is_finite() => Ok(*value as i64),
-        V::String(value) => value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("invalid literal for int() with base 10: '{value}'")),
-        _ => Err(format!(
-            "int() argument must be a string, a bytes-like object or a real number, not {}",
-            type_name(value)
-        )),
-    }
-}
-
-fn type_name(value: &V) -> &'static str {
-    match value {
-        V::Null => "NoneType",
-        V::Bool(_) => "bool",
-        V::Integer(_) => "int",
-        V::Float(_) => "float",
-        V::String(_) => "str",
-        V::Array(_) => "list",
-        V::Object(_) => "dict",
-    }
-}
-
-fn output_text(value: &V) -> Option<String> {
-    match value {
-        V::String(value) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-/// Mirrors the dict-comprehension followed by the per-result try/except/finally
-/// structure. The caller applies the returned texts and queues fallback jobs.
 pub fn interpret_response(
     response: &str,
     inputs: &[String],
     disable_same_text_fallback: bool,
 ) -> InterpretResult {
-    let parsed = match super::python_semantics::json_loads(clean_json_output(response).trim()) {
+    let parsed = match serde_json::from_str::<BatchResponse>(clean_json_output(response).trim()) {
         Ok(value) => value,
         Err(error) => {
             return InterpretResult {
@@ -566,81 +495,26 @@ pub fn interpret_response(
             };
         }
     };
-    let parsed = match parsed {
-        V::Object(fields)
-            if fields
-                .iter()
-                .rfind(|(k, _)| k == "output")
-                .or_else(|| fields.iter().rfind(|(k, _)| k == "input"))
-                .is_some_and(|(_, value)| truthy(value)) =>
-        {
-            V::Array(vec![V::Object(fields)])
-        }
-        value => value,
-    };
     let values = match parsed {
-        V::Array(values) => values,
-        _ => {
-            return InterpretResult {
-                items: vec![],
-                fallback_indices: (0..inputs.len()).collect(),
-                fallback_errors: vec![],
-                processed: 0,
-                ok_count: 0,
-                fallback_count: 0,
-                error: Some("'{}' object is not iterable".into()),
-            };
-        }
+        BatchResponse::Many(values) => values,
+        BatchResponse::Single(value) => vec![value],
     };
-    let mut results = Vec::<(CompatKey, V)>::new();
-    let mut nan_sequence = 0usize;
+    let invalid_identity = |message: String| InterpretResult {
+        items: vec![], fallback_indices: (0..inputs.len()).collect(), fallback_errors: vec![],
+        processed: 0, ok_count: 0, fallback_count: 0, error: Some(message),
+    };
+    let mut results = Vec::<(usize, Option<String>)>::new();
+    let mut seen = std::collections::HashSet::new();
     for item in values {
-        let V::Object(fields) = item else {
-            return InterpretResult {
-                items: vec![],
-                fallback_indices: (0..inputs.len()).collect(),
-                fallback_errors: vec![],
-                processed: 0,
-                ok_count: 0,
-                fallback_count: 0,
-                error: Some("list indices must be integers or slices, not str".into()),
-            };
-        };
-        let Some((_, id)) = fields.iter().rfind(|(key, _)| key == "id") else {
-            return InterpretResult {
-                items: vec![],
-                fallback_indices: (0..inputs.len()).collect(),
-                fallback_errors: vec![],
-                processed: 0,
-                ok_count: 0,
-                fallback_count: 0,
-                error: Some("'id'".into()),
-            };
-        };
-        let output = fields
-            .iter()
-            .rfind(|(key, _)| key == "output")
-            .map(|(_, v)| v)
-            .or_else(|| {
-                fields
-                    .iter()
-                    .rfind(|(key, _)| key == "input")
-                    .map(|(_, v)| v)
-            })
-            .cloned()
-            .unwrap_or(V::Null);
-        let key = compat_key(id, nan_sequence);
-        if matches!(key, CompatKey::Nan(_)) {
-            nan_sequence += 1;
+        let index = item.id;
+        if index >= inputs.len() {
+            return invalid_identity("Translation item ID is not a requested nonnegative integer".into());
         }
-        if let Some(existing) = results
-            .iter_mut()
-            .find(|(candidate, _)| keys_equal(candidate, &key))
-        {
-            existing.1 = output;
-        } else {
-            results.push((key, output));
+        if !seen.insert(index) {
+            return invalid_identity(format!("Translation item ID {index} is repeated"));
         }
+        let output = item.output.and_then(|value| value.as_str().map(str::to_owned));
+        results.push((index, output));
     }
     if results.len() != inputs.len() {
         return InterpretResult {
@@ -663,49 +537,13 @@ pub fn interpret_response(
     let mut processed = 0;
     let mut ok_count = 0;
     let mut fallback_count = 0;
-    for (key, output) in results {
-        let raw = key_to_value(&key);
+    for (index, output) in results {
         processed += 1;
-        let id = match python_int(&raw) {
-            Ok(id) => id,
-            Err(error) => {
-                fallback_count += 1;
-                return InterpretResult {
-                    items: vec![],
-                    fallback_indices: (0..inputs.len()).collect(),
-                    fallback_errors: vec![],
-                    processed,
-                    ok_count,
-                    fallback_count,
-                    error: Some(match raw {
-                        V::String(_) => "list indices must be integers or slices, not str".into(),
-                        V::Float(_) => "list indices must be integers or slices, not float".into(),
-                        V::Null => "list indices must be integers or slices, not NoneType".into(),
-                        V::Object(_) => "list indices must be integers or slices, not dict".into(),
-                        V::Array(_) => "list indices must be integers or slices, not list".into(),
-                        _ => error,
-                    }),
-                };
-            }
-        };
-        if id >= inputs.len() as i64 || id < -(inputs.len() as i64) {
-            return InterpretResult {
-                items: vec![],
-                fallback_indices: (0..inputs.len()).collect(),
-                fallback_errors: vec![],
-                processed,
-                ok_count,
-                fallback_count: fallback_count + 1,
-                error: Some("list index out of range".into()),
-            };
-        }
-        let index = if id < 0 { inputs.len() as i64 + id } else { id } as usize;
-        if output_text(&output).is_none() {
+        let Some(translated) = output else {
             fallback_count += 1;
             fallback_indices.push(index);
             continue;
-        }
-        let translated = output_text(&output).unwrap();
+        };
         let translated = collapse_punctuation(&translated);
         let source = collapse_punctuation(&inputs[index]);
         let in_tokens = count_tokens(&source);
@@ -772,29 +610,6 @@ fn python_json_error(response: &str, parser_error: &str) -> String {
         return format!("Expecting value: line 1 column {column} (char {offset})");
     }
     parser_error.to_owned()
-}
-
-fn key_to_value(key: &CompatKey) -> V {
-    match key {
-        CompatKey::Null => V::Null,
-        CompatKey::Bool(value) => V::Bool(*value),
-        CompatKey::Integer(value) => V::Integer(value.clone()),
-        CompatKey::Float(value) => V::Float(*value),
-        CompatKey::String(value) => V::String(value.clone()),
-        CompatKey::Nan(_) => V::Float(f64::NAN),
-    }
-}
-
-fn truthy(value: &V) -> bool {
-    match value {
-        V::Null => false,
-        V::Bool(v) => *v,
-        V::Integer(v) => v != "0",
-        V::Float(v) => *v != 0.0,
-        V::String(v) => !v.is_empty(),
-        V::Array(v) => !v.is_empty(),
-        V::Object(v) => !v.is_empty(),
-    }
 }
 
 fn collapse_punctuation(value: &str) -> String {

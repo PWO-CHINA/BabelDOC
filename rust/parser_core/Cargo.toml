@@ -11,8 +11,10 @@ log = { workspace = true }
 babeldoc-ir-core = { path = "../ir_core" }
 babeldoc-il-types = { path = "../il_types" }
 lopdf = { version = "=0.45.0", default-features = false, features = ["rayon"] }
+flate2 = "=1.1.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "=0.11.0"
 ruzstd = "=0.9.0"
 freetype-rs = { version = "=0.38.0", features = ["bundled"] }
 libz-sys = { version = "=1.1.31", features = ["static"] }

@@ -54,9 +54,11 @@ impl CancelFlag {
     /// The checkpoint is called at job start, never used to interrupt an in-flight call.
     pub fn checkpoint(&self) -> PyResult<()> {
         if self.is_cancelled() {
-            let mut times = self.times.lock().unwrap_or_else(|e| e.into_inner());
-            if times.1.is_none() {
-                times.1 = times.0.map(|at| at.elapsed().as_secs_f64());
+            {
+                let mut times = self.times.lock().unwrap_or_else(|e| e.into_inner());
+                if times.1.is_none() {
+                    times.1 = times.0.map(|at| at.elapsed().as_secs_f64());
+                }
             }
             Err(Python::attach(|py| {
                 match py
@@ -79,6 +81,14 @@ impl CancelFlag {
 impl Cancellation for CancelFlag {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl CancelFlag {
+    pub fn commit_when_live<T, E>(&self, action: impl FnOnce() -> Result<T, E>) -> Result<Option<T>, E> {
+        let _guard = self.times.lock().unwrap_or_else(|error| error.into_inner());
+        if self.cancelled.load(Ordering::Acquire) { return Ok(None); }
+        action().map(Some)
     }
 }
 

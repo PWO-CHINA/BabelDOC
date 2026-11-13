@@ -434,14 +434,29 @@ pub fn glossary_block(text: &str, glossaries: &[super::glossary::Glossary]) -> S
             (!entries.is_empty()).then_some((glossary.name.clone(), entries))
         })
         .collect::<Vec<_>>();
-    if active.is_empty() {
+    let suggestions = glossaries
+        .iter()
+        .flat_map(|glossary| glossary.active_suggestions_for_text(text))
+        .filter(|suggestion| {
+            !active.iter().any(|(_, entries)| {
+                entries.iter().any(|(source, _)| {
+                    super::glossary::term_occurrences(&suggestion.source, source) > 0
+                        || super::glossary::term_occurrences(source, &suggestion.source) > 0
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if active.is_empty() && suggestions.is_empty() {
         return String::new();
     }
-    let mut lines = vec![
-        "## Glossary".to_owned(), String::new(),
-        "Always use the glossary's **Target Term** for any occurrence of its **Source Term** (including variants, inside tags, or broken across lines).".to_owned(),
-        String::new(), "Unlisted terms are translated naturally.".to_owned(), String::new(),
-    ];
+    let mut lines = Vec::new();
+    if !active.is_empty() {
+        lines.extend(vec![
+            "## Glossary".to_owned(), String::new(),
+            "Always use the glossary's **Target Term** for any occurrence of its **Source Term** (including variants, inside tags, or broken across lines).".to_owned(),
+            String::new(), "Unlisted terms are translated naturally.".to_owned(), String::new(),
+        ]);
+    }
     for (name, entries) in active {
         lines.push(format!("### Glossary: {name}"));
         lines.push(String::new());
@@ -450,6 +465,17 @@ pub fn glossary_block(text: &str, glossaries: &[super::glossary::Glossary]) -> S
             lines.push(format!("| {source} | {target} |"));
         }
         lines.push(String::new());
+    }
+    if !suggestions.is_empty() {
+        lines.push("## Automatic terminology suggestions".to_owned());
+        lines.push("These are optional suggestions for the quoted source context only. Choose the meaning from the current context; do not apply them to other senses or override a user glossary.".to_owned());
+        for suggestion in suggestions {
+            let label = suggestion.context.layout_label.as_deref().unwrap_or("unknown");
+            lines.push(format!(
+                "- {} → {} (source region: {}; source context: {})",
+                suggestion.source, suggestion.target, label, suggestion.context.text
+            ));
+        }
     }
     lines.join("\n")
 }

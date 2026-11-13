@@ -115,6 +115,7 @@ pub fn parse_prepared_pdf(
         page_count,
         diagnostics: parsed.diagnostics,
         page_objects,
+        source_sha256: parsed.source_sha256,
     })
 }
 
@@ -146,6 +147,7 @@ struct ProductObserver {
     pages: Option<Vec<usize>>,
     completed: usize,
     python_error: Option<PyErr>,
+    capture_source_sha256: bool,
 }
 impl ProductObserver {
     fn boundary(
@@ -160,6 +162,10 @@ impl ProductObserver {
     }
 }
 impl babeldoc_parser_core::ParseObserver for ProductObserver {
+    fn capture_source_sha256(&self) -> bool {
+        self.capture_source_sha256
+    }
+
     fn resource_limits_disabled(&mut self) -> babeldoc_parser_core::Result<()> {
         self.boundary(|py, _| disabled_warning(py))
     }
@@ -220,7 +226,7 @@ impl babeldoc_parser_core::ParseObserver for ProductObserver {
 }
 
 #[pyfunction]
-#[pyo3(signature=(path, config_json, font_mapper, shared_context, flag, monitor, *, only_include_translated_page=false, capture_path=None, debug_path=None))]
+#[pyo3(signature=(path, config_json, font_mapper, shared_context, flag, monitor, *, only_include_translated_page=false, capture_path=None, debug_path=None, capture_source_sha256=false))]
 pub fn parse_prepared_pdf_product(
     py: Python<'_>,
     path: String,
@@ -232,6 +238,7 @@ pub fn parse_prepared_pdf_product(
     only_include_translated_page: bool,
     capture_path: Option<String>,
     debug_path: Option<String>,
+    capture_source_sha256: bool,
 ) -> PyResult<Option<MDocument>> {
     #[cfg(not(feature = "stage-capture"))]
     if capture_path.is_some() {
@@ -255,6 +262,7 @@ pub fn parse_prepared_pdf_product(
         pages: config.pages.clone(),
         completed: 0,
         python_error: None,
+        capture_source_sha256,
     };
     let parsed = py.detach(|| {
         babeldoc_parser_core::catch_parser_unwind(|| {
@@ -298,6 +306,7 @@ pub fn parse_prepared_pdf_product(
         page_count: observer.completed,
         diagnostics: parsed.diagnostics,
         page_objects,
+        source_sha256: parsed.source_sha256,
     }))
 }
 

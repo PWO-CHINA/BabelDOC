@@ -342,10 +342,32 @@ pub(crate) fn build_input(
     unicode_override: Option<&str>,
     deferred_missing_font_style: &mut Option<FontStyleLookupError>,
 ) -> PyResult<Option<stage::TranslateInput>> {
+    build_input_impl(
+        paragraph, view, service, regex, patterns, allow_rich, mapper, font_styles,
+        unicode_override, deferred_missing_font_style, None, &mut None,
+    )
+}
+
+fn build_input_impl(
+    paragraph: &ir::Cursor<babeldoc_ir_core::types::PdfParagraph>,
+    view: &babeldoc_ir_core::TreeView<'_, ReadOnlyView>,
+    service: &Bound<'_, PyAny>,
+    regex: &mut RegexService<'_>,
+    patterns: &stage::PlaceholderPatterns,
+    allow_rich: bool,
+    mapper: &crate::font_mapper::FontMapperHandle,
+    font_styles: &HashMap<String, babeldoc_p2_stages::font_mapper::SourceFontStyle>,
+    unicode_override: Option<&str>,
+    deferred_missing_font_style: &mut Option<FontStyleLookupError>,
+    boundary_patterns: Option<&[u64]>,
+    boundary_failure: &mut Option<String>,
+) -> PyResult<Option<stage::TranslateInput>> {
+    let boundary = boundary_patterns.is_some();
     let composition_len = paragraph
         .pdf_paragraph_composition_len(view)
         .map_err(access)?;
     if composition_len == 0 {
+        *boundary_failure = Some("paragraph has no source compositions".into());
         return Ok(None);
     }
     let unicode = unicode_override
@@ -359,7 +381,13 @@ pub(crate) fn build_input(
             |value| Ok(Some(value.to_owned())),
         )?
         .unwrap_or_default();
-    if babeldoc_p2_stages::translation::paragraph_helpers::is_pure_numeric_text(&unicode) {
+    if let Some(boundary_patterns) = boundary_patterns {
+        if !boundary_source_unambiguous("", &unicode, boundary_patterns, regex)? {
+            *boundary_failure = Some("paragraph contains a literal placeholder or reserved marker".into());
+            return Ok(None);
+        }
+    }
+    if !boundary && babeldoc_p2_stages::translation::paragraph_helpers::is_pure_numeric_text(&unicode) {
         return Ok(None);
     }
     let mut formula_only = composition_len != 0;
@@ -367,10 +395,11 @@ pub(crate) fn build_input(
         .pdf_paragraph_composition_iter(view)
         .map_err(access)?
     {
+        *boundary_failure = Some("paragraph contains only whitespace".into());
         let composition = composition.map_err(access)?;
         formula_only &= composition.pdf_formula(view).map_err(access)?.is_some();
     }
-    if formula_only
+    if (!boundary && formula_only)
         || (!unicode.is_empty()
             && babeldoc_p2_stages::translation::python_semantics::python_isspace(&unicode))
     {
@@ -378,7 +407,7 @@ pub(crate) fn build_input(
     }
     let originals =
         stage::original_placeholder_tokens(regex, patterns, &unicode).map_err(access)?;
-    if composition_len == 1 {
+    if !boundary && composition_len == 1 {
         let composition = paragraph
             .pdf_paragraph_composition_at(view, 0)
             .map_err(access)?;
@@ -416,9 +445,10 @@ pub(crate) fn build_input(
     {
         let composition = composition.map_err(access)?;
         if let Some(line) = composition.pdf_line(view).map_err(access)? {
-            parts.extend(character_fragments(
+            parts.extend(input_character_fragments(
                 line.pdf_character_iter(view).map_err(access)?,
                 view,
+                boundary,
             )?);
         } else if let Some(formula) = composition.pdf_formula(view).map_err(access)? {
             let formula_characters =
@@ -431,8 +461,16 @@ pub(crate) fn build_input(
                 .filter_map(|value| value.as_deref())
                 .filter(|value| is_cid_placeholder(value))
                 .count();
-            let hint_source = cid_count as f64 <= formula_characters.len() as f64 * 0.8;
-            let source_chars = character_text(formula_characters, view)?;
+            let hint_source = cid_count as f64 <= formula_characters.len() as f64 * 0.8
+                && (!boundary || (!formula_characters.is_empty() && formula_characters.iter().all(|character| {
+                    character.char_unicode(view).ok().and_then(|value| value.as_deref())
+                        .is_some_and(|text| !text.is_empty())
+                })));
+            let source_chars = if boundary {
+                raw_character_text(formula_characters.clone(), view)?
+            } else {
+                character_text(formula_characters.clone(), view)?
+            };
             let placeholder = stage::formula_placeholder(
                 regex,
                 &unicode,
@@ -444,10 +482,35 @@ pub(crate) fn build_input(
             )
             .map_err(access)?;
             next_id = placeholder.id + 1;
-            parts.push(InputTextPart::Text(placeholder.token.clone()));
+            if boundary {
+                let characters = input_character_fragments(formula_characters.into_iter().map(Ok), view, true)?;
+                let formula_box = if let Some(rect) = formula.r#box(view).map_err(access)? {
+                    match (rect.x(view).map_err(access)?, rect.y(view).map_err(access)?,
+                        rect.x2(view).map_err(access)?, rect.y2(view).map_err(access)?) {
+                        (Some(x), Some(y), Some(x2), Some(y2))
+                            if [x, y, x2, y2].iter().all(|value| value.is_finite()) && x2 > x && y2 > y =>
+                                Some((x, y, x2, y2)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let nonspace = |part: &&InputTextPart| matches!(part,
+                    InputTextPart::Character { text, .. } if text.chars().any(|ch| !python_whitespace(ch)));
+                let first = characters.iter().find(nonspace).and_then(boundary_character_coords).or(formula_box);
+                let last = characters.iter().rev().find(nonspace).and_then(boundary_character_coords).or(formula_box);
+                parts.push(InputTextPart::BoundaryFormula {
+                    token: placeholder.token.clone(),
+                    source: placeholder.source_chars.clone(),
+                    first,
+                    last,
+                });
+            } else {
+                parts.push(InputTextPart::Text(placeholder.token.clone()));
+            }
             placeholders.push(stage::InputPlaceholder::Formula(placeholder));
         } else if let Some(character) = composition.pdf_character(view).map_err(access)? {
-            parts.extend(character_fragments(std::iter::once(Ok(character)), view)?);
+            parts.extend(input_character_fragments(std::iter::once(Ok(character)), view, boundary)?);
         } else if let Some(group) = composition
             .pdf_same_style_characters(view)
             .map_err(access)?
@@ -464,10 +527,15 @@ pub(crate) fn build_input(
                 {
                     let font_id = style.font_id(view).map_err(access)?;
                     if let Err(error) = require_font_style(font_styles, font_id.clone()) {
+                        *boundary_failure = Some(format!("missing source font style: {}", error.key_error_message()));
                         deferred_missing_font_style.get_or_insert(error);
                         return Ok(None);
                     }
                 }
+            }
+            if boundary && allow_rich && composition_style.is_none() != paragraph_style.is_none() {
+                *boundary_failure = Some("source and paragraph style presence differs".into());
+                return Ok(None);
             }
             let equivalent = style_matches(
                 composition_style.clone(),
@@ -527,24 +595,55 @@ pub(crate) fn build_input(
                 )
                 .map_err(access)?;
                 next_id = placeholder.id + 2;
-                parts.push(InputTextPart::Text(placeholder.left.clone()));
-                parts.extend(character_fragments(
+                parts.push(InputTextPart::BoundaryOpen(placeholder.left.clone()));
+                parts.extend(input_character_fragments(
                     group_characters.into_iter().map(Ok),
                     view,
+                    boundary,
                 )?);
-                parts.push(InputTextPart::Text(placeholder.right.clone()));
+                parts.push(InputTextPart::BoundaryClose(placeholder.right.clone()));
                 placeholders.push(stage::InputPlaceholder::Rich(placeholder));
                 let _ = (left, left_pattern, right, right_pattern);
             } else {
-                parts.extend(character_fragments(
+                parts.extend(input_character_fragments(
                     group_characters.into_iter().map(Ok),
                     view,
+                    boundary,
                 )?);
+            }
+        } else if boundary {
+            if let Some(group) = composition.pdf_same_style_unicode_characters(view).map_err(access)? {
+                if allow_rich {
+                    let group_style = group.pdf_style(view).map_err(access)?;
+                    let paragraph_style = paragraph.pdf_style(view).map_err(access)?;
+                    for style in [group_style.as_ref(), paragraph_style.as_ref()].into_iter().flatten() {
+                        if let Err(error) = require_font_style(font_styles, style.font_id(view).map_err(access)?.clone()) {
+                            *boundary_failure = Some(format!("missing source font style: {}", error.key_error_message()));
+                            deferred_missing_font_style.get_or_insert(error);
+                            return Ok(None);
+                        }
+                    }
+                    let equivalent = style_matches(group_style.clone(), paragraph_style.clone(), view, false, false, mapper, font_styles)?
+                        || style_matches(group_style.clone(), paragraph_style.clone(), view, true, false, mapper, font_styles)?
+                        || style_matches(group_style, paragraph_style, view, false, true, mapper, font_styles)?;
+                    if !equivalent {
+                        *boundary_failure = Some("unicode-only source has a different style".into());
+                        return Ok(None);
+                    }
+                }
+                let Some(text) = group.unicode(view).map_err(access)?.clone() else {
+                    *boundary_failure = Some("unicode-only source has no text".into());
+                    return Ok(None)
+                };
+                parts.push(InputTextPart::Text(text));
+            } else {
+                *boundary_failure = Some("unsupported or empty source composition".into());
+                return Ok(None);
             }
         } else {
             return Ok(None);
         }
-        if placeholders.len() > 40 && allow_rich {
+        if !boundary && placeholders.len() > 40 && allow_rich {
             return build_input(
                 paragraph,
                 view,
@@ -559,8 +658,20 @@ pub(crate) fn build_input(
             );
         }
     }
-    let translated =
-        stage::prepare_translated_text(&[compose_input_text(&parts)], placeholders, originals);
+    let text = if let Some(boundary_patterns) = boundary_patterns {
+        let raw = boundary_raw_text(&parts);
+        if !boundary_source_unambiguous(&raw, &unicode, boundary_patterns, regex)? {
+            *boundary_failure = Some("source contains a literal placeholder or reserved marker".into());
+            return Ok(None);
+        }
+        match compose_boundary_input_text(&parts, &unicode) {
+            Ok(text) => text,
+            Err(reason) => { *boundary_failure = Some(reason.into()); return Ok(None); }
+        }
+    } else {
+        compose_input_text(&parts)
+    };
+    let translated = stage::prepare_translated_text(&[text], placeholders, originals);
     Ok(Some(translated))
 }
 
@@ -873,6 +984,286 @@ mod page_local_font_tests {
         assert!(!validate_local_input(&mut input, "字{v1}", &[0, 1], &mut overlap).unwrap());
     }
 
+    fn character(text: &str, x: f64, y: f64, width: f64, height: f64) -> InputTextPart {
+        InputTextPart::Character {
+            text: text.into(),
+            coords: Some((x, y, x + width, y + height)),
+            font_id: None,
+            font_size: None,
+        }
+    }
+
+    fn unpositioned(text: &str) -> InputTextPart {
+        InputTextPart::Character { text: text.into(), coords: None, font_id: None, font_size: None }
+    }
+
+    #[test]
+    fn boundary_geometry_passes_style_and_formula_markers() {
+        let styled = vec![
+            character("T", 0.0, 0.0, 1.0, 10.0),
+            character("h", 1.0, 0.0, 1.0, 10.0),
+            character("e", 2.0, 0.0, 1.0, 10.0),
+            InputTextPart::BoundaryOpen("<b1>".into()),
+            character("m", 5.0, 0.0, 1.0, 10.0),
+            character("o", 6.0, 0.0, 1.0, 10.0),
+            InputTextPart::BoundaryClose("</b1>".into()),
+            character("x", 9.0, 0.0, 1.0, 10.0),
+        ];
+        assert_eq!(compose_boundary_input_text(&styled, "Themo x"), Ok("The <b1>mo</b1> x".into()));
+        let formula = vec![
+            character("A", 0.0, 0.0, 1.0, 10.0),
+            InputTextPart::BoundaryFormula {
+                token: "{v1}".into(), source: "x".into(),
+                first: Some((3.0, 0.0, 4.0, 10.0)), last: Some((3.0, 0.0, 4.0, 10.0)),
+            },
+            character("B", 6.0, 0.0, 1.0, 10.0),
+        ];
+        assert_eq!(compose_boundary_input_text(&formula, "AxB"), Ok("A {v1} B".into()));
+    }
+
+    #[test]
+    fn boundary_preserves_unicode_whitespace_and_rejects_mismatch() {
+        let one = vec![unpositioned("We\u{a0}find")];
+        let many = vec![unpositioned("We"), InputTextPart::BoundaryOpen("<b1>".into()),
+            unpositioned("find"), InputTextPart::BoundaryClose("</b1>".into())];
+        assert_eq!(compose_boundary_input_text(&one, "We\u{a0}find"), Ok("We\u{a0}find".into()));
+        assert_eq!(compose_boundary_input_text(&many, "We\u{a0}find"), Ok("We\u{a0}<b1>find</b1>".into()));
+        assert_eq!(compose_boundary_input_text(&one, "We find"), Ok("We find".into()));
+        assert!(compose_boundary_input_text(&many, "We found").is_err());
+        assert_eq!(compose_boundary_input_text(&[unpositioned("10⁻³")], "10⁻³"), Ok("10⁻³".into()));
+    }
+
+    #[test]
+    fn boundary_maps_ligatures_and_legacy_scripts_to_their_sources() {
+        let parts = vec![unpositioned("A  e"), InputTextPart::BoundaryOpen("<b1>".into()),
+            unpositioned("ﬀ"), InputTextPart::BoundaryClose("</b1>".into()), unpositioned("ect 10⁻³")];
+        assert_eq!(compose_boundary_input_text(&parts, "A effect 10−3"), Ok("A e<b1>ff</b1>ect 10⁻³".into()));
+        assert!(compose_boundary_input_text(&[unpositioned("ﬁ")], "f i").is_err());
+        assert!(compose_boundary_input_text(&[unpositioned("x²")], "x3").is_err());
+        assert!(compose_boundary_input_text(&[unpositioned("x2")], "x²").is_err());
+        let formula = InputTextPart::BoundaryFormula { token: "{v1}".into(), source: "10⁻³".into(), first: None, last: None };
+        assert_eq!(compose_boundary_input_text(&[formula], "10−3"), Ok("{v1}".into()));
+    }
+
+    #[test]
+    fn boundary_rebuilds_six_stored_pre_ir_sources() {
+        let root = std::env::var_os("BABELDOC_SOURCE_FIXTURES").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.crossboundary-rootcause-20261112/selection"));
+        let samples: &[(&str, &[(usize, usize)])] = &[
+            ("06-Asp-pre", &[(0, 6), (0, 7)]),
+            ("07-science-first-pre", &[(0, 8), (1, 2), (1, 8), (1, 9)]),
+        ];
+        if !root.join(samples[0].0).exists() { return; }
+        for (sample, locations) in samples {
+            let path = root.join(sample).join("pretranslation-artifact.json");
+            let document: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            for &(page, paragraph) in *locations {
+                let paragraph = &document["document"]["page"][page]["pdf_paragraph"][paragraph];
+                let mut parts = Vec::new();
+                for (index, composition) in paragraph["pdf_paragraph_composition"].as_array().unwrap().iter().enumerate() {
+                    let source_character = |value: &serde_json::Value| {
+                        let bounds = &value["box"];
+                        let coords = bounds["x"].as_f64().zip(bounds["y"].as_f64())
+                            .zip(bounds["x2"].as_f64().zip(bounds["y2"].as_f64()))
+                            .map(|((x, y), (x2, y2))| (x, y, x2, y2));
+                        InputTextPart::Character {
+                            text: value["char_unicode"].as_str().unwrap_or_default().into(), coords,
+                            font_id: value["pdf_style"]["font_id"].as_str().map(str::to_owned),
+                            font_size: value["pdf_style"]["font_size"].as_f64(),
+                        }
+                    };
+                    if let Some(character) = composition.get("pdf_character").filter(|value| !value.is_null()) {
+                        parts.push(source_character(character));
+                    } else if let Some(formula) = composition.get("pdf_formula").filter(|value| !value.is_null()) {
+                        let characters: Vec<_> = formula["pdf_character"].as_array().unwrap().iter().map(source_character).collect();
+                        let source = boundary_raw_text(&characters);
+                        let first = characters.iter().find_map(boundary_character_coords);
+                        let last = characters.iter().rev().find_map(boundary_character_coords);
+                        parts.push(InputTextPart::BoundaryFormula { token: format!("{{v{index}}}"), source, first, last });
+                    } else if let Some(group) = composition.get("pdf_same_style_characters").filter(|value| !value.is_null()) {
+                        parts.push(InputTextPart::BoundaryOpen(format!("<b{index}>")));
+                        parts.extend(group["pdf_character"].as_array().unwrap().iter().map(source_character));
+                        parts.push(InputTextPart::BoundaryClose(format!("</b{index}>")));
+                    } else if let Some(line) = composition.get("pdf_line").filter(|value| !value.is_null()) {
+                        parts.extend(line["pdf_character"].as_array().unwrap().iter().map(source_character));
+                    } else if let Some(group) = composition.get("pdf_same_style_unicode_characters").filter(|value| !value.is_null()) {
+                        parts.push(InputTextPart::Text(group["unicode"].as_str().unwrap().into()));
+                    } else {
+                        panic!("unsupported source composition in {sample}");
+                    }
+                }
+                let text = compose_boundary_input_text(&parts, paragraph["unicode"].as_str().unwrap());
+                assert!(text.is_ok(), "{sample} {page}: {text:?}");
+                if *sample == "06-Asp-pre" && paragraph["unicode"].as_str().unwrap().contains("toolsand") {
+                    assert!(text.unwrap().contains("tools and"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_rejects_unrepresented_geometric_script() {
+        let shifted = vec![character("x", 0.0, 0.0, 5.0, 10.0), character("2", 5.0, 6.0, 3.0, 6.0)];
+        assert!(compose_boundary_input_text(&shifted, "x2").is_err());
+        assert_eq!(compose_boundary_input_text(&[unpositioned("x2")], "x2"), Ok("x2".into()));
+        let encoded = vec![character("x", 0.0, 0.0, 5.0, 10.0), character("²", 5.0, 6.0, 3.0, 6.0)];
+        assert_eq!(compose_boundary_input_text(&encoded, "x²"), Ok("x²".into()));
+    }
+
+    #[test]
+    fn boundary_allows_numeric_and_formula_but_rejects_literal_tokens() {
+        assert_eq!(compose_boundary_input_text(&[unpositioned("42")], "42"), Ok("42".into()));
+        let formula = InputTextPart::BoundaryFormula {
+            token: "{v1}".into(), source: "10⁻³".into(), first: None, last: None,
+        };
+        assert_eq!(compose_boundary_input_text(&[formula], "10⁻³"), Ok("{v1}".into()));
+        let spaced_formula = InputTextPart::BoundaryFormula {
+            token: "{v1}".into(), source: "x + y".into(), first: None, last: None,
+        };
+        assert_eq!(compose_boundary_input_text(&[spaced_formula], "x + y"), Ok("{v1}".into()));
+        let mut regex = LiteralRegex(vec!["{v1}".into(), "<b1>".into(), "</b1>".into()]);
+        assert!(!boundary_source_unambiguous("prefix {v1}", "prefix {v1}", &[0, 1, 2], &mut regex).unwrap());
+        assert!(!boundary_source_unambiguous("prefix <b1>", "prefix <b1>", &[0, 1, 2], &mut regex).unwrap());
+        assert!(!boundary_source_unambiguous("[[BABEL_F_0_0_0]]", "", &[0, 1, 2], &mut regex).unwrap());
+        assert!(boundary_source_unambiguous("42", "42", &[0, 1, 2], &mut regex).unwrap());
+    }
+
+    #[test]
+    fn boundary_rebuilds_ir_inputs_and_preserves_atomic_failure() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                pyo3::ffi::c_str!(r#"
+import re
+class Service:
+    def __init__(self):
+        self.patterns = []
+    def regex_compile(self, pattern, flags):
+        self.patterns.append(re.compile(pattern, flags))
+        return len(self.patterns) - 1
+    def regex_match(self, index, text):
+        return self.patterns[index].match(text)
+    def regex_finditer(self, index, text):
+        return [[match.span(index) for index in range(self.patterns[index].groups + 1)]
+                for match in self.patterns[index].finditer(text)]
+    def get_formular_placeholder(self, identifier):
+        return '{v' + str(identifier) + '}'
+    def get_rich_text_left_placeholder(self, identifier):
+        return '<b' + str(identifier) + '>'
+    def get_rich_text_right_placeholder(self, identifier):
+        return '</b' + str(identifier) + '>'
+service = Service()
+"#),
+                pyo3::ffi::c_str!("boundary_fixture.py"),
+                pyo3::ffi::c_str!("boundary_fixture"),
+            ).unwrap();
+            let service = module.getattr("service").unwrap();
+            let mut regex = RegexService { service: service.clone() };
+            let patterns = stage::PlaceholderPatterns {
+                formula: r"\{v\d+\}".into(), rich_left: r"<b\d+>".into(), rich_right: r"</b\d+>".into(),
+            };
+            let font = if cfg!(windows) { "C:/Windows/Fonts/arial.ttf" } else { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" };
+            let family = serde_json::json!({"normal":["test"],"script":[],"fallback":["test"],"base":["test"]});
+            let mapper = FontMapperHandle::from_shared(
+                babeldoc_p2_stages::font_mapper::font_mapper_from_asset_paths(&family, &serde_json::json!({"test":font}), None).unwrap(),
+            );
+            let root = ir::Node::new(ir::NodeData::Document(ir::DataDocument {
+                page: vec![ir::Edge::Inline(Box::new(ir::Node::new(ir::NodeData::Page(Default::default()))))],
+                ..Default::default()
+            }));
+            let mut document = ir::Document::from_parts(root, Default::default(), Default::default()).unwrap();
+            let make_line = |text: &str| ir::PdfParagraphCompositionInit {
+                pdf_line: Some(ir::PdfLineInit {
+                    pdf_character: text.chars().map(|ch| ir::PdfCharacterInit {
+                        char_unicode: Some(ch.to_string()), ..Default::default()
+                    }.into_value()).collect(), ..Default::default()
+                }.into_value()), ..Default::default()
+            }.into_value();
+            let make_formula = || ir::PdfParagraphCompositionInit {
+                pdf_formula: Some(ir::PdfFormulaInit {
+                    pdf_character: vec![ir::PdfCharacterInit { char_unicode: Some("x".into()), ..Default::default() }.into_value()],
+                    ..Default::default()
+                }.into_value()), ..Default::default()
+            }.into_value();
+            let make_rich = || ir::PdfParagraphCompositionInit {
+                pdf_same_style_characters: Some(ir::PdfSameStyleCharactersInit {
+                    pdf_style: Some(ir::PdfStyleInit {
+                        font_id: Some("test".into()), font_size: Some(10.0), ..Default::default()
+                    }.into_value()),
+                    pdf_character: vec![ir::PdfCharacterInit { char_unicode: Some("x".into()), ..Default::default() }.into_value()],
+                    ..Default::default()
+                }.into_value()), ..Default::default()
+            }.into_value();
+            let mut rich_paragraph = ir::PdfParagraphInit {
+                unicode: Some("x".repeat(41)),
+                pdf_style: Some(ir::PdfStyleInit {
+                    font_id: Some("test".into()), font_size: Some(10.0),
+                    graphic_state: Some(ir::GraphicStateInit {
+                        passthrough_per_char_instruction: Some(ir::Instructions::Materialized("different".into())),
+                    }.into_value()),
+                }.into_value()), ..Default::default()
+            };
+            rich_paragraph.pdf_paragraph_composition = (0..41).map(|_| make_rich()).collect();
+            {
+                let mut view = document.view::<ir::ParagraphFinderView>();
+                let page = view.document().page_at(&view, 0).unwrap();
+                page.set_pdf_paragraph(&mut view, vec![
+                    ir::PdfParagraphInit { unicode: Some("42".into()), pdf_paragraph_composition: vec![make_line("42")], ..Default::default() }.into_value(),
+                    ir::PdfParagraphInit { unicode: Some("x".into()), pdf_paragraph_composition: vec![make_formula()], ..Default::default() }.into_value(),
+                    ir::PdfParagraphInit { unicode: Some("We find".into()), pdf_paragraph_composition: vec![make_line("We"), make_line("find")], ..Default::default() }.into_value(),
+                    ir::PdfParagraphInit { unicode: Some("a{v1}".into()), pdf_paragraph_composition: vec![make_line("a{v1}")], ..Default::default() }.into_value(),
+                    rich_paragraph.into_value(),
+                ]).unwrap();
+            }
+            let make_job = |paragraph: usize, text: &str| Job {
+                page: 0, paragraph, debug_id: Some(format!("p{paragraph}")), text: text.into(), tracker_unicode: text.into(),
+                vertical: false, unicode_present: true, layout_label: None, cid: false,
+                pure_numeric: false, placeholder_only: false, box_y2: None, title_paragraph: false, token_count: 0,
+                title: None, local_title: None, eligible: false, input: None, fallback_input: None,
+                missing_font_style: None, fallback_missing_font_style: None,
+            };
+            let mut jobs = vec![make_job(0, "42"), make_job(1, "x"), make_job(2, "We find"), make_job(3, "a{v1}"), make_job(4, &"x".repeat(41))];
+            let font_styles = HashMap::from([("test".into(), babeldoc_p2_stages::font_mapper::SourceFontStyle::default())]);
+            {
+                let view = document.view::<ReadOnlyView>();
+                let page = view.document().page_at(&view, 0).unwrap();
+                let paragraph = page.pdf_paragraph_at(&view, 4).unwrap();
+                let ids = cross_page_patterns(&service, &mut regex).unwrap();
+                let mut missing = None;
+                let input = build_input_impl(&paragraph, &view, &service, &mut regex, &patterns, true, &mapper, &font_styles, None, &mut missing, Some(&ids), &mut None).unwrap().unwrap();
+                assert_eq!(input.placeholders.len(), 41);
+                assert!(input.placeholders.iter().all(|placeholder| matches!(placeholder, stage::InputPlaceholder::Rich(_))));
+                for index in 0..2 {
+                    let paragraph = page.pdf_paragraph_at(&view, index).unwrap();
+                    assert!(build_input(&paragraph, &view, &service, &mut regex, &patterns, true, &mapper, &font_styles, None, &mut None).unwrap().is_none());
+                }
+            }
+            for index in 0..3 {
+                assert!(rebuild_boundary_inputs(&mut document, &mut jobs, &[(0, index)], &service, &mut regex, &patterns, true, &mapper).unwrap());
+            }
+            assert_eq!(jobs[0].input.as_ref().unwrap().text, "42");
+            let formula = jobs[1].input.as_ref().unwrap();
+            assert_eq!(formula.text, "{v1}");
+            assert!(matches!(&formula.placeholders[..], [stage::InputPlaceholder::Formula(value)] if value.composition_index == 0 && value.source_chars == "x"));
+            let ids = cross_page_patterns(&service, &mut regex).unwrap();
+            let source = babeldoc_p2_stages::translation::cross_boundary::Source::new(
+                babeldoc_p2_stages::translation::cross_boundary::Location { page: 0, paragraph: 1 },
+                formula, &ids, &mut regex,
+            ).unwrap().unwrap();
+            assert_eq!(source.formulas()[0].1, "x");
+            assert_eq!(jobs[2].input.as_ref().unwrap().text, "We find");
+            let before = jobs[0].input.clone();
+            assert!(!rebuild_boundary_inputs(&mut document, &mut jobs, &[(0, 0), (0, 3)], &service, &mut regex, &patterns, true, &mapper).unwrap());
+            let failure = rebuild_boundary_inputs_diagnostic(&mut document, &mut jobs, &[(0, 0), (0, 3)], &service, &mut regex, &patterns, true, &mapper).unwrap().unwrap_err();
+            assert_eq!((failure.page, failure.paragraph), (0, 3));
+            assert!(failure.reason.contains("literal placeholder"));
+            assert_eq!(jobs[0].input, before);
+            assert!(jobs[3].input.is_none());
+        });
+    }
+
     #[test]
     fn page_and_xobject_font_resources_remain_separate() {
         let normal = babeldoc_p2_stages::font_mapper::SourceFontStyle::default();
@@ -930,7 +1321,7 @@ fn validate_local_input<R: stage::PlaceholderRegex>(
     patterns: &[u64],
     regex: &mut R,
 ) -> Result<bool, R::Error> {
-    if patterns.len() != 3 { return Ok(false); }
+    if patterns.len() != 3 || input.text.contains("[[BABEL_") { return Ok(false); }
     for &pattern in patterns {
         if !regex.find_all(pattern, source)?.is_empty() { return Ok(false); }
     }
@@ -948,11 +1339,44 @@ pub(crate) fn rebuild_page_local_inputs(
     allow_rich: bool,
     mapper: &FontMapperHandle,
 ) -> PyResult<bool> {
-    if pair[0] == pair[1] {
-        return Err(PyRuntimeError::new_err("duplicate paragraph in cross-page pair"));
+    rebuild_boundary_inputs(document, jobs, &pair, service, regex, patterns, allow_rich, mapper)
+}
+
+pub(crate) fn rebuild_boundary_inputs(
+    document: &mut Document,
+    jobs: &mut [Job],
+    keys: &[(usize, usize)],
+    service: &Bound<'_, PyAny>,
+    regex: &mut RegexService<'_>,
+    patterns: &stage::PlaceholderPatterns,
+    allow_rich: bool,
+    mapper: &FontMapperHandle,
+) -> PyResult<bool> {
+    Ok(rebuild_boundary_inputs_diagnostic(document, jobs, keys, service, regex, patterns, allow_rich, mapper)?.is_ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundaryInputFailure {
+    pub(crate) page: usize,
+    pub(crate) paragraph: usize,
+    pub(crate) reason: String,
+}
+
+pub(crate) fn rebuild_boundary_inputs_diagnostic(
+    document: &mut Document,
+    jobs: &mut [Job],
+    keys: &[(usize, usize)],
+    service: &Bound<'_, PyAny>,
+    regex: &mut RegexService<'_>,
+    patterns: &stage::PlaceholderPatterns,
+    allow_rich: bool,
+    mapper: &FontMapperHandle,
+) -> PyResult<Result<(), BoundaryInputFailure>> {
+    if keys.iter().copied().collect::<HashSet<_>>().len() != keys.len() {
+        return Err(PyRuntimeError::new_err("duplicate paragraph in boundary selection"));
     }
-    let mut indices = Vec::with_capacity(2);
-    for key in pair {
+    let mut indices = Vec::with_capacity(keys.len());
+    for &key in keys {
         let mut found = jobs.iter().enumerate().filter(|(_, job)| (job.page, job.paragraph) == key);
         let Some((index, _)) = found.next() else {
             return Err(PyRuntimeError::new_err("cross-page paragraph job missing"));
@@ -965,7 +1389,8 @@ pub(crate) fn rebuild_page_local_inputs(
     let generic_patterns = cross_page_patterns(service, regex)?;
     let view = document.view::<ReadOnlyView>();
     let mut rebuilt: Vec<Job> = indices.iter().map(|&index| jobs[index].clone()).collect();
-    for ((page_index, paragraph_index), job) in pair.into_iter().zip(&mut rebuilt) {
+    for (&(page_index, paragraph_index), job) in keys.iter().zip(&mut rebuilt) {
+        let failure = |reason: String| BoundaryInputFailure { page: page_index, paragraph: paragraph_index, reason };
         let page = view.document().page_at(&view, page_index).map_err(access)?;
         let paragraph = page.pdf_paragraph_at(&view, paragraph_index).map_err(access)?;
         let vertical = paragraph.vertical(&view).map_err(access)?.unwrap_or(false);
@@ -973,23 +1398,29 @@ pub(crate) fn rebuild_page_local_inputs(
         let maps = page_font_maps_for(&view, page_index, &HashSet::from([xobj_id]))?;
         let font_styles = maps.for_xobject(xobj_id);
         let unicode = paragraph.unicode(&view).map_err(access)?.clone();
-        let tracker_unicode = job.tracker_unicode.clone();
+        let mut build_failure = None;
         rebuild_job_inputs(job, vertical, || {
             let mut missing = None;
-            let input = build_input(&paragraph, &view, service, regex, patterns, allow_rich, mapper, font_styles, unicode.as_deref(), &mut missing)?;
-            let mut fallback_missing = None;
-            let fallback = build_input(&paragraph, &view, service, regex, patterns, allow_rich, mapper, font_styles, Some(&tracker_unicode), &mut fallback_missing)?;
-            Ok((input, fallback, missing, fallback_missing))
+            let input = build_input_impl(&paragraph, &view, service, regex, patterns, allow_rich, mapper, font_styles, unicode.as_deref(), &mut missing, Some(&generic_patterns), &mut build_failure)?;
+            Ok((input.clone(), input, missing.clone(), missing))
         })?;
-        let Some(input) = job.input.as_mut() else { return Ok(false) };
-        if !validate_local_input(input, &job.text, &generic_patterns, regex)? { return Ok(false); }
-        let Some(fallback) = job.fallback_input.as_mut() else { return Ok(false) };
-        if !validate_local_input(fallback, &tracker_unicode, &generic_patterns, regex)? { return Ok(false); }
+        let Some(input) = job.input.as_mut() else {
+            let reason = if vertical || job.vertical { "vertical source paragraph".into() }
+                else { build_failure.unwrap_or_else(|| "source input could not be built".into()) };
+            return Ok(Err(failure(reason)));
+        };
+        if !validate_local_input(input, &job.text, &generic_patterns, regex)? {
+            return Ok(Err(failure("source placeholder validation failed".into())));
+        }
+        let Some(fallback) = job.fallback_input.as_mut() else { return Ok(Err(failure("fallback source input is missing".into()))) };
+        if !validate_local_input(fallback, &job.text, &generic_patterns, regex)? {
+            return Ok(Err(failure("fallback source placeholder validation failed".into())));
+        }
     }
     for (index, job) in indices.into_iter().zip(rebuilt) {
         jobs[index] = job;
     }
-    Ok(true)
+    Ok(Ok(()))
 }
 
 /// Rebuild only inputs selected for cross-page LLM batches with the same
@@ -1144,8 +1575,57 @@ enum InputTextPart {
     Character {
         text: String,
         coords: Option<(f64, f64, f64, f64)>,
+        font_id: Option<String>,
+        font_size: Option<f64>,
     },
     Text(String),
+    BoundaryOpen(String),
+    BoundaryClose(String),
+    BoundaryFormula {
+        token: String,
+        source: String,
+        first: Option<(f64, f64, f64, f64)>,
+        last: Option<(f64, f64, f64, f64)>,
+    },
+}
+
+fn input_character_fragments(
+    characters: impl IntoIterator<
+        Item = Result<ir::Cursor<babeldoc_ir_core::types::PdfCharacter>, babeldoc_ir_core::AccessError>,
+    >,
+    view: &TreeView<'_, impl Permission>,
+    boundary: bool,
+) -> PyResult<Vec<InputTextPart>> {
+    if !boundary {
+        return character_fragments(characters, view);
+    }
+    characters.into_iter().map(|character| {
+        let character = character.map_err(access)?;
+        let text = character.char_unicode(view).map_err(access)?.clone().unwrap_or_default();
+        let coords = if let Some(rect) = character.r#box(view).map_err(access)? {
+            match (rect.x(view).map_err(access)?, rect.y(view).map_err(access)?,
+                rect.x2(view).map_err(access)?, rect.y2(view).map_err(access)?) {
+                (Some(x), Some(y), Some(x2), Some(y2))
+                    if [x, y, x2, y2].iter().all(|value| value.is_finite()) && x2 > x && y2 > y =>
+                        Some((x, y, x2, y2)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (font_id, font_size) = match character.pdf_style(view).map_err(access)? {
+            Some(style) => (style.font_id(view).map_err(access)?.clone(), style.font_size(view).map_err(access)?),
+            None => (None, None),
+        };
+        Ok(InputTextPart::Character { text, coords, font_id, font_size })
+    }).collect()
+}
+
+fn boundary_character_coords(part: &InputTextPart) -> Option<(f64, f64, f64, f64)> {
+    match part {
+        InputTextPart::Character { text, coords, .. } if text.chars().any(|ch| !python_whitespace(ch)) => *coords,
+        _ => None,
+    }
 }
 
 fn character_fragments(
@@ -1178,7 +1658,11 @@ fn character_fragments(
                     ))
                 })
                 .transpose()?;
-            Ok(InputTextPart::Character { text, coords })
+            let (font_id, font_size) = match character.pdf_style(view).map_err(access)? {
+                Some(style) => (style.font_id(view).map_err(access)?.clone(), style.font_size(view).map_err(access)?),
+                None => (None, None),
+            };
+            Ok(InputTextPart::Character { text, coords, font_id, font_size })
         })
         .collect()
 }
@@ -1187,94 +1671,296 @@ fn python_whitespace(ch: char) -> bool {
     ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch)
 }
 
-fn normalize_character_text(text: &str) -> String {
-    let normalized = babeldoc_p2_stages::shared::layout_helper::normalize_unicode_nfkc(text);
-    let mut output = String::new();
-    let mut in_space = false;
-    for ch in normalized.chars() {
-        if python_whitespace(ch) {
-            if !in_space {
-                output.push(' ');
-            }
-            in_space = true;
-        } else {
-            output.push(ch);
-            in_space = false;
+fn boundary_raw_text(parts: &[InputTextPart]) -> String {
+    let mut raw = String::new();
+    for part in parts {
+        match part {
+            InputTextPart::Character { text, .. } | InputTextPart::Text(text) => raw.push_str(text),
+            InputTextPart::BoundaryFormula { source, .. } => raw.push_str(source),
+            InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_) => {}
         }
     }
-    output
+    raw
+}
+
+fn boundary_source_unambiguous<R: stage::PlaceholderRegex>(
+    raw: &str,
+    unicode: &str,
+    patterns: &[u64],
+    regex: &mut R,
+) -> Result<bool, R::Error> {
+    if patterns.len() != 3 || raw.contains("[[BABEL_") || unicode.contains("[[BABEL_") {
+        return Ok(false);
+    }
+    for &pattern in patterns {
+        if !regex.find_all(pattern, raw)?.is_empty() || !regex.find_all(pattern, unicode)?.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn boundary_whitespace_slots(text: &str) -> (String, Vec<String>) {
+    let mut visible = String::new();
+    let mut slots = vec![String::new()];
+    for ch in text.chars() {
+        if python_whitespace(ch) {
+            slots.last_mut().expect("initial slot").push(ch);
+        } else {
+            let ligature = babeldoc_p2_stages::shared::layout_helper::expand_print_ligature(ch);
+            if ligature.is_empty() {
+                visible.push(ch);
+                slots.push(String::new());
+            } else {
+                for expanded in ligature.chars() {
+                    visible.push(expanded);
+                    slots.push(String::new());
+                }
+            }
+        }
+    }
+    (visible, slots)
+}
+
+#[derive(Clone)]
+struct BoundaryAtom {
+    text: String,
+    start: usize,
+    end: usize,
+    first: Option<(f64, f64, f64, f64)>,
+    last: Option<(f64, f64, f64, f64)>,
+    part_index: usize,
+    character: Option<char>,
+    formula: bool,
+}
+
+enum BoundaryEvent<'a> {
+    Atom(usize),
+    Marker { text: &'a str, open: bool },
+}
+
+fn boundary_unicode_script(ch: char) -> bool {
+    matches!(ch, '\u{00b2}' | '\u{00b3}' | '\u{00b9}' | '\u{2070}'..='\u{209f}'
+        | '\u{1d2c}'..='\u{1d6a}' | '\u{1d9b}'..='\u{1dbf}')
+}
+
+fn boundary_unrepresented_script(left: &BoundaryAtom, right: &BoundaryAtom) -> bool {
+    if left.formula || right.formula
+        || left.character.is_some_and(boundary_unicode_script)
+        || right.character.is_some_and(boundary_unicode_script) {
+        return false;
+    }
+    if left.part_index == right.part_index {
+        return false;
+    }
+    let (Some((left_x, left_y, left_x2, left_y2)), Some((right_x, right_y, right_x2, right_y2))) =
+        (left.last, right.first) else { return false; };
+    let left_height = left_y2 - left_y;
+    let right_height = right_y2 - right_y;
+    if (left_y2 < right_y || right_y2 < left_y) && right_x2 >= left_x
+        && right_x - left_x2 <= left_height.max(right_height) * 0.75 {
+        return true;
+    }
+    let height = left_height.max(right_height);
+    let gap = right_x - left_x2;
+    let overlap = left_y2.min(right_y2) - left_y.max(right_y);
+    let center_shift = ((left_y + left_y2) - (right_y + right_y2)).abs() / 2.0;
+    right_x2 >= left_x && gap <= height * 0.75 && overlap > 0.0
+        && center_shift > height * 0.22
+        && (left_height.min(right_height) < height * 0.85 || center_shift > height * 0.35)
+}
+
+fn compose_boundary_input_text(parts: &[InputTextPart], unicode: &str) -> Result<String, &'static str> {
+    if parts.iter().any(|part| matches!(part, InputTextPart::Character { text, .. } if text.is_empty())) {
+        return Err("empty source character");
+    }
+    let raw = boundary_raw_text(parts);
+    let (raw_visible, mut spaces) = boundary_whitespace_slots(&raw);
+    let original_spaces = spaces.clone();
+    if !unicode.is_empty() {
+        let (unicode_visible, unicode_spaces) = boundary_whitespace_slots(unicode);
+        let raw_characters: Vec<_> = raw_visible.chars().collect();
+        let unicode_characters: Vec<_> = unicode_visible.chars().collect();
+        let matches = raw_characters.len() == unicode_characters.len()
+            && raw_characters.iter().zip(&unicode_characters).all(|(&raw, &unicode)| {
+                raw == unicode || boundary_unicode_script(raw)
+                    && babeldoc_p2_stages::shared::layout_helper::normalize_unicode_nfkc(&raw.to_string()) == unicode.to_string()
+            });
+        if !matches {
+            return Err("source characters disagree with paragraph unicode");
+        }
+        for (raw_space, unicode_space) in spaces.iter_mut().zip(unicode_spaces) {
+            if !unicode_space.is_empty() {
+                *raw_space = unicode_space;
+            }
+        }
+    }
+
+    let mut raw_position = 0;
+    for part in parts {
+        match part {
+            InputTextPart::Character { text, .. } | InputTextPart::Text(text) => {
+                raw_position += boundary_whitespace_slots(text).0.chars().count();
+            }
+            InputTextPart::BoundaryFormula { source, .. } => {
+                let length = boundary_whitespace_slots(source).0.chars().count();
+                let range = raw_position + 1..raw_position + length;
+                if length > 1 && spaces[range.clone()].iter()
+                    .zip(&original_spaces[range]).any(|(merged, original)| merged.is_empty() != original.is_empty()) {
+                    return Err("paragraph whitespace changes formula source");
+                }
+                raw_position += length;
+            }
+            InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_) => {}
+        }
+    }
+
+    let mut atoms = Vec::new();
+    let mut events = Vec::new();
+    let mut position = 0;
+    for (part_index, part) in parts.iter().enumerate() {
+        match part {
+            InputTextPart::BoundaryOpen(text) => events.push(BoundaryEvent::Marker { text, open: true }),
+            InputTextPart::BoundaryClose(text) => events.push(BoundaryEvent::Marker { text, open: false }),
+            InputTextPart::BoundaryFormula { token, source, first, last } => {
+                let end = position + boundary_whitespace_slots(source).0.chars().count();
+                if (end == position && !raw_visible.is_empty()) || source.chars().all(python_whitespace) && !source.is_empty() {
+                    return Err("formula has no visible source characters");
+                }
+                events.push(BoundaryEvent::Atom(atoms.len()));
+                atoms.push(BoundaryAtom {
+                    text: token.clone(), start: position, end, first: *first, last: *last,
+                    part_index, character: None, formula: true,
+                });
+                position = end;
+            }
+            InputTextPart::Character { text, .. } | InputTextPart::Text(text) => {
+                let coords = match part {
+                    InputTextPart::Character { coords, .. } => *coords,
+                    _ => None,
+                };
+                for ch in text.chars().filter(|ch| !python_whitespace(*ch)) {
+                    let ligature = babeldoc_p2_stages::shared::layout_helper::expand_print_ligature(ch);
+                    let expanded = if ligature.is_empty() { ch.to_string() } else { ligature.to_owned() };
+                    let end = position + expanded.chars().count();
+                    if spaces[position + 1..end].iter().any(|space| !space.is_empty()) {
+                        return Err("paragraph whitespace splits a source ligature");
+                    }
+                    events.push(BoundaryEvent::Atom(atoms.len()));
+                    atoms.push(BoundaryAtom {
+                        text: expanded, start: position, end,
+                        first: coords, last: coords, part_index, character: Some(ch), formula: false,
+                    });
+                    position = end;
+                }
+            }
+        }
+    }
+    if atoms.is_empty() || position + 1 != spaces.len() {
+        return Err("source text has no representable characters");
+    }
+
+    for pair in atoms.windows(2) {
+        let (left, right) = (&pair[0], &pair[1]);
+        if !spaces[right.start].is_empty() {
+            continue;
+        }
+        if boundary_unrepresented_script(left, right) {
+            return Err("source contains an unrepresented geometric script");
+        }
+    }
+    use babeldoc_p2_stages::shared::layout_helper::{inferred_word_spaces, SpacingUnit};
+    let spacing_units: Vec<_> = parts.iter().filter_map(|part| match part {
+        InputTextPart::Character { text, coords, font_id, font_size } => Some(SpacingUnit {
+            text, bounds: *coords, font_id: font_id.as_deref(), font_size: *font_size,
+        }),
+        InputTextPart::Text(text) => Some(SpacingUnit { text, bounds: None, font_id: None, font_size: None }),
+        InputTextPart::BoundaryFormula { source, first, last, .. } => Some(SpacingUnit {
+            text: source, bounds: first.zip(*last).map(|(first, last)| (first.0, first.1.min(last.1), last.2, first.3.max(last.3))),
+            font_id: None, font_size: None,
+        }),
+        InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_) => None,
+    }).collect();
+    let spacing = inferred_word_spaces(&spacing_units);
+    let mut part_spacing = vec![false; parts.len()];
+    let mut spacing_index = 0;
+    for (index, part) in parts.iter().enumerate() {
+        if !matches!(part, InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_)) {
+            part_spacing[index] = spacing[spacing_index];
+            spacing_index += 1;
+        }
+    }
+    let mut output = String::new();
+    let mut pending = Vec::new();
+    let mut previous: Option<&BoundaryAtom> = None;
+    let mut emitted_slots = vec![false; spaces.len()];
+    for event in events {
+        match event {
+            BoundaryEvent::Marker { text, open } => pending.push((text, open)),
+            BoundaryEvent::Atom(index) => {
+                let atom = &atoms[index];
+                let mut gap = if emitted_slots[atom.start] { String::new() } else { spaces[atom.start].clone() };
+                if gap.is_empty() && !emitted_slots[atom.start] {
+                    if previous.is_some_and(|left| left.part_index != atom.part_index) && part_spacing[atom.part_index] {
+                        gap.push(' ');
+                    }
+                }
+                let marker_count = pending.len();
+                let insertion = pending.iter().position(|(_, open)| *open).unwrap_or(marker_count);
+                for (index, (marker, _)) in pending.drain(..).enumerate() {
+                    if index == insertion { output.push_str(&gap); }
+                    output.push_str(marker);
+                }
+                if insertion == marker_count {
+                    output.push_str(&gap);
+                }
+                emitted_slots[atom.start] = true;
+                output.push_str(&atom.text);
+                previous = Some(atom);
+            }
+        }
+    }
+    for (marker, _) in pending {
+        output.push_str(marker);
+    }
+    if !emitted_slots[spaces.len() - 1] {
+        output.push_str(spaces.last().expect("initial slot"));
+    }
+    Ok(output)
 }
 
 fn compose_input_text(parts: &[InputTextPart]) -> String {
-    let mut distances = parts
-        .windows(2)
-        .filter_map(|pair| match (&pair[0], &pair[1]) {
-            (
-                InputTextPart::Character {
-                    coords: Some((_, _, first_x2, _)),
-                    ..
-                },
-                InputTextPart::Character {
-                    coords: Some((second_x, _, _, _)),
-                    ..
-                },
-            ) => {
-                let distance = second_x - first_x2;
-                (distance > 1.0).then_some(distance)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    distances.sort_by(f64::total_cmp);
-    distances.dedup_by(|left, right| left == right);
-    let median = match distances.as_slice() {
-        [] => 1.0,
-        [only] => *only,
-        many => many[1],
-    };
+    use babeldoc_p2_stages::shared::layout_helper::{inferred_word_spaces, normalize_source_text, SpacingUnit};
+    let units: Vec<_> = parts.iter().filter_map(|part| match part {
+        InputTextPart::Character { text, coords, font_id, font_size } => Some(SpacingUnit {
+            text, bounds: *coords, font_id: font_id.as_deref(), font_size: *font_size,
+        }),
+        InputTextPart::Text(text) => Some(SpacingUnit { text, bounds: None, font_id: None, font_size: None }),
+        InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_) => None,
+        InputTextPart::BoundaryFormula { .. } => unreachable!("boundary-only input part"),
+    }).collect();
+    let spaces = inferred_word_spaces(&units);
     let mut output = String::new();
-    for (index, part) in parts.iter().enumerate() {
+    let mut pending_markers = String::new();
+    let mut index = 0;
+    for part in parts {
+        if let InputTextPart::BoundaryOpen(marker) | InputTextPart::BoundaryClose(marker) = part {
+            pending_markers.push_str(marker);
+            continue;
+        }
+        if spaces[index] { output.push(' '); }
+        output.push_str(&pending_markers);
+        pending_markers.clear();
+        index += 1;
         match part {
             InputTextPart::Text(text) => output.push_str(text),
-            InputTextPart::Character { text, coords } => {
-                output.push_str(&normalize_character_text(text));
-                if text == " " {
-                    continue;
-                }
-                if let (
-                    Some((x, y, x2, y2)),
-                    Some(InputTextPart::Character {
-                        coords: Some((next_x, next_y, next_x2, next_y2)),
-                        ..
-                    }),
-                ) = (coords, parts.get(index + 1))
-                {
-                    let distance = next_x - x2;
-                    let char_height = (y2 - y).max(next_y2 - next_y);
-                    let char_width = (x2 - x).max(next_x2 - next_x);
-                    let newline = *next_y2 < *y || *next_x2 < *x - char_width * 10.0;
-                    let _ = char_height;
-                    if distance >= median || newline {
-                        output.push(' ');
-                    }
-                }
-            }
+            InputTextPart::Character { text, .. } => output.push_str(text),
+            InputTextPart::BoundaryOpen(_) | InputTextPart::BoundaryClose(_)
+            | InputTextPart::BoundaryFormula { .. } => unreachable!("boundary-only input part"),
         }
     }
-    let normalized = babeldoc_p2_stages::shared::layout_helper::normalize_unicode_nfkc(&output);
-    let mut collapsed = String::new();
-    let mut in_space = false;
-    for ch in normalized.chars() {
-        if python_whitespace(ch) {
-            if !in_space {
-                collapsed.push(' ');
-            }
-            in_space = true;
-        } else {
-            collapsed.push(ch);
-            in_space = false;
-        }
-    }
+    output.push_str(&pending_markers);
+    let collapsed = normalize_source_text(&output);
     babeldoc_p2_stages::translation::python_semantics::python_strip(&collapsed).to_owned()
 }
 
@@ -1608,16 +2294,6 @@ pub fn process(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<()> {
-    let cross_page_experiment = config
-        .getattr("experimental_cross_page_context")
-        .ok()
-        .and_then(|value| value.extract::<bool>().ok())
-        .unwrap_or(false);
-    if cross_page_experiment {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Experimental cross-page translation requires an LLM translator; ordinary translators are not supported.",
-        ));
-    }
     let _native_font_mapper = &mapper.mapper;
     let root = crate::shared_context::root_from_handle(shared_context)?;
     let translator = translator_service.bind(py).clone();
@@ -1658,11 +2334,7 @@ pub fn process(
         false,
         mapper,
     )?;
-    let candidates = if cross_page_experiment {
-        crate::cross_page::find_pairs(document, config).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let candidates: Vec<((usize, usize), (usize, usize))> = Vec::new();
     let cross_page_ids = if candidates.is_empty() {
         None
     } else {

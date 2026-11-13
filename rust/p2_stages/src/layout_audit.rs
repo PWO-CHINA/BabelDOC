@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use babeldoc_ir_core::{self as ir, Document, ReadOnlyView, TreeView};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bounds {
@@ -19,7 +20,7 @@ impl Bounds {
             && self.right >= other.right && self.top >= other.top
     }
 
-    fn overlaps(self, other: Self) -> bool {
+    pub fn overlaps(self, other: Self) -> bool {
         self.left < other.right && other.left < self.right
             && self.bottom < other.top && other.bottom < self.top
     }
@@ -43,6 +44,118 @@ pub struct Formula {
 pub struct NeighborEvidence {
     pub complete: bool,
     pub bounds: Vec<Option<Bounds>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObstacleKind { Paragraph, Character, Figure, Rectangle, Curve, Form }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedObstacle {
+    pub kind: ObstacleKind,
+    pub index: usize,
+    pub bounds: Option<Bounds>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObstacleUncertainty {
+    MissingOrInvalidCropBox,
+    MissingTarget,
+    MissingOrInvalidTargetBox,
+    TargetOutsideCropBox,
+    MissingOrInvalidObstacleBox { kind: ObstacleKind, index: usize },
+    CoordinateSpaceAndPaintExtentUnverified,
+    PageAndXobjectOperationsUnexamined,
+    GraphicStateAndClippingUnexamined,
+    IrCollectionCompletenessUnproven,
+}
+
+#[derive(Clone, Debug)]
+pub struct PageObstacleReport {
+    pub page_identity: u64,
+    pub target_identity: Option<u64>,
+    pub target_xobject: Option<i64>,
+    pub crop_box: Option<Bounds>,
+    pub target_box: Option<Bounds>,
+    pub obstacles: Vec<ObservedObstacle>,
+    pub uncertainties: Vec<ObstacleUncertainty>,
+}
+
+impl PageObstacleReport {
+    pub fn neighbor_evidence(&self) -> NeighborEvidence {
+        NeighborEvidence { complete: self.uncertainties.is_empty(), bounds: self.obstacles.iter().map(|item| item.bounds).collect() }
+    }
+
+    pub fn matches_fork_target(&self, candidate: &Self) -> bool {
+        self.page_identity == candidate.page_identity
+            && self.target_identity.is_some()
+            && self.target_identity == candidate.target_identity
+            && self.target_xobject == candidate.target_xobject
+            && self.crop_box.is_some()
+            && self.crop_box == candidate.crop_box
+            && self.target_box.is_some()
+            && self.target_box == candidate.target_box
+    }
+}
+
+fn ir_bounds(value: Option<ir::Cursor<ir::types::Box>>, view: &TreeView<'_, ReadOnlyView>) -> Result<Option<Bounds>, ir::AccessError> {
+    let Some(value) = value else { return Ok(None) };
+    let (Some(left), Some(bottom), Some(right), Some(top)) =
+        (value.x(view)?, value.y(view)?, value.x2(view)?, value.y2(view)?) else { return Ok(None) };
+    let bounds = Bounds { left, bottom, right, top };
+    Ok(bounds.valid().then_some(bounds))
+}
+
+/// Collects inspectable IR boxes, but does not establish a complete paint or clip map.
+/// Call on the original document before target replacement; a report is never a safety proof.
+pub fn inspect_page_obstacles(document: &mut Document, page_index: usize, target_index: usize) -> Result<PageObstacleReport, ir::AccessError> {
+    let view = document.view::<ReadOnlyView>();
+    let page = view.document().page_at(&view, page_index)?;
+    let crop_box = match page.cropbox(&view)? {
+        Some(crop) => ir_bounds(crop.r#box(&view)?, &view)?,
+        None => None,
+    };
+    let mut report = PageObstacleReport {
+        page_identity: page.identity(), target_identity: None, target_xobject: None,
+        crop_box, target_box: None, obstacles: Vec::new(),
+        uncertainties: vec![ObstacleUncertainty::CoordinateSpaceAndPaintExtentUnverified,
+            ObstacleUncertainty::PageAndXobjectOperationsUnexamined,
+            ObstacleUncertainty::GraphicStateAndClippingUnexamined,
+            ObstacleUncertainty::IrCollectionCompletenessUnproven],
+    };
+    if crop_box.is_none() { report.uncertainties.push(ObstacleUncertainty::MissingOrInvalidCropBox); }
+    let mut target_found = false;
+    macro_rules! collect {
+        ($iter:expr, $kind:expr) => {
+            for (index, item) in $iter?.enumerate() {
+                let item = item?;
+                let bounds = ir_bounds(item.r#box(&view)?, &view)?;
+                if bounds.is_none() { report.uncertainties.push(ObstacleUncertainty::MissingOrInvalidObstacleBox { kind: $kind, index }); }
+                report.obstacles.push(ObservedObstacle { kind: $kind, index, bounds });
+            }
+        };
+    }
+    for (index, paragraph) in page.pdf_paragraph_iter(&view)?.enumerate() {
+        let paragraph = paragraph?;
+        let bounds = ir_bounds(paragraph.r#box(&view)?, &view)?;
+        if index == target_index {
+            target_found = true;
+            report.target_identity = Some(paragraph.identity());
+            report.target_xobject = paragraph.xobj_id(&view)?;
+            report.target_box = bounds;
+            if bounds.is_none() { report.uncertainties.push(ObstacleUncertainty::MissingOrInvalidTargetBox); }
+            if crop_box.zip(bounds).is_some_and(|(crop, target)| !crop.contains(target)) { report.uncertainties.push(ObstacleUncertainty::TargetOutsideCropBox); }
+        } else {
+            if bounds.is_none() { report.uncertainties.push(ObstacleUncertainty::MissingOrInvalidObstacleBox { kind: ObstacleKind::Paragraph, index }); }
+            report.obstacles.push(ObservedObstacle { kind: ObstacleKind::Paragraph, index, bounds });
+        }
+    }
+    if !target_found { report.uncertainties.push(ObstacleUncertainty::MissingTarget); }
+    collect!(page.pdf_character_iter(&view), ObstacleKind::Character);
+    collect!(page.pdf_figure_iter(&view), ObstacleKind::Figure);
+    collect!(page.pdf_rectangle_iter(&view), ObstacleKind::Rectangle);
+    collect!(page.pdf_curve_iter(&view), ObstacleKind::Curve);
+    collect!(page.pdf_form_iter(&view), ObstacleKind::Form);
+    Ok(report)
 }
 
 #[derive(Clone, Debug)]

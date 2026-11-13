@@ -23,6 +23,61 @@ use std::{
     time::Duration,
 };
 
+fn recoverable_python_error(error: &PyErr) -> bool {
+    Python::attach(|py| {
+        if !error.is_instance_of::<pyo3::exceptions::PyException>(py) {
+            return false;
+        }
+        for module in ["asyncio", "concurrent.futures"] {
+            if let Ok(class) = py.import(module).and_then(|module| module.getattr("CancelledError")) {
+                if error.is_instance(py, &class) {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
+pub fn optional_extraction_result(result: PyResult<()>, flag: &CancelFlag) -> PyResult<()> {
+    flag.checkpoint()?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if recoverable_python_error(&error) => {
+            log::warn!("Automatic term extraction failed: {error}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[pyclass]
+struct TermDispatcher {
+    inner: Py<PyAny>,
+}
+
+#[pymethods]
+impl TermDispatcher {
+    fn submit(
+        &self,
+        py: Python<'_>,
+        method: Bound<'_, PyAny>,
+        args: Bound<'_, PyAny>,
+        kwargs: Bound<'_, PyAny>,
+        completion: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if let Err(error) = self.inner.bind(py).call_method1(
+            "submit",
+            (method, args, kwargs, &completion),
+        ) {
+            let future = py.import("concurrent.futures")?.getattr("Future")?.call0()?;
+            future.call_method1("set_exception", (error.value(py),))?;
+            completion.call1((future,))?;
+        }
+        Ok(())
+    }
+}
+
 fn ir_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
@@ -102,6 +157,7 @@ fn paragraph_facts(
     Ok(TermParagraphFacts {
         debug_id: debug_id.clone(),
         unicode: unicode.clone(),
+        layout_label: paragraph.layout_label(view)?.clone(),
         cid,
         pure_numeric,
         placeholder_only,
@@ -180,6 +236,22 @@ pub fn process(
     flag: CancelFlag,
     monitor: Py<PyAny>,
 ) -> PyResult<()> {
+    let result = process_inner(
+        py, document, config, shared_context, dispatcher, translator_service, flag.clone(), monitor,
+    );
+    optional_extraction_result(result, &flag)
+}
+
+fn process_inner(
+    py: Python<'_>,
+    document: &mut Document,
+    config: &Bound<'_, PyAny>,
+    shared_context: &Bound<'_, PyAny>,
+    dispatcher: Py<PyAny>,
+    translator_service: Py<PyAny>,
+    flag: CancelFlag,
+    monitor: Py<PyAny>,
+) -> PyResult<()> {
     let pages = document_pages(document).map_err(ir_error)?;
     let root = crate::shared_context::root_from_handle(shared_context)?;
     let lang_out = config.getattr("lang_out")?.extract::<String>()?;
@@ -187,17 +259,33 @@ pub fn process(
         .getattr("term_pool_max_workers")?
         .extract::<usize>()?
         .max(1);
-    let paths = [
-        output_path(config, "term_extractor_tracking.json")?,
-        output_path(config, "term_extractor_freq.json")?,
-        output_path(config, "auto_extractor_glossary.csv")?,
-    ];
-    let start = usage_counters(translator_service.bind(py))?;
+    let paths = match (|| -> PyResult<_> {
+        Ok([
+            output_path(config, "term_extractor_tracking.json")?,
+            output_path(config, "term_extractor_freq.json")?,
+            output_path(config, "auto_extractor_glossary.csv")?,
+        ])
+    })() {
+        Ok(paths) => paths,
+        Err(error) if recoverable_python_error(&error) => {
+            log::warn!("Automatic term extraction output paths are unavailable: {error}");
+            [None, None, None]
+        }
+        Err(error) => return Err(error),
+    };
+    let start = match usage_counters(translator_service.bind(py)) {
+        Ok(counters) => Some(counters),
+        Err(error) if recoverable_python_error(&error) => {
+            log::warn!("Automatic term extraction usage counters are unavailable: {error}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let glossaries = root.user_glossaries();
     let translator = translator_service.clone_ref(py);
     let recorder = Recorder::for_dispatcher(py, dispatcher.bind(py));
     let service = PythonService {
-        dispatcher,
+        dispatcher: Py::new(py, TermDispatcher { inner: dispatcher })?.into_any(),
         recorder,
     };
     callbacks::run(py, workers, move |runtime, progress_run| {
@@ -294,17 +382,22 @@ pub fn process(
                         let response = match response {
                             Ok(Some(response)) => response,
                             Ok(None) => return Ok::<(), PyErr>(()),
-                            Err(CallbackError::Python(_)) => {
+                            Err(CallbackError::Python(error)) => {
+                                if !recoverable_python_error(&error) {
+                                    return Err(error);
+                                }
+                                log::warn!("Automatic term extraction request failed: {error}");
                                 progress
                                     .report(batch.paragraphs.len() as u64, None)
                                     .map_err(|error| error.into_python())?;
                                 return Ok::<(), PyErr>(());
                             }
                             Err(CallbackError::Bridge(error)) => {
+                                log::warn!("Automatic term extraction request could not be dispatched: {error}");
                                 progress
                                     .report(batch.paragraphs.len() as u64, None)
                                     .map_err(|error| error.into_python())?;
-                                return Err(PyRuntimeError::new_err(error));
+                                return Ok::<(), PyErr>(());
                             }
                         };
                         let parsed = Python::attach(
@@ -314,9 +407,18 @@ pub fn process(
                                 let value = response.bind(py);
                                 let stored = python_output_value(py, value)?;
                                 let text = value.extract::<String>().ok();
-                                let terms = text
-                                    .as_deref()
-                                    .and_then(|text| stage::parse_terms(text).ok());
+                                let terms = text.as_deref().and_then(|text| {
+                                    match stage::parse_terms(text) {
+                                        Ok(terms) => Some(terms),
+                                        Err(error) => {
+                                            log::warn!("Automatic term extraction returned invalid JSON: {error}");
+                                            None
+                                        }
+                                    }
+                                });
+                                if text.is_none() {
+                                    log::warn!("Automatic term extraction returned a non-text response");
+                                }
                                 Ok(Some((stored, terms)))
                             },
                         );
@@ -327,17 +429,21 @@ pub fn process(
                                 output,
                             );
                             if let Some(terms) = terms {
-                                for (source, target) in terms {
+                                for term in stage::sourced_terms(&batch, terms) {
                                     request_pool
                                         .shared_context()
-                                        .add_raw_extracted_term_pair(source, target);
+                                        .add_scoped_extracted_term(term.source, term.target, term.contexts);
                                 }
                             }
                         } else if let Err(error) = parsed {
+                            if !recoverable_python_error(&error) {
+                                return Err(error);
+                            }
+                            log::warn!("Automatic term extraction response could not be recorded: {error}");
                             progress
                                 .report(batch.paragraphs.len() as u64, None)
                                 .map_err(|e| e.into_python())?;
-                            return Err(error);
+                            return Ok::<(), PyErr>(());
                         }
                         progress
                             .report(batch.paragraphs.len() as u64, None)
@@ -366,6 +472,9 @@ pub fn process(
                     }
                 };
             }
+            if flag.is_cancelled() {
+                return flag.checkpoint();
+            }
             if let Some(error) = task_error.or(page_error) {
                 let tracking_json = tracking
                     .lock()
@@ -387,28 +496,42 @@ pub fn process(
         }
         progress.end(None).map_err(ProgressError::into_python)?;
 
-        root.finalize_auto_extracted_glossary()
-            .map_err(PyRuntimeError::new_err)?;
-        let end = Python::attach(|py| usage_counters(translator.bind(py)))?;
-        let deltas = std::array::from_fn::<_, 4, _>(|index| end[index] - start[index]);
-        Python::attach(|py| {
-            translator.bind(py).call_method1(
-                "record_term_extraction_usage",
-                (deltas[0], deltas[1], deltas[2], deltas[3]),
-            )?;
-            Ok::<(), PyErr>(())
-        })?;
+        flag.checkpoint()?;
+        if let Err(error) = root.finalize_auto_extracted_glossary() {
+            log::warn!("Automatic terminology could not be finalized: {error}");
+        }
+        if let Some(start) = start {
+            let usage_result = Python::attach(|py| {
+                let end = usage_counters(translator.bind(py))?;
+                let deltas = std::array::from_fn::<_, 4, _>(|index| end[index] - start[index]);
+                translator.bind(py).call_method1(
+                    "record_term_extraction_usage",
+                    (deltas[0], deltas[1], deltas[2], deltas[3]),
+                )?;
+                Ok::<(), PyErr>(())
+            });
+            if let Err(error) = usage_result {
+                if !recoverable_python_error(&error) {
+                    return Err(error);
+                }
+                log::warn!("Automatic term extraction usage could not be recorded: {error}");
+            }
+        }
 
         let tracking_json = tracking
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .to_json();
         if let Some(path) = &paths[0] {
-            write_output(path, tracking_json.as_bytes())?;
+            if let Err(error) = write_output(path, tracking_json.as_bytes()) {
+                log::warn!("Automatic term extraction tracking could not be saved: {error}");
+            }
         }
         let raw_terms = root.raw_extracted_terms();
         if let Some(path) = &paths[1] {
-            write_output(path, stage::frequency_json(&raw_terms).as_bytes())?;
+            if let Err(error) = write_output(path, stage::frequency_json(&raw_terms).as_bytes()) {
+                log::warn!("Automatic term extraction frequencies could not be saved: {error}");
+            }
         }
         let csv = root
             .auto_extracted_glossary()
@@ -419,8 +542,11 @@ pub fn process(
                 bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
                 bytes.extend_from_slice(csv.as_bytes());
             }
-            write_output(path, &bytes)?;
+            if let Err(error) = write_output(path, &bytes) {
+                log::warn!("Automatic term extraction glossary could not be saved: {error}");
+            }
         }
+        flag.checkpoint()?;
         Ok(())
     })
 }

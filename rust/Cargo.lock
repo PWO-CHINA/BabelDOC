@@ -101,6 +101,7 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "zstd",
 ]
@@ -130,6 +131,7 @@ dependencies = [
  "babeldoc-il-types",
  "babeldoc-ir-core",
  "babeldoc-writer-core",
+ "flate2",
  "freetype-rs",
  "libz-sys",
  "log",
@@ -137,6 +139,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha2",
  "tiktoken-rs",
  "zstd",
 ]

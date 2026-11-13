@@ -732,6 +732,12 @@ class PdfCharacter:
             "type": "Attribute",
         },
     )
+    synthetic_spacing: bool | None = field(
+        default=None,
+        metadata={
+            "type": "Attribute",
+        },
+    )
 
 
 @dataclass(slots=True)

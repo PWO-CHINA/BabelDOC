@@ -4,3 +4,9 @@
 /rust/p2_stages/tests/cross_page.rs
 /rust/p2_stages/tests/cross_page_whole_sentence.rs
 /rust/p2_bridge/tests/test_cross_page_llm_direct_atomicity.py
+# Exact mixed-language spacing, punctuation, numbers and source-path fixtures.
+/rust/p2_bridge/tests/test_boundary_item_recovery.py
+/rust/p2_bridge/tests/test_cross_boundary_integration.py
+/rust/p2_stages/tests/baseline_glossary_scope.rs
+/rust/p2_stages/tests/cross_boundary_document.rs
+/rust/p2_stages/tests/cross_boundary.rs

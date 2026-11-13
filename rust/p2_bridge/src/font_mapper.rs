@@ -1,19 +1,30 @@
 //! Read-only Python handle to the existing, immutable Rust asset mapper.
 use babeldoc_p2_stages::font_mapper::{
-    FontError, FontMapper, FontMapperAssetsError, font_mapper_from_asset_paths,
+    FontError, FontMapper, FontMapperAssetsError, SourceFontStyle, font_mapper_from_asset_paths,
     font_mapper_with_source_styles_from_verified_asset_paths,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[pyclass(frozen, module = "babeldoc._rust_il")]
 pub struct FontMapperHandle {
     pub mapper: Arc<FontMapper>,
+    source_styles: Option<HashMap<String, SourceFontStyle>>,
 }
 impl FontMapperHandle {
     pub fn from_shared(mapper: Arc<FontMapper>) -> Self {
-        Self { mapper }
+        Self {
+            mapper,
+            source_styles: None,
+        }
+    }
+
+    /// Returns the complete styles from the verified production constructor,
+    /// or None when this handle was constructed without that metadata.
+    pub fn source_styles(&self) -> Option<&HashMap<String, SourceFontStyle>> {
+        self.source_styles.as_ref()
     }
 }
 #[pymethods]
@@ -118,7 +129,7 @@ pub fn font_mapper_handle_with_source_styles(
     .map_err(map_verified_assets_error)?;
 
     let styles = PyDict::new(py);
-    for (font_id, style) in assets.source_styles {
+    for (font_id, style) in &assets.source_styles {
         let item = PyDict::new(py);
         item.set_item("bold", style.bold)?;
         item.set_item("italic", style.italic)?;
@@ -127,7 +138,10 @@ pub fn font_mapper_handle_with_source_styles(
         styles.set_item(font_id, item)?;
     }
     Ok((
-        FontMapperHandle::from_shared(assets.mapper),
+        FontMapperHandle {
+            mapper: assets.mapper,
+            source_styles: Some(assets.source_styles.into_iter().collect()),
+        },
         styles.unbind(),
     ))
 }

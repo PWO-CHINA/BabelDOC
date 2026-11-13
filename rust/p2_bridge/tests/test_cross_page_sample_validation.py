@@ -13,7 +13,9 @@ from test_cross_page_llm_direct_atomicity import TRANSLATED_SENTENCE
 from test_cross_page_llm_direct_atomicity import DirectApplicationService
 from test_cross_page_llm_direct_atomicity import DirectTranslator
 from test_cross_page_llm_direct_atomicity import Monitor
+from test_cross_page_llm_direct_atomicity import formula_texts
 from test_cross_page_llm_direct_atomicity import make_direct_document
+from test_cross_page_llm_direct_atomicity import report_of
 from test_cross_page_llm_direct_atomicity import run_bridge
 
 
@@ -31,6 +33,15 @@ def paragraph(text, box, *, label="text", size=10.0):
             )
         ],
     )
+
+
+def graphic_instructions(value):
+    if isinstance(value, dict):
+        result = {value["passthrough_per_char_instruction"]} if value.get("passthrough_per_char_instruction") else set()
+        return result | set().union(*(graphic_instructions(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(graphic_instructions(item) for item in value))
+    return set()
 
 
 def document_with_caption(
@@ -89,8 +100,10 @@ def document_with_caption(
     return _rust_il.transfer_document(il.Document(page=pages, total_pages=2))
 
 
-def run(document, tmp_path):
+def run(document, tmp_path, *, left_tail=LEFT_TAIL, continuation="several independent experiments."):
     service = DirectApplicationService()
+    service.translator.left_tail = left_tail
+    service.translator.continuation = continuation
     run_bridge(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     return service.translator
 
@@ -101,9 +114,9 @@ def test_complete_input_and_original_page_writeback(tmp_path):
     translator = run(document, tmp_path)
     assert translator.cross_page_requests == 1
     assert translator.fallback_requests == 0
-    prompt = next(value for value in translator.requests if "## Cross-page continuation" in value)
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    assert any(LEFT_TAIL + " several independent experiments." in item["input"] for item in items)
+    items = translator.translation_items[0]
+    assert any(LEFT_TAIL + " several independent experiments." in re.sub(r"\[\[BABEL_[^\]]+\]\]", "", item["text"])
+               for item in items)
 
     after = json.loads(document.parser_artifact_json())["document"]["page"]
     left, right = [page["pdf_paragraph"][0] for page in after]
@@ -113,8 +126,9 @@ def test_complete_input_and_original_page_writeback(tmp_path):
     ]
     assert TRANSLATED_PREFIX in left["unicode"] and TRANSLATED_PREFIX not in right["unicode"]
     assert TRANSLATED_FOLLOWING in right["unicode"] and TRANSLATED_FOLLOWING not in left["unicode"]
-    visible = re.sub(r"\{v\d+\}|</?b\d+>", "", left["unicode"] + right["unicode"])
-    assert visible == TRANSLATED_PREFIX + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING
+    visible = re.sub(r"\{v\d+\}|</?b\d+>|\s+", "", left["unicode"] + right["unicode"])
+    assert visible == TRANSLATED_PREFIX + "x" + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING + "y"
+    assert [formula_texts(page) for page in after] == [["x"], ["y"]]
     assert all(
         any(part.get("pdf_formula") for part in paragraph["pdf_paragraph_composition"])
         for paragraph in (left, right)
@@ -134,7 +148,8 @@ def test_proper_name_after_preposition_is_a_continuation(tmp_path):
         left_text="Earlier findings were clear. The cohort included participants from",
         right_text="California and neighboring regions. Additional observations follow.",
     )
-    translator = run(document, tmp_path)
+    translator = run(document, tmp_path, left_tail="The cohort included participants from",
+                     continuation="California and neighboring regions.")
     assert translator.requests
     assert translator.cross_page_requests == 1
 
@@ -175,8 +190,9 @@ def test_mixed_style_boundary_keeps_sentences_and_pages(tmp_path):
     after = json.loads(document.parser_artifact_json())["document"]["page"]
     left, right = [page["pdf_paragraph"][0] for page in after]
     assert TRANSLATED_PREFIX in left["unicode"] and TRANSLATED_FOLLOWING in right["unicode"]
-    visible = re.sub(r"\{v\d+\}|</?b\d+>", "", left["unicode"] + right["unicode"])
-    assert visible == TRANSLATED_PREFIX + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING
+    visible = re.sub(r"\{v\d+\}|</?b\d+>|\s+", "", left["unicode"] + right["unicode"])
+    assert visible == TRANSLATED_PREFIX + "x" + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING + "y"
+    assert [formula_texts(page) for page in after] == [["x"], ["y"]]
 
 
 def test_isolated_continuation_is_translated_as_one_input(tmp_path):
@@ -186,23 +202,21 @@ def test_isolated_continuation_is_translated_as_one_input(tmp_path):
     )
     translator = run(document, tmp_path)
     assert translator.cross_page_requests == 1
-    prompt = next(value for value in translator.requests if "## Cross-page continuation" in value)
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    assert any(LEFT_TAIL + " several independent experiments." in item["input"] for item in items)
+    items = translator.translation_items[0]
+    assert any(LEFT_TAIL + " several independent experiments." in item["text"] for item in items)
 
     pages = json.loads(document.parser_artifact_json())["document"]["page"]
     left = pages[0]["pdf_paragraph"][-1]["unicode"]
     right = pages[1]["pdf_paragraph"][0]["unicode"]
-    visible = re.sub(r"\{v\d+\}|</?b\d+>", "", left + right)
+    visible = re.sub(r"\{v\d+\}|</?b\d+>|\s+", "", left + right)
     assert visible == TRANSLATED_PREFIX + TRANSLATED_SENTENCE
 
 
 def test_following_sentence_is_separate_and_stays_on_its_page(tmp_path):
     document = document_with_caption(caption_label="text", caption_size=10, obstacle=False)
     translator = run(document, tmp_path)
-    prompt = next(value for value in translator.requests if "## Cross-page continuation" in value)
-    items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-    inputs = [re.sub(r"\{v\d+\}|</?b\d+>", "", item["input"]) for item in items]
+    items = translator.translation_items[0]
+    inputs = [re.sub(r"\[\[BABEL_[^\]]+\]\]|\{v\d+\}|</?b\d+>", "", item["text"]) for item in items]
     continuation = LEFT_TAIL + " several independent experiments."
     following = "Additional observations follow."
     assert any(continuation in value and following not in value for value in inputs)
@@ -213,11 +227,11 @@ def test_following_sentence_is_separate_and_stays_on_its_page(tmp_path):
     right = pages[1]["pdf_paragraph"][0]["unicode"]
     assert TRANSLATED_PREFIX in left and TRANSLATED_PREFIX not in right
     assert TRANSLATED_FOLLOWING in right and TRANSLATED_FOLLOWING not in left
-    visible = re.sub(r"\{v\d+\}|</?b\d+>", "", left + right)
+    visible = re.sub(r"\{v\d+\}|</?b\d+>|\s+", "", left + right)
     assert visible == TRANSLATED_PREFIX + TRANSLATED_SENTENCE + TRANSLATED_FOLLOWING
 
 
-def test_unproven_different_styles_do_not_reflow_across_pages(tmp_path):
+def test_different_styles_preserve_sentence_and_page_ownership(tmp_path):
     control = document_with_caption(caption_label="text", caption_size=10, obstacle=False)
     control_dir = tmp_path / "control"
     control_dir.mkdir()
@@ -232,12 +246,16 @@ def test_unproven_different_styles_do_not_reflow_across_pages(tmp_path):
     styled_dir.mkdir()
     translator = run(styled, styled_dir)
     assert translator.requests
-    assert translator.cross_page_requests == 0
+    assert translator.cross_page_requests == 1
+    assert report_of(styled_dir)["applied_groups"] == 1
     pages = json.loads(styled.parser_artifact_json())["document"]["page"]
     left = pages[0]["pdf_paragraph"][-1]["unicode"]
     right = pages[1]["pdf_paragraph"][0]["unicode"]
     assert TRANSLATED_FOLLOWING not in left
     assert TRANSLATED_FOLLOWING in right
+
+    assert {"0 g", "1 g"} <= graphic_instructions(pages[0]["pdf_paragraph"][-1])
+    assert {"0 g", "1 g"} <= graphic_instructions(pages[1]["pdf_paragraph"][0])
 
 
 @pytest.mark.parametrize("split_at", [None, 1, 2], ids=["same-style", "boundary-before-period", "boundary-after-period"])
@@ -254,24 +272,18 @@ def test_style_boundary_around_continuation_end(tmp_path, split_at):
     }[split_at]
 
     class AmbiguousTranslator(DirectTranslator):
-        def llm_translate(self, prompt, rate_limit_params=None):
-            response = super().llm_translate(prompt, rate_limit_params=rate_limit_params)
-            if "## Cross-page continuation" not in prompt or "## Here is the input:" not in prompt:
-                return response
-            items = json.loads(response)
-            for item in items:
-                item["output"] = item["output"].replace(
-                    "several locations, including", "several locations. Including",
-                )
-            return json.dumps(items)
+        def __init__(self):
+            super().__init__()
+            self.left_tail = left_tail
+            self.continuation = first_style + "that was later revised."
+
+        def enhanced(self, text):
+            return text.replace("several locations, including", "several locations. Including")
 
     def whole_inputs(translator, require_separate_following=False):
         result = []
-        for prompt in translator.requests:
-            if "## Cross-page continuation" not in prompt or "## Here is the input:" not in prompt:
-                continue
-            items = json.loads(prompt.rsplit("## Here is the input:", 1)[1].strip())
-            texts = [re.sub(r"</?b\d+>|\{v\d+\}", "", item["input"]) for item in items]
+        for items in translator.translation_items:
+            texts = [re.sub(r"\[\[BABEL_[^\]]+\]\]|</?b\d+>|\{v\d+\}", "", item["text"]) for item in items]
             for index, text in enumerate(texts):
                 if left_tail in text and first_style.strip() in text:
                     following = "A separate sentence remains here."
@@ -305,25 +317,19 @@ def test_style_boundary_around_continuation_end(tmp_path, split_at):
     mixed_dir.mkdir()
     run_bridge(mixed, mixed_dir, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.requests
-    if split_at == 1:
-        assert service.translator.cross_page_requests == 0
-        assert not whole_inputs(service.translator)
-    else:
-        assert whole_inputs(service.translator, require_separate_following=True)
-        dedicated_index = next(
-            index for index, prompt in enumerate(service.translator.requests)
-            if "## Cross-page continuation" in prompt
-        )
-        assert any(
-            "## Here is the input:" not in prompt
-            for prompt in service.translator.requests[dedicated_index + 1:]
-        )
+    assert service.translator.cross_page_requests == 1
+    assert whole_inputs(service.translator, require_separate_following=True)
     pages = json.loads(mixed.parser_artifact_json())["document"]["page"]
     left_page = " ".join(paragraph["unicode"] for paragraph in pages[0]["pdf_paragraph"])
     right_page = " ".join(paragraph["unicode"] for paragraph in pages[1]["pdf_paragraph"])
     assert "A separate sentence remains here." not in left_page
     assert "A separate sentence remains here." in right_page
-    assert "several locations. Including" not in left_page + right_page
+    expected_styles = {"0 g"} if split_at is None else {"0 g", "1 g"}
+    assert expected_styles <= graphic_instructions(pages[1]["pdf_paragraph"][0])
+    report = report_of(mixed_dir)
+    assert report["baseline_completed"]
+    if report["applied_groups"] == 0:
+        assert "several locations. Including" not in left_page + right_page
 
 
 @pytest.mark.parametrize(

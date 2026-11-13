@@ -4,6 +4,9 @@
 mod codecs;
 mod content;
 mod fonts;
+mod font_binding_evidence;
+mod glyph_ink_evidence;
+mod in_memory_diagnostics;
 mod pdf;
 mod retry;
 pub use retry::{WriteAttempt, write_with_retry};
@@ -11,6 +14,9 @@ pub use retry::{WriteAttempt, write_with_retry};
 pub use codecs::base64 as decode_inline_data;
 pub use content::*;
 pub use fonts::*;
+pub use font_binding_evidence::*;
+pub use glyph_ink_evidence::*;
+pub use in_memory_diagnostics::*;
 pub use lopdf::Document as PdfDocument;
 pub use pdf::*;
 

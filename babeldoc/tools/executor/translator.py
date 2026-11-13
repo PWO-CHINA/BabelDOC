@@ -68,12 +68,18 @@ class ExecutorTranslator(BaseTranslator):
         if text is None:
             return None
 
+        boundary = (rate_limit_params or {}).get("cross_boundary_request", False)
+        flag = (rate_limit_params or {}).get("cancel_flag")
+        if flag is not None:
+            flag.checkpoint()
+
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 2048,
             "messages": [{"role": "user", "content": text}],
         }
+        if not boundary:
+            body["max_tokens"] = 2048
         if rate_limit_params and rate_limit_params.get("request_json_mode"):
             body["response_format"] = {"type": "json_object"}
 
@@ -84,6 +90,8 @@ class ExecutorTranslator(BaseTranslator):
 
         url = f"{self.base_url}/chat/completions"
         response = self._client.post(url, headers=headers, json=body)
+        if flag is not None:
+            flag.checkpoint()
 
         if response.status_code != 200:
             self._raise_for_response(response)
@@ -102,6 +110,11 @@ class ExecutorTranslator(BaseTranslator):
 
         if not isinstance(content, str):
             raise ExecutorTranslatorError(response.status_code, response.text)
+
+        if boundary and (
+            payload["choices"][0].get("finish_reason") != "stop" or not content.strip()
+        ):
+            raise RuntimeError("Cross-boundary executor response was incomplete")
 
         return content.strip()
 

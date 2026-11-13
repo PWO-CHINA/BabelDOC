@@ -76,6 +76,31 @@ fn string_set(value: &Value, name: &str) -> PyResult<Option<BTreeSet<String>>> {
         .map(Some)
 }
 
+pub(crate) fn typesetting_configuration(
+    config: &Value,
+) -> PyResult<(String, bool, HashMap<String, SourceFontStyle>)> {
+    let fields = field(config, "config_fields").unwrap_or(config);
+    let mut styles = HashMap::new();
+    if let Some(values) = field(config, "font_source_styles").and_then(Value::as_object) {
+        for (id, value) in values {
+            let read = |key: &str| {
+                value.get(key).and_then(Value::as_bool).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "missing font source style {id}.{key}"
+                    ))
+                })
+            };
+            styles.insert(id.clone(), SourceFontStyle {
+                bold: read("bold")?, italic: read("italic")?,
+                monospaced: read("monospaced")?, serif: read("serif")?,
+            });
+        }
+    }
+    let lang = field(fields, "lang_out").and_then(Value::as_str)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing lang_out"))?;
+    Ok((lang.to_owned(), bool_field(config, "progress_monitor_present", true), styles))
+}
+
 fn start<'a>(
     progress: &'a ProgressRun,
     monitor: &Py<PyAny>,
@@ -218,7 +243,6 @@ pub fn typesetting(
     monitor: Py<PyAny>,
     cancellation: &CancelFlag,
 ) -> PyResult<()> {
-    let fields = field(config, "config_fields").unwrap_or(config);
     let total = {
         let view = document.view::<babeldoc_ir_core::ReadOnlyView>();
         view.document()
@@ -228,32 +252,8 @@ pub fn typesetting(
     };
     let mut run = ProgressRun::new()?;
     let (progress, mut reporter) = start(&run, &monitor, "Typesetting", total)?;
-    let mut styles = HashMap::new();
-    if let Some(values) = field(config, "font_source_styles").and_then(Value::as_object) {
-        for (id, value) in values {
-            let read = |key: &str| {
-                value.get(key).and_then(Value::as_bool).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "missing font source style {id}.{key}"
-                    ))
-                })
-            };
-            styles.insert(
-                id.clone(),
-                SourceFontStyle {
-                    bold: read("bold")?,
-                    italic: read("italic")?,
-                    monospaced: read("monospaced")?,
-                    serif: read("serif")?,
-                },
-            );
-        }
-    }
-    let lang = field(fields, "lang_out")
-        .and_then(Value::as_str)
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing lang_out"))?;
-    let has_progress = bool_field(config, "progress_monitor_present", true);
-    let stage = Typesetting::new(lang, mapper.mapper.clone(), has_progress, styles);
+    let (lang, has_progress, styles) = typesetting_configuration(config)?;
+    let stage = Typesetting::new(&lang, mapper.mapper.clone(), has_progress, styles);
     let mut context = StageContext::new(cancellation, &mut reporter);
     let result = stage.process(document, &mut context);
     finish_stage(&progress, result)?;

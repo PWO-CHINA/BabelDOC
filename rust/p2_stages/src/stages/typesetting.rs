@@ -14,6 +14,80 @@ const LOG_TARGET: &str = "babeldoc.format.pdf.document_il.midend.typesetting";
 type View<'a> = TreeView<'a, TypesettingView>;
 type P = Cursor<types::PdfParagraph>;
 type Page = Cursor<types::Page>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypesettingFailure {
+    MissingStyle,
+    MissingFontId,
+    MissingSourceFont,
+    AmbiguousFontId,
+    MissingGlyph,
+    MissingParagraphBox,
+    MissingContent,
+    LayoutExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypesettingError {
+    Failure { kind: TypesettingFailure, detail: String },
+    Stage(StageError),
+}
+
+impl std::fmt::Display for TypesettingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failure { detail, .. } => formatter.write_str(detail),
+            Self::Stage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for TypesettingError {}
+
+impl From<StageError> for TypesettingError {
+    fn from(error: StageError) -> Self {
+        if let Some(kind) = typesetting_failure(&error) {
+            Self::Failure { kind, detail: error.to_string() }
+        } else {
+            Self::Stage(error)
+        }
+    }
+}
+
+impl TypesettingFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::MissingStyle => "missing_style",
+            Self::MissingFontId => "missing_font_id",
+            Self::MissingSourceFont => "missing_source_font",
+            Self::AmbiguousFontId => "ambiguous_font_id",
+            Self::MissingGlyph => "missing_glyph",
+            Self::MissingParagraphBox => "missing_paragraph_box",
+            Self::MissingContent => "missing_content",
+            Self::LayoutExhausted => "layout_exhausted",
+        }
+    }
+}
+
+pub fn typesetting_failure(error: &StageError) -> Option<TypesettingFailure> {
+    let StageError::Failed(message) = error else { return None; };
+    let code = message.strip_prefix("typesetting:")?.split(':').next()?;
+    [
+        TypesettingFailure::MissingStyle,
+        TypesettingFailure::MissingFontId,
+        TypesettingFailure::MissingSourceFont,
+        TypesettingFailure::AmbiguousFontId,
+        TypesettingFailure::MissingGlyph,
+        TypesettingFailure::MissingParagraphBox,
+        TypesettingFailure::MissingContent,
+        TypesettingFailure::LayoutExhausted,
+    ].into_iter().find(|kind| kind.code() == code)
+}
+
+fn typesetting_failed(kind: TypesettingFailure, detail: impl std::fmt::Display) -> StageError {
+    StageError::failed(format!("typesetting:{}: {detail}", kind.code()))
+}
+
 fn need<T>(v: Option<T>, s: &str) -> Result<T, StageError> {
     v.ok_or_else(|| StageError::failed(s))
 }
@@ -48,10 +122,12 @@ struct VisualBbox {
 #[derive(Clone, Default)]
 struct PdfCharacter {
     original: Option<Cursor<types::PdfCharacter>>,
+    source_identity: Option<u64>,
     r#box: Option<std::boxed::Box<Box>>,
     visual_bbox: Option<std::boxed::Box<VisualBbox>>,
     pdf_style: Option<std::boxed::Box<PdfStyle>>,
     pdf_character_id: Option<i64>,
+    synthetic_spacing: Option<bool>,
     char_unicode: Option<String>,
     scale: Option<f64>,
     vertical: Option<bool>,
@@ -62,6 +138,7 @@ struct PdfCharacter {
 #[derive(Clone, Default)]
 struct PdfFormula {
     original: Option<Cursor<types::PdfFormula>>,
+    source_identity: Option<u64>,
     r#box: Option<std::boxed::Box<Box>>,
     pdf_character: Vec<PdfCharacter>,
     pdf_curve: Vec<PdfCurve>,
@@ -86,6 +163,18 @@ fn read_character(
     c: Cursor<types::PdfCharacter>,
     v: &mut View<'_>,
 ) -> Result<PdfCharacter, StageError> {
+    let pdf_character_id = c.pdf_character_id(v)?;
+    let synthetic_spacing = c.synthetic_spacing(v)?;
+    let char_unicode = c.char_unicode(v)?.clone();
+    if pdf_character_id.is_none()
+        && !(synthetic_spacing == Some(true)
+            && matches!(char_unicode.as_deref(), Some(" " | "\n")))
+    {
+        return Err(StageError::failed(format!(
+            "typesetting.missing_character_id: object {}",
+            c.identity()
+        )));
+    }
     let style = c
         .pdf_style(v)?
         .map(|s| {
@@ -113,17 +202,20 @@ fn read_character(
             })
             .transpose()?,
         pdf_style: style,
-        pdf_character_id: c.pdf_character_id(v)?,
-        char_unicode: c.char_unicode(v)?.clone(),
+        pdf_character_id,
+        synthetic_spacing,
+        char_unicode,
         scale: c.scale(v)?,
         vertical: c.vertical(v)?,
         advance: c.advance(v)?,
         debug_info: c.debug_info(v)?,
         xobj_id: c.xobj_id(v)?,
         original: Some(c.retain(v)?),
+        source_identity: Some(c.identity()),
     })
 }
 fn read_formula(f: Cursor<types::PdfFormula>, v: &mut View<'_>) -> Result<PdfFormula, StageError> {
+    let original = f.retain(v)?;
     let mut characters = Vec::with_capacity(f.pdf_character_len(v)?);
     for index in 0..f.pdf_character_len(v)? {
         characters.push(read_character(f.pdf_character_at(v, index)?, v)?);
@@ -163,7 +255,8 @@ fn read_formula(f: Cursor<types::PdfFormula>, v: &mut View<'_>) -> Result<PdfFor
         x_offset: f.x_offset(v)?,
         y_offset: f.y_offset(v)?,
         x_advance: f.x_advance(v)?,
-        original: Some(f.retain(v)?),
+        original: Some(original),
+        source_identity: Some(original.identity()),
     })
 }
 fn char_value(
@@ -195,6 +288,7 @@ fn char_value(
             })
             .transpose()?,
         pdf_character_id: c.pdf_character_id,
+        synthetic_spacing: c.synthetic_spacing,
         char_unicode: c.char_unicode,
         scale: c.scale,
         vertical: c.vertical,
@@ -274,6 +368,7 @@ struct TypesettingUnit {
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub scale: Option<f64>,
+    inferred_source_space: bool,
     box_cache: Option<Box>,
     width_cache: Option<f64>,
     height_cache: Option<f64>,
@@ -358,6 +453,7 @@ impl TypesettingUnit {
             x: None,
             y: None,
             scale: None,
+            inferred_source_space: false,
             box_cache: None,
             width_cache: None,
             height_cache: None,
@@ -378,6 +474,58 @@ impl TypesettingUnit {
         } else {
             self.unicode.as_deref()
         }
+    }
+    fn source_word_wrap(left: &PdfCharacter, right: &PdfCharacter) -> bool {
+        let latin = |text: Option<&str>| text.is_some_and(|text| {
+            !text.is_empty() && text.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || ('\u{00c0}'..='\u{024f}').contains(&character)
+                    || ('\u{fb00}'..='\u{fb06}').contains(&character)
+            })
+        });
+        if !latin(left.char_unicode.as_deref()) || !latin(right.char_unicode.as_deref())
+            || left.synthetic_spacing == Some(true) || right.synthetic_spacing == Some(true)
+            || left.vertical.unwrap_or(false) || right.vertical.unwrap_or(false)
+            || left.xobj_id != right.xobj_id
+        {
+            return false;
+        }
+        let (Some(first), Some(second), Some(first_style), Some(second_style)) = (
+            left.r#box.as_deref(), right.r#box.as_deref(), left.pdf_style.as_deref(), right.pdf_style.as_deref(),
+        ) else { return false; };
+        let (Some(first_x), Some(first_y), Some(first_x2), Some(first_y2),
+             Some(second_x), Some(second_y), Some(second_x2), Some(second_y2),
+             Some(size), Some(second_size)) = (
+            first.x, first.y, first.x2, first.y2, second.x, second.y, second.x2, second.y2,
+            first_style.font_size, second_style.font_size,
+        ) else { return false; };
+        let values = [first_x, first_y, first_x2, first_y2, second_x, second_y, second_x2, second_y2, size, second_size];
+        values.iter().all(|value| value.is_finite())
+            && size > 0.0 && second_size > 0.0
+            && first_x2 > first_x && second_x2 > second_x && first_y2 > first_y && second_y2 > second_y
+            && first_style.font_id.is_some() && first_style.font_id == second_style.font_id
+            && (size / second_size - 1.0).abs() <= 0.05
+            && matches!(left.scale, None | Some(1.0)) && matches!(right.scale, None | Some(1.0))
+            && (0.55..=2.5).contains(&((first_y - second_y) / size))
+            && second_y2 <= first_y + size * 0.15
+            && first_x2 - second_x >= size * 2.0
+    }
+    fn source_word_space(left: &PdfCharacter) -> TypesettingUnit {
+        let style = left.pdf_style.clone();
+        let size = style.as_deref().and_then(|style| style.font_size).unwrap_or_default();
+        let mut space = TypesettingUnit::from_character(PdfCharacter {
+            r#box: Some(std::boxed::Box::new(Box {
+                x: Some(0.0), y: Some(0.0), x2: Some(size * 0.25), y2: Some(size),
+            })),
+            pdf_style: style,
+            synthetic_spacing: Some(true),
+            char_unicode: Some(" ".into()),
+            advance: Some(size * 0.25),
+            xobj_id: left.xobj_id,
+            ..Default::default()
+        }, false);
+        space.inferred_source_space = true;
+        space
     }
     fn cached<T: Copy>(cache: &mut Option<T>, value: impl FnOnce() -> T) -> T {
         *cache.get_or_insert_with(value)
@@ -663,6 +811,7 @@ impl TypesettingUnit {
             })?;
             let new = PdfCharacter {
                 pdf_character_id: ch.pdf_character_id,
+                synthetic_spacing: ch.synthetic_spacing,
                 char_unicode: ch.char_unicode.clone(),
                 r#box: Some(std::boxed::Box::new(Box {
                     x: Some(x),
@@ -747,7 +896,9 @@ impl TypesettingUnit {
                     y2: Some(y + (vy - fy + (vy2 - vy) + yo) * scale),
                 };
                 let nc = PdfCharacter {
+                    source_identity: ch.source_identity,
                     pdf_character_id: ch.pdf_character_id,
+                    synthetic_spacing: ch.synthetic_spacing,
                     char_unicode: ch.char_unicode.clone(),
                     r#box: Some(std::boxed::Box::new(relocated_box)),
                     visual_bbox: Some(std::boxed::Box::new(VisualBbox {
@@ -772,6 +923,7 @@ impl TypesettingUnit {
                     .filter_map(|c| c.visual_bbox.as_deref()?.r#box.as_deref()),
             )?;
             let mut nf = PdfFormula {
+                source_identity: f.source_identity,
                 r#box: Some(std::boxed::Box::new(Box {
                     x: Some(minx),
                     y: Some(miny),
@@ -816,6 +968,22 @@ impl TypesettingUnit {
             u.try_resue_cache(self);
             Ok(u)
         }
+    }
+    fn boundary_space(&self, x: f64, y: f64, height: f64) -> TypesettingUnit {
+        let mut space = TypesettingUnit::from_character(PdfCharacter {
+            r#box: Some(std::boxed::Box::new(Box {
+                x: Some(x), y: Some(y), x2: Some(x), y2: Some(y + height),
+            })),
+            pdf_style: self.character.as_ref().and_then(|character| character.pdf_style.clone())
+                .or_else(|| self.style.clone().map(std::boxed::Box::new)),
+            synthetic_spacing: Some(true),
+            char_unicode: Some(" ".into()),
+            advance: Some(0.0),
+            xobj_id: self.xobj_id.or_else(|| self.character.as_ref().and_then(|character| character.xobj_id)),
+            ..Default::default()
+        }, self.debug_info);
+        space.inferred_source_space = self.inferred_source_space;
+        space
     }
     pub fn render(
         &mut self,
@@ -1021,7 +1189,16 @@ pub enum PreviewRejection {
     CaptureFailed,
     MissingGlyph,
     InvalidGlyphEvidence,
+    InvalidSpacingEvidence,
+    GlyphResourceUnavailable,
+    GlyphMismatch,
+    TextEvidenceUnavailable,
+    TextMismatch,
+    MissingOrInvalidTargetBounds,
+    OutsideOriginalTargetBounds,
     FormulaIdentityUnavailable,
+    FormulaIdentityMismatch,
+    InvalidFormulaEvidence,
     ObstacleAndClipEvidenceUnavailable,
 }
 
@@ -1030,21 +1207,141 @@ pub struct PreviewGlyph {
     pub text: Option<String>,
     pub glyph_id: Option<i64>,
     pub font_size: Option<f64>,
+    pub font_id: Option<String>,
+    pub xobj_id: Option<i64>,
     pub bounds: Option<crate::layout_audit::Bounds>,
 }
 
 #[derive(Clone, Debug)]
 pub enum PreviewUnit {
     Glyph(PreviewGlyph),
+    Spacing { bounds: Option<crate::layout_audit::Bounds> },
     Formula { bounds: Option<crate::layout_audit::Bounds> },
     Unknown,
 }
 
 #[derive(Clone, Debug)]
 pub struct TypesettingPreview {
+    pub original_bounds: Option<crate::layout_audit::Bounds>,
     pub glyphs: Vec<PreviewGlyph>,
     pub units: Vec<PreviewUnit>,
+    pub formulas: Vec<PreviewFormula>,
+    pub formula_identities_match: Option<bool>,
     pub rejections: Vec<PreviewRejection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreviewFormula {
+    pub source_identity: Option<u64>,
+    pub character_source_identities: Vec<Option<u64>>,
+    pub bounds: Option<crate::layout_audit::Bounds>,
+    pub character_bounds: Vec<Option<crate::layout_audit::Bounds>>,
+    pub curve_bounds: Vec<Option<crate::layout_audit::Bounds>>,
+    pub form_bounds: Vec<Option<crate::layout_audit::Bounds>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FormulaSignature {
+    source_identity: Option<u64>,
+    characters: Vec<(Option<u64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<u64>, Option<bool>, Option<bool>)>,
+    curves: Vec<u64>,
+    forms: Vec<u64>,
+}
+
+#[derive(Default)]
+struct FormulaCapture {
+    expected: Vec<FormulaSignature>,
+    rendered: Vec<FormulaSignature>,
+    placements: Vec<PreviewFormula>,
+    complete: bool,
+    render_failed: bool,
+    output: Vec<(usize, bool, bool)>,
+}
+
+#[derive(Default)]
+struct RenderedTrial {
+    characters: Vec<PdfCharacter>,
+    curves: Vec<PdfCurve>,
+    forms: Vec<PdfForm>,
+    rendered: Vec<FormulaSignature>,
+    placements: Vec<PreviewFormula>,
+    output: Vec<(usize, bool, bool)>,
+    verification_failed: bool,
+}
+
+fn render_trial(placed: Vec<TypesettingUnit>, capture: bool) -> Result<RenderedTrial, StageError> {
+    let mut trial = RenderedTrial::default();
+    for mut unit in placed {
+        let formula = capture.then(|| unit.formula.as_ref()).flatten()
+            .map(|formula| (formula_signature(formula), formula_placement(formula)));
+        let (characters, curves, forms) = unit.render()?;
+        if capture {
+            trial.output.push((characters.len(), formula.is_some(), unit.inferred_source_space));
+            if let Some((signature, placement)) = formula {
+                let actual = formula_parts_signature(signature.source_identity, &characters, &curves, &forms);
+                trial.verification_failed |= actual != signature;
+                trial.rendered.push(actual);
+                trial.placements.push(placement);
+            }
+        }
+        trial.characters.extend(characters);
+        trial.curves.extend(curves);
+        trial.forms.extend(forms);
+    }
+    Ok(trial)
+}
+
+fn formula_parts_signature(
+    source_identity: Option<u64>, characters: &[PdfCharacter], curves: &[PdfCurve], forms: &[PdfForm],
+) -> FormulaSignature {
+    FormulaSignature {
+        source_identity,
+        characters: characters.iter().map(|character| (
+            character.source_identity,
+            character.pdf_character_id,
+            character.char_unicode.clone(),
+            character.pdf_style.as_ref().and_then(|style| style.font_id.clone()),
+            character.xobj_id,
+            character.pdf_style.as_ref().and_then(|style| style.graphic_state.as_ref().map(Cursor::identity)),
+            character.vertical,
+            character.synthetic_spacing,
+        )).collect(),
+        curves: curves.iter().map(|curve| curve.original.identity()).collect(),
+        forms: forms.iter().map(|form| form.original.identity()).collect(),
+    }
+}
+
+fn formula_signature(formula: &PdfFormula) -> FormulaSignature {
+    formula_parts_signature(formula.source_identity, &formula.pdf_character, &formula.pdf_curve, &formula.pdf_form)
+}
+
+fn preview_bounds_with_spacing(value: Option<&Box>, spacing: bool) -> Option<crate::layout_audit::Bounds> {
+    let value = value?;
+    let bounds = crate::layout_audit::Bounds {
+        left: value.x?, bottom: value.y?, right: value.x2?, top: value.y2?,
+    };
+    ([bounds.left, bounds.bottom, bounds.right, bounds.top].iter().all(|value| value.is_finite())
+        && (bounds.left < bounds.right || spacing && bounds.left == bounds.right)
+        && bounds.bottom < bounds.top).then_some(bounds)
+}
+
+fn preview_bounds(value: Option<&Box>) -> Option<crate::layout_audit::Bounds> {
+    preview_bounds_with_spacing(value, false)
+}
+
+fn formula_placement(formula: &PdfFormula) -> PreviewFormula {
+    PreviewFormula {
+        source_identity: formula.source_identity,
+        character_source_identities: formula.pdf_character.iter().map(|character| character.source_identity).collect(),
+        bounds: preview_bounds(formula.r#box.as_deref()),
+        character_bounds: formula.pdf_character.iter().map(|character| preview_bounds_with_spacing(
+            character.r#box.as_deref(),
+            character.synthetic_spacing == Some(true) && character.pdf_character_id.is_none()
+                && matches!(character.char_unicode.as_deref(), Some(" " | "\n")),
+        )).collect(),
+        curve_bounds: formula.pdf_curve.iter().map(|curve| preview_bounds(curve.r#box.as_deref())).collect(),
+        form_bounds: formula.pdf_form.iter().map(|form| preview_bounds(form.r#box.as_deref())).collect(),
+    }
 }
 
 impl Typesetting {
@@ -1119,51 +1416,59 @@ impl Typesetting {
                         false,
                     ))
                 }
-            } else if comp.pdf_character(v)?.is_some() {
-                return Err(StageError::failed(
-                    "'PdfParagraph' object has no attribute 'debug_info'",
-                ));
+            } else if let Some(character) = comp.pdf_character(v)? {
+                let debug = character.debug_info(v)?.unwrap_or(false);
+                out.push(TypesettingUnit::from_character(read_character(character, v)?, debug));
             } else if let Some(same) = comp.pdf_same_style_characters(v)? {
+                let mut previous: Option<PdfCharacter> = None;
                 for child_index in 0..same.pdf_character_len(v)? {
                     let c = same.pdf_character_at(v, child_index)?;
-                    out.push(TypesettingUnit::from_character(
-                        read_character(c, v)?,
-                        false,
-                    ))
+                    let character = read_character(c, v)?;
+                    if previous.as_ref().is_some_and(|left| TypesettingUnit::source_word_wrap(left, &character)) {
+                        out.push(TypesettingUnit::source_word_space(previous.as_ref().unwrap()));
+                    }
+                    previous = Some(character.clone());
+                    out.push(TypesettingUnit::from_character(character, false));
                 }
             } else if let Some(unis) = comp.pdf_same_style_unicode_characters(v)? {
-                let Some(style) = unis.pdf_style(v)? else {
+                let unicode = unis.unicode(v)?.clone().ok_or_else(|| {
+                    typesetting_failed(TypesettingFailure::MissingContent, format!("composition {child_index} has no unicode"))
+                })?;
+                if unicode.chars().all(|character| character == '\n') {
                     continue;
-                };
-                let Some(id) = style.font_id(v)?.clone() else {
-                    continue;
-                };
-                let asset = xobj
-                    .is_none_or(|id| !fonts.xobjects.contains(&id))
-                    .then(|| self.mapper.font_by_id(&id))
-                    .flatten();
+                }
+                let style = unis.pdf_style(v)?.ok_or_else(|| {
+                    typesetting_failed(TypesettingFailure::MissingStyle, format!("composition {child_index}"))
+                })?;
+                let id = style.font_id(v)?.clone().ok_or_else(|| {
+                    typesetting_failed(TypesettingFailure::MissingFontId, format!("composition {child_index}"))
+                })?;
+                let asset = self.mapper.font_by_id(&id);
+                let source_scope = xobj.filter(|scope| fonts.xobjects.contains(scope));
                 let sf = if let Some(face) = asset {
                     let t = face.traits();
-                    self.font_source_styles
+                    let explicit = self.font_source_styles
                         .get(&id)
                         // `base` aliases a loaded face; its spelling does not
                         // describe the source font's serif/weight flags.
                         .or_else(|| self.font_source_styles.get(face.id()))
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let lower_id = id.to_lowercase();
-                            SourceFontStyle {
-                                bold: t.bold,
-                                italic: t.italic,
-                                monospaced: t.monospaced,
-                                serif: lower_id.contains("serif") && !lower_id.contains("sans"),
-                            }
-                        })
+                        .copied();
+                    let lower_id = face.id().to_lowercase();
+                    let inferred = SourceFontStyle {
+                        bold: t.bold,
+                        italic: t.italic,
+                        monospaced: t.monospaced,
+                        serif: lower_id.contains("serif") && !lower_id.contains("sans"),
+                    };
+                    if explicit.is_none() && fonts.fonts.get(&(source_scope, id.clone())).is_some_and(|source| *source != inferred) {
+                        return Err(typesetting_failed(TypesettingFailure::AmbiguousFontId, format!("font id {id:?}, scope {source_scope:?} has conflicting source and mapper styles")));
+                    }
+                    explicit.unwrap_or(inferred)
                 } else {
                     *fonts
                         .fonts
-                        .get(&(xobj.filter(|id| fonts.xobjects.contains(id)), id.clone()))
-                        .ok_or_else(|| StageError::failed(format!("font id {id:?} not found")))?
+                        .get(&(source_scope, id.clone()))
+                        .ok_or_else(|| typesetting_failed(TypesettingFailure::MissingSourceFont, format!("font id {id:?}, scope {xobj:?}")))?
                 };
                 let size = style.font_size(v)?.unwrap_or_default();
                 if size == 0. {
@@ -1176,28 +1481,31 @@ impl Typesetting {
                     font_size: Some(size),
                     graphic_state: style.graphic_state(v)?.map(|g| g.retain(v)).transpose()?,
                 };
-                for ch in unis
-                    .unicode(v)?
-                    .as_deref()
-                    .unwrap_or_default()
-                    .chars()
-                    .filter(|c| *c != '\n')
-                {
-                    if let Some(font) = self.mapper.map(sf, ch) {
-                        out.push(TypesettingUnit::from_unicode(
-                            ch.to_string(),
-                            font,
-                            None,
-                            size,
-                            cached.clone(),
-                            xobj,
-                            unis.debug_info(v)?.unwrap_or(false),
-                        ))
-                    }
+                for ch in unicode.chars().filter(|c| *c != '\n') {
+                    let font = self.mapper.map(sf, ch).ok_or_else(|| {
+                        typesetting_failed(TypesettingFailure::MissingGlyph, format!("U+{:04X}, source font {:?}", ch as u32, cached.font_id))
+                    })?;
+                    out.push(TypesettingUnit::from_unicode(
+                        ch.to_string(),
+                        font,
+                        None,
+                        size,
+                        cached.clone(),
+                        xobj,
+                        unis.debug_info(v)?.unwrap_or(false),
+                    ));
                 }
             } else if let Some(f) = comp.pdf_formula(v)? {
                 out.push(TypesettingUnit::from_formula(read_formula(f, v)?))
             }
+        }
+        if out.is_empty() && p.unicode(v)?.as_deref().is_some_and(|text| text.chars().any(|character| !character.is_whitespace())) {
+            return Err(typesetting_failed(TypesettingFailure::MissingContent, "nonempty paragraph has no typesetting units"));
+        }
+        if out.iter().all(TypesettingUnit::calc_can_passthrough) {
+            out.retain(|unit| unit.character.as_ref().is_none_or(|character| {
+                character.original.is_some() || character.synthetic_spacing != Some(true)
+            }));
         }
         Ok(out)
     }
@@ -1259,6 +1567,34 @@ impl Typesetting {
             let w = units[i].width()? * scale;
             let h = units[i].height()? * scale;
             if x == bx && units[i].is_space() {
+                out.push(units[i].boundary_space(x, y, h));
+                continue;
+            }
+            if units[i].character.as_ref().is_some_and(|character| {
+                character.synthetic_spacing == Some(true)
+                    && character.pdf_character_id.is_none() && character.char_unicode.as_deref() == Some(" ")
+                    && (character.original.is_none() || w == 0.0)
+            }) {
+                let w = if w == 0.0 {
+                    units[i].character.as_ref().and_then(|character| character.pdf_style.as_deref())
+                        .and_then(|style| style.font_size).unwrap_or_default() * 0.25 * scale
+                } else { w };
+                if x + w > right {
+                    x = bx;
+                    if line_heights.is_empty() {
+                        return Ok((vec![], false));
+                    }
+                    let maxh = line_heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let modeh = mode(&line_heights)?;
+                    y -= (dominant * scale * line_skip).max(modeh * line_skip).max(maxh * 1.05);
+                    line_height = h;
+                    line_heights.clear();
+                    if y < by { fit = false; }
+                    out.push(units[i].boundary_space(x, y, h));
+                } else {
+                    out.push(units[i].boundary_space(x, y, h));
+                    x += w;
+                }
                 continue;
             }
             if let Some(prev) = out.last_mut() {
@@ -1317,6 +1653,7 @@ impl Typesetting {
                 }
                 if units[i].is_space() {
                     line_height = line_height.max(h);
+                    out.push(units[i].boundary_space(x, y, h));
                     continue;
                 }
             }
@@ -1398,17 +1735,28 @@ impl Typesetting {
         initial: f64,
         english: bool,
         apply: bool,
+        adjusted_box: Option<&Box>,
         v: &mut View<'_>,
+        mut capture: Option<&mut FormulaCapture>,
     ) -> Result<f64, StageError> {
-        let Some(b) = p.r#box(v)? else {
-            return Ok(initial);
+        if !initial.is_finite() || initial < 0.1 {
+            return Err(typesetting_failed(TypesettingFailure::LayoutExhausted, format!("invalid initial scale {initial}")));
+        }
+        let mut b = if let Some(b) = adjusted_box {
+            b.clone()
+        } else {
+            let b = p.r#box(v)?.ok_or_else(|| {
+                typesetting_failed(TypesettingFailure::MissingParagraphBox, "paragraph requires layout")
+            })?;
+            read_box(b, v)?
         };
-        let mut b = read_box(b, v)?;
         let mut scale = initial;
         let skip = if self.is_cjk { 1.5 } else { 1.3 };
         let mut expand = 0;
+        let mut box_expanded = adjusted_box.is_some();
+        let mut last_failure = None;
         while scale >= 0.1 {
-            if let Ok((placed, fit)) = self.layout(
+            match self.layout(
                 units,
                 &b,
                 scale,
@@ -1416,48 +1764,48 @@ impl Typesetting {
                 p.first_line_indent(v)?.unwrap_or(false),
                 english,
             ) {
-                if fit {
-                    let mut failed = false;
+                Ok((placed, true)) => {
                     if apply {
-                        p.set_scale(v, Some(scale))?;
-                        p.set_pdf_paragraph_composition(v, vec![])?;
-                        for mut u in placed {
-                            match u.render() {
-                                Ok((cs, curves, forms)) => {
-                                    for c in cs {
-                                        let c = char_value(c, v)?;
-                                        p.push_pdf_paragraph_composition(
-                                            v,
-                                            ir::PdfParagraphCompositionInit {
-                                                pdf_character: Some(c),
-                                                ..Default::default()
-                                            }
-                                            .into_value(),
-                                        )?;
-                                    }
-                                    for c in curves {
-                                        let c = curve_value(c, v)?;
-                                        page.push_pdf_curve(v, c)?
-                                    }
-                                    for f in forms {
-                                        let f = form_value(f, v)?;
-                                        page.push_pdf_form(v, f)?
-                                    }
-                                }
-                                Err(_) => {
-                                    failed = true;
-                                    break;
-                                }
+                        let trial = match render_trial(placed, capture.is_some()) {
+                            Ok(trial) => trial,
+                            Err(error) => {
+                                last_failure = Some(error.to_string());
+                                scale -= if scale > 0.6 { 0.05 } else { 0.1 };
+                                continue;
                             }
+                        };
+                        let mut compositions = Vec::with_capacity(trial.characters.len());
+                        for character in trial.characters {
+                            compositions.push(ir::PdfParagraphCompositionInit {
+                                pdf_character: Some(char_value(character, v)?),
+                                ..Default::default()
+                            }.into_value());
+                        }
+                        let curves = trial.curves.into_iter().map(|curve| curve_value(curve, v)).collect::<Result<Vec<_>, _>>()?;
+                        let forms = trial.forms.into_iter().map(|form| form_value(form, v)).collect::<Result<Vec<_>, _>>()?;
+                        if box_expanded {
+                            p.set_box(v, Some(box_field(b.clone())))?;
+                        }
+                        p.set_scale(v, Some(scale))?;
+                        p.set_pdf_paragraph_composition(v, compositions)?;
+                        for curve in curves {
+                            page.push_pdf_curve(v, curve)?;
+                        }
+                        for form in forms {
+                            page.push_pdf_form(v, form)?;
+                        }
+                        if let Some(capture) = capture.as_deref_mut() {
+                            capture.render_failed = trial.verification_failed;
+                            capture.rendered = trial.rendered;
+                            capture.placements = trial.placements;
+                            capture.output = trial.output;
+                            capture.complete = true;
                         }
                     }
-                    if !failed {
-                        return Ok(scale);
-                    }
+                    return Ok(scale);
                 }
-            }
-            if p.debug_id(v)?.as_deref().unwrap_or_default().is_empty() {
-                return Ok(scale);
+                Ok((_, false)) => last_failure = Some("paragraph does not fit".into()),
+                Err(error) => last_failure = Some(error.to_string()),
             }
             scale -= if scale > 0.6 { 0.05 } else { 0.1 };
             if scale < 0.7 {
@@ -1467,9 +1815,7 @@ impl Typesetting {
                         let y = y + 2.;
                         if y < b.y.unwrap_or_default() {
                             b.y = Some(y);
-                            if apply {
-                                p.set_box(v, Some(box_field(b.clone())))?
-                            }
+                            box_expanded = true;
                             expanded = true
                         }
                     }
@@ -1479,9 +1825,7 @@ impl Typesetting {
                         let x = x - 5.;
                         if x > b.x2.unwrap_or_default() {
                             b.x2 = Some(x);
-                            if apply {
-                                p.set_box(v, Some(box_field(b.clone())))?
-                            }
+                            box_expanded = true;
                             expanded = true
                         }
                     }
@@ -1496,9 +1840,12 @@ impl Typesetting {
             }
         }
         if english {
-            self.optimal(p, page, index, units, initial, false, apply, v)
+            self.optimal(p, page, index, units, initial, false, apply, adjusted_box, v, capture)
         } else {
-            Ok(0.1)
+            if let Some(capture) = capture {
+                capture.render_failed = true;
+            }
+            Err(typesetting_failed(TypesettingFailure::LayoutExhausted, last_failure.unwrap_or_else(|| format!("invalid initial scale {initial}"))))
         }
     }
     fn render_paragraph(
@@ -1507,14 +1854,27 @@ impl Typesetting {
         page: &Page,
         index: usize,
         fonts: &FontTable,
+        adjusted_box: Option<&Box>,
         v: &mut View<'_>,
+        mut capture: Option<&mut FormulaCapture>,
     ) -> Result<(), StageError> {
         let mut units = self.create_units(p, fonts, v)?;
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.expected = units.iter().filter_map(|unit| unit.formula.as_ref().map(formula_signature)).collect();
+        }
+        if units.is_empty() {
+            if let Some(capture) = capture { capture.complete = true; }
+            return Ok(());
+        }
         if units.iter_mut().all(TypesettingUnit::can_passthrough) {
-            p.set_scale(v, Some(1.))?;
             let mut comps = vec![];
             for u in units {
                 if let Some(f) = u.formula {
+                    if let Some(capture) = capture.as_deref_mut() {
+                        capture.output.push((1, true, false));
+                        capture.rendered.push(formula_signature(&f));
+                        capture.placements.push(formula_placement(&f));
+                    }
                     let f = need(f.original, "passthrough formula lost selection")?;
                     comps.push(
                         ir::PdfParagraphCompositionInit {
@@ -1524,6 +1884,7 @@ impl Typesetting {
                         .into_value(),
                     );
                 } else if let Some(c) = u.character {
+                    if let Some(capture) = capture.as_deref_mut() { capture.output.push((1, false, false)); }
                     comps.push(
                         ir::PdfParagraphCompositionInit {
                             pdf_character: Some(char_value(c, v)?),
@@ -1533,12 +1894,16 @@ impl Typesetting {
                     );
                 }
             }
+            if let Some(b) = adjusted_box {
+                p.set_box(v, Some(box_field(b.clone())))?;
+            }
+            p.set_scale(v, Some(1.))?;
             p.set_pdf_paragraph_composition(v, comps)?;
+            if let Some(capture) = capture { capture.complete = true; }
             return Ok(());
         }
         let initial = p.optimal_scale(v)?.unwrap_or(1.);
-        p.set_pdf_paragraph_composition(v, vec![])?;
-        self.optimal(p, page, index, &mut units, initial, true, true, v)?;
+        self.optimal(p, page, index, &mut units, initial, true, true, adjusted_box, v, capture)?;
         if let Some(order) = p.render_order(v)? {
             let mut sub = 1;
             for child_index in 0..p.pdf_paragraph_composition_len(v)? {
@@ -1575,10 +1940,13 @@ impl Typesetting {
                         .iter()
                         .map(|u| u.formula.as_ref().map_or(1, |f| f.pdf_character.len()))
                         .sum::<usize>();
+                    if units.is_empty() {
+                        return Ok::<_, StageError>(0);
+                    }
                     let scale = if units.iter_mut().all(TypesettingUnit::can_passthrough) {
                         1.
                     } else {
-                        self.optimal(&p, page, index, &mut units, 1., true, false, v)?
+                        self.optimal(&p, page, index, &mut units, 1., true, false, None, v, None)?
                     };
                     p.set_optimal_scale(v, Some(scale))?;
                     Ok::<_, StageError>(count)
@@ -1586,6 +1954,16 @@ impl Typesetting {
                 let count = match result {
                     Ok(n) => n,
                     Err(e) => {
+                        if matches!(typesetting_failure(&e), Some(
+                            TypesettingFailure::MissingStyle
+                            | TypesettingFailure::MissingFontId
+                            | TypesettingFailure::MissingSourceFont
+                            | TypesettingFailure::AmbiguousFontId
+                            | TypesettingFailure::MissingGlyph
+                            | TypesettingFailure::MissingContent
+                        )) {
+                            return Err(e);
+                        }
                         warn!(target:LOG_TARGET,"预处理段落时出错：{e}");
                         p.set_optimal_scale(v, Some(1.))?;
                         0
@@ -1638,24 +2016,28 @@ impl Typesetting {
         }
         Ok(())
     }
-    fn render_page(&self, page: &Page, v: &mut View<'_>) -> Result<(), StageError> {
+    fn render_page(
+        &self, page: &Page, v: &mut View<'_>,
+        mut captures: Option<(usize, &mut HashMap<(usize, usize), FormulaCapture>)>,
+    ) -> Result<(), StageError> {
         let fonts = self.font_map(page, v)?;
         let paragraph_len = page.pdf_paragraph_len(v)?;
         let mut indexed = vec![];
+        let mut adjusted_boxes = HashMap::new();
+        let mut changed_boxes = HashSet::new();
         for i in 0..paragraph_len {
             let p = page.pdf_paragraph_at(v, i)?;
             if let Some(b) = p.r#box(v)? {
-                if let Ok(coords) = box_coordinates(&read_box(b, v)?) {
-                    indexed.push((i, coords))
+                let b = read_box(b, v)?;
+                if let Ok(coords) = box_coordinates(&b) {
+                    indexed.push((i, coords));
+                    adjusted_boxes.insert(i, b);
                 }
             }
         }
         let adjustment = (|| -> Result<(), StageError> {
             for (i, _) in &indexed {
-                let Some(b) = page.pdf_paragraph_at(v, *i)?.r#box(v)? else {
-                    continue;
-                };
-                let upper = box_coordinates(&read_box(b.clone(), v)?)?;
+                let upper = box_coordinates(&adjusted_boxes[i])?;
                 let gap = if upper.3 - upper.1 < 36. { 0.5 } else { 3. };
                 let query = (upper.0, upper.1 - gap, upper.2, upper.1);
                 let mut max: Option<f64> = None;
@@ -1665,17 +2047,16 @@ impl Typesetting {
                     {
                         continue;
                     }
-                    if let Some(c) = page.pdf_paragraph_at(v, *j)?.r#box(v)? {
-                        let lower = box_coordinates(&read_box(c, v)?)?;
-                        if !(lower.2 < upper.0 || lower.0 > upper.2) {
-                            max = Some(max.map_or(lower.3, |m| m.max(lower.3)))
-                        }
+                    let lower = box_coordinates(&adjusted_boxes[j])?;
+                    if !(lower.2 < upper.0 || lower.0 > upper.2) {
+                        max = Some(max.map_or(lower.3, |m| m.max(lower.3)))
                     }
                 }
                 if let Some(y) = max {
                     let y = y + gap;
-                    if y < need(b.y2(v)?, "paragraph.box.y2 is None")? {
-                        b.set_y(v, Some(y))?
+                    if y < upper.3 {
+                        adjusted_boxes.get_mut(i).expect("indexed paragraph box").y = Some(y);
+                        changed_boxes.insert(*i);
                     }
                 }
             }
@@ -1686,7 +2067,9 @@ impl Typesetting {
         }
         for index in 0..paragraph_len {
             let p = page.pdf_paragraph_at(v, index)?;
-            self.render_paragraph(&p, page, index, &fonts, v)?
+            let capture = captures.as_mut().and_then(|(page_index, captures)| captures.get_mut(&(*page_index, index)));
+            let adjusted_box = changed_boxes.contains(&index).then(|| &adjusted_boxes[&index]);
+            self.render_paragraph(&p, page, index, &fonts, adjusted_box, v, capture)?
         }
         Ok(())
     }
@@ -1702,7 +2085,7 @@ impl Typesetting {
         }
         for p in pages.iter() {
             ctx.check_cancelled()?;
-            self.render_page(p, &mut v)?;
+            self.render_page(p, &mut v, None)?;
             if self.progress {
                 ctx.report_progress(1, Some(pages.len() as u64 * 2))?;
             }
@@ -1713,32 +2096,134 @@ impl Typesetting {
         Ok(())
     }
 
+    pub fn process_typed(
+        &self,
+        document: &mut ir::Document,
+        context: &mut StageContext<'_>,
+    ) -> Result<(), TypesettingError> {
+        self.process(document, context).map_err(TypesettingError::from)
+    }
+
     pub fn audit_fork(
         &self,
         document: &ir::Document,
         targets: &[(usize, usize)],
         ctx: &mut StageContext<'_>,
     ) -> Result<Vec<TypesettingPreview>, StageError> {
+        self.audit_fork_with_document(document, targets, ctx).map(|(previews, _)| previews)
+    }
+
+    /// Returns the exact typeset fork used to produce the previews when capture succeeds.
+    /// Preview rejections still apply; a returned document is not evidence of writer safety.
+    pub fn audit_fork_with_document(
+        &self,
+        document: &ir::Document,
+        targets: &[(usize, usize)],
+        ctx: &mut StageContext<'_>,
+    ) -> Result<(Vec<TypesettingPreview>, Option<ir::Document>), StageError> {
         let empty = || TypesettingPreview {
+            original_bounds: None,
             glyphs: Vec::new(),
             units: Vec::new(),
+            formulas: Vec::new(),
+            formula_identities_match: None,
             rejections: vec![PreviewRejection::FormulaIdentityUnavailable, PreviewRejection::ObstacleAndClipEvidenceUnavailable],
         };
         let mut results: Vec<_> = targets.iter().map(|_| empty()).collect();
         ctx.check_cancelled()?;
-        if targets.is_empty() { return Ok(results); }
+        if targets.is_empty() { return Ok((results, None)); }
+        let original = match document.artifact() {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                for result in &mut results { result.rejections.push(PreviewRejection::CaptureFailed); }
+                return Ok((results, None));
+            }
+        };
+        let read_bounds = |value: &serde_json::Value, spacing: bool| -> Option<crate::layout_audit::Bounds> {
+            let bounds = crate::layout_audit::Bounds {
+                left: value.get("x")?.as_f64()?, bottom: value.get("y")?.as_f64()?,
+                right: value.get("x2")?.as_f64()?, top: value.get("y2")?.as_f64()?,
+            };
+            ([bounds.left, bounds.bottom, bounds.right, bounds.top].iter().all(|value| value.is_finite())
+                && (bounds.left < bounds.right || spacing && bounds.left == bounds.right)
+                && bounds.bottom < bounds.top).then_some(bounds)
+        };
+        for (&(page_index, paragraph_index), result) in targets.iter().zip(&mut results) {
+            let paragraph = original.get("document").and_then(|value| value.get("page"))
+                .and_then(|value| value.get(page_index)).and_then(|value| value.get("pdf_paragraph"))
+                .and_then(|value| value.get(paragraph_index));
+            if let Some(paragraph) = paragraph {
+                result.original_bounds = paragraph.get("box").and_then(|bounds| read_bounds(bounds, false));
+                if result.original_bounds.is_none() { result.rejections.push(PreviewRejection::MissingOrInvalidTargetBounds); }
+            } else {
+                result.rejections.push(PreviewRejection::TargetMissing);
+            }
+        }
         if !self.progress {
             for result in &mut results { result.rejections.push(PreviewRejection::CaptureFailed); }
-            return Ok(results);
+            return Ok((results, None));
         }
         let mut fork = document.fork();
+        let mut captures: HashMap<_, FormulaCapture> = targets.iter().copied().map(|target| (target, FormulaCapture::default())).collect();
+        let mut formula_references = HashMap::<u64, usize>::new();
+        let mut character_references = HashMap::<u64, usize>::new();
+        let mut curve_references = HashMap::<u64, usize>::new();
+        let mut form_references = HashMap::<u64, usize>::new();
         let run = (|| {
             let mut view = fork.view::<TypesettingView>();
             let pages = view.document().page_iter(&view)?.collect::<Result<Vec<_>, _>>()?;
-            self.preprocess(&pages, &mut view, ctx, true)?;
             for page in &pages {
                 ctx.check_cancelled()?;
-                self.render_page(page, &mut view)?;
+                for index in 0..page.pdf_character_len(&view)? {
+                    *character_references.entry(page.pdf_character_at(&view, index)?.identity()).or_default() += 1;
+                }
+                for curve_index in 0..page.pdf_curve_len(&view)? {
+                    let identity = page.pdf_curve_at(&view, curve_index)?.identity();
+                    *curve_references.entry(identity).or_default() += 1;
+                }
+                for form_index in 0..page.pdf_form_len(&view)? {
+                    let identity = page.pdf_form_at(&view, form_index)?.identity();
+                    *form_references.entry(identity).or_default() += 1;
+                }
+                for paragraph_index in 0..page.pdf_paragraph_len(&view)? {
+                    ctx.check_cancelled()?;
+                    let paragraph = page.pdf_paragraph_at(&view, paragraph_index)?;
+                    for composition_index in 0..paragraph.pdf_paragraph_composition_len(&view)? {
+                        let composition = paragraph.pdf_paragraph_composition_at(&view, composition_index)?;
+                        if let Some(character) = composition.pdf_character(&view)? {
+                            *character_references.entry(character.identity()).or_default() += 1;
+                        }
+                        if let Some(line) = composition.pdf_line(&view)? {
+                            for index in 0..line.pdf_character_len(&view)? {
+                                *character_references.entry(line.pdf_character_at(&view, index)?.identity()).or_default() += 1;
+                            }
+                        }
+                        if let Some(group) = composition.pdf_same_style_characters(&view)? {
+                            for index in 0..group.pdf_character_len(&view)? {
+                                *character_references.entry(group.pdf_character_at(&view, index)?.identity()).or_default() += 1;
+                            }
+                        }
+                        if let Some(formula) = composition.pdf_formula(&view)? {
+                            *formula_references.entry(formula.identity()).or_default() += 1;
+                            for index in 0..formula.pdf_character_len(&view)? {
+                                *character_references.entry(formula.pdf_character_at(&view, index)?.identity()).or_default() += 1;
+                            }
+                            for curve_index in 0..formula.pdf_curve_len(&view)? {
+                                let identity = formula.pdf_curve_at(&view, curve_index)?.identity();
+                                *curve_references.entry(identity).or_default() += 1;
+                            }
+                            for form_index in 0..formula.pdf_form_len(&view)? {
+                                let identity = formula.pdf_form_at(&view, form_index)?.identity();
+                                *form_references.entry(identity).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            self.preprocess(&pages, &mut view, ctx, true)?;
+            for (page_index, page) in pages.iter().enumerate() {
+                ctx.check_cancelled()?;
+                self.render_page(page, &mut view, Some((page_index, &mut captures)))?;
                 ctx.report_progress(1, Some(pages.len() as u64 * 2))?;
             }
             drop(pages);
@@ -1749,60 +2234,213 @@ impl Typesetting {
         if let Err(error) = run {
             if error == StageError::Cancelled { return Err(error); }
             for result in &mut results { result.rejections.push(PreviewRejection::TypesettingFailed); }
-            return Ok(results);
+            return Ok((results, None));
         }
         let artifact = match fork.artifact() {
             Ok(artifact) => artifact,
             Err(_) => {
                 for result in &mut results { result.rejections.push(PreviewRejection::CaptureFailed); }
-                return Ok(results);
+                return Ok((results, None));
             }
         };
         for (&(page_index, paragraph_index), result) in targets.iter().zip(&mut results) {
+        if let Some(capture) = captures.get(&(page_index, paragraph_index)) {
+            result.formulas = capture.placements.clone();
+            if capture.complete {
+                let mut identities = HashSet::new();
+                let mut character_identities = HashSet::new();
+                let matched = !capture.render_failed && capture.expected == capture.rendered
+                    && capture.expected.iter().all(|formula| formula.source_identity.is_some_and(|id| identities.insert(id) && formula_references.get(&id) == Some(&1))
+                        && formula.characters.iter().all(|character| character.0.is_some_and(|id| character_identities.insert(id) && character_references.get(&id) == Some(&1)))
+                        && formula.curves.iter().all(|identity| curve_references.get(identity) == Some(&1))
+                        && formula.forms.iter().all(|identity| form_references.get(identity) == Some(&1)));
+                result.formula_identities_match = Some(matched);
+                if !matched { result.rejections.push(PreviewRejection::FormulaIdentityMismatch); }
+            }
+            for formula in &result.formulas {
+                for bounds in std::iter::once(&formula.bounds)
+                    .chain(&formula.character_bounds).chain(&formula.curve_bounds).chain(&formula.form_bounds) {
+                    match (result.original_bounds, bounds) {
+                        (_, None) => result.rejections.push(PreviewRejection::InvalidFormulaEvidence),
+                        (Some(target), Some(bounds)) if bounds.left < target.left || bounds.bottom < target.bottom
+                            || bounds.right > target.right || bounds.top > target.top => {
+                            result.rejections.push(PreviewRejection::OutsideOriginalTargetBounds);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let Some(paragraph) = artifact.get("document").and_then(|value| value.get("page"))
             .and_then(|value| value.get(page_index)).and_then(|value| value.get("pdf_paragraph"))
             .and_then(|value| value.get(paragraph_index)) else {
-            result.rejections.push(PreviewRejection::TargetMissing);
+            if !result.rejections.contains(&PreviewRejection::TargetMissing) { result.rejections.push(PreviewRejection::TargetMissing); }
             continue;
         };
         let Some(compositions) = paragraph.get("pdf_paragraph_composition").and_then(|value| value.as_array()) else {
             result.rejections.push(PreviewRejection::CaptureFailed);
             continue;
         };
+        let source = original.get("document").and_then(|value| value.get("page"))
+            .and_then(|value| value.get(page_index)).and_then(|value| value.get("pdf_paragraph"))
+            .and_then(|value| value.get(paragraph_index));
+        let expected = source.and_then(|value| value.get("pdf_paragraph_composition"))
+            .and_then(|value| value.as_array()).and_then(|parts| {
+                let mut text = Vec::new();
+                for part in parts {
+                    let supported = ["pdf_same_style_unicode_characters", "pdf_character", "pdf_line", "pdf_same_style_characters", "pdf_formula"];
+                    if supported.iter().filter(|key| part.get(**key).is_some_and(|value| !value.is_null())).count() != 1 { return None; }
+                    if let Some(unicode) = part.get("pdf_same_style_unicode_characters").filter(|value| !value.is_null()) {
+                        text.extend(unicode.get("unicode")?.as_str()?.chars().filter(|character| *character != '\n').map(Some));
+                    } else if let Some(character) = part.get("pdf_character").filter(|value| !value.is_null()) {
+                        text.extend(character.get("char_unicode")?.as_str()?.chars().map(Some));
+                    } else if let Some(group) = part.get("pdf_line").filter(|value| !value.is_null()).or_else(|| part.get("pdf_same_style_characters").filter(|value| !value.is_null())) {
+                        for character in group.get("pdf_character")?.as_array()? {
+                            text.extend(character.get("char_unicode")?.as_str()?.chars().map(Some));
+                        }
+                    } else if part.get("pdf_formula").is_some_and(|value| !value.is_null()) {
+                        text.push(None);
+                    } else {
+                        return None;
+                    }
+                }
+                Some(text)
+            });
+        let mut composition_glyphs = Vec::new();
+        let mut composition_spacing = Vec::new();
         for composition in compositions {
             let Some(character) = composition.get("pdf_character").filter(|value| !value.is_null()) else {
-                if let Some(formula) = composition.get("pdf_formula").filter(|value| !value.is_null()) {
-                    let bounds = formula.get("box").and_then(|value| Some(crate::layout_audit::Bounds {
-                        left: value.get("x")?.as_f64()?, bottom: value.get("y")?.as_f64()?,
-                        right: value.get("x2")?.as_f64()?, top: value.get("y2")?.as_f64()?,
-                    }));
-                    result.units.push(PreviewUnit::Formula { bounds });
-                } else {
-                    result.units.push(PreviewUnit::Unknown);
+                if composition.get("pdf_formula").filter(|value| !value.is_null()).is_none() {
+                    result.rejections.push(PreviewRejection::CaptureFailed);
                 }
-                result.rejections.push(PreviewRejection::CaptureFailed);
+                composition_glyphs.push(None);
+                composition_spacing.push(None);
                 continue;
             };
-            let bounds = character.get("box").and_then(|value| Some(crate::layout_audit::Bounds {
-                left: value.get("x")?.as_f64()?, bottom: value.get("y")?.as_f64()?,
-                right: value.get("x2")?.as_f64()?, top: value.get("y2")?.as_f64()?,
-            }));
+            let spacing = character.get("synthetic_spacing").and_then(|value| value.as_bool()) == Some(true)
+                && character.get("pdf_character_id").is_none_or(|value| value.is_null())
+                && matches!(character.get("char_unicode").and_then(|value| value.as_str()), Some(" " | "\n"));
+            let bounds = character.get("box").and_then(|bounds| read_bounds(bounds, spacing));
+            if spacing {
+                if bounds.is_none() { result.rejections.push(PreviewRejection::InvalidSpacingEvidence); }
+                if let (Some(target), Some(bounds)) = (result.original_bounds, bounds) {
+                    if bounds.left < target.left || bounds.bottom < target.bottom || bounds.right > target.right || bounds.top > target.top {
+                        result.rejections.push(PreviewRejection::OutsideOriginalTargetBounds);
+                    }
+                }
+                composition_glyphs.push(None);
+                composition_spacing.push(Some(bounds));
+                continue;
+            }
+            composition_spacing.push(None);
             let glyph = PreviewGlyph {
                 text: character.get("char_unicode").and_then(|value| value.as_str()).map(str::to_owned),
                 glyph_id: character.get("pdf_character_id").and_then(|value| value.as_i64()),
                 font_size: character.get("pdf_style").and_then(|value| value.get("font_size")).and_then(|value| value.as_f64()),
+                font_id: character.get("pdf_style").and_then(|value| value.get("font_id")).and_then(|value| value.as_str()).map(str::to_owned),
+                xobj_id: character.get("xobj_id").and_then(|value| value.as_i64()),
                 bounds,
             };
             if glyph.glyph_id.is_none_or(|id| id <= 0) { result.rejections.push(PreviewRejection::MissingGlyph); }
+            result.rejections.push(PreviewRejection::GlyphResourceUnavailable);
+            match (glyph.font_id.as_deref().and_then(|id| self.mapper.font_by_id(id)), glyph.text.as_deref(), glyph.glyph_id) {
+                (Some(font), Some(text), Some(id)) if glyph.xobj_id.is_none() && text.chars().count() == 1 => {
+                    if i64::from(font.has_glyph(text.chars().next().unwrap() as u32)) != id {
+                        result.rejections.push(PreviewRejection::GlyphMismatch);
+                    }
+                }
+                _ => (),
+            }
             if glyph.text.as_ref().is_none_or(String::is_empty) || glyph.font_size.is_none_or(|size| !size.is_finite() || size <= 0.0) || glyph.bounds.is_none() {
                 result.rejections.push(PreviewRejection::InvalidGlyphEvidence);
             }
-            result.units.push(PreviewUnit::Glyph(glyph.clone()));
-            result.glyphs.push(glyph);
+            if let (Some(target), Some(bounds)) = (result.original_bounds, glyph.bounds) {
+                if bounds.left < target.left || bounds.bottom < target.bottom || bounds.right > target.right || bounds.top > target.top {
+                    result.rejections.push(PreviewRejection::OutsideOriginalTargetBounds);
+                }
+            }
+            composition_glyphs.push(Some(glyph));
         }
-        if result.glyphs.is_empty() { result.rejections.push(PreviewRejection::InvalidGlyphEvidence); }
+        let empty_slice = compositions.is_empty()
+            && source.and_then(|paragraph| paragraph.get("unicode")).and_then(|value| value.as_str()) == Some("")
+            && expected.as_ref().is_some_and(Vec::is_empty);
+        if !empty_slice && composition_glyphs.iter().all(Option::is_none)
+            && composition_spacing.iter().all(Option::is_none) { result.rejections.push(PreviewRejection::InvalidGlyphEvidence); }
+        let mut observed = Vec::new();
+        let mut inferred_spacing_positions = Vec::new();
+        let mut position = 0;
+        let mut formula_index = 0;
+        let capture = captures.get(&(page_index, paragraph_index));
+        let mut complete = capture.is_some_and(|capture| capture.complete && !capture.render_failed && result.formula_identities_match == Some(true));
+        if let Some(capture) = capture {
+            for &(count, is_formula, inferred_source_space) in &capture.output {
+                if position + count > compositions.len() { complete = false; break; }
+                let slice = &compositions[position..position + count];
+                if is_formula {
+                    let Some(signature) = capture.rendered.get(formula_index) else { complete = false; break; };
+                    let Some(formula) = result.formulas.get(formula_index) else { complete = false; break; };
+                    result.units.push(PreviewUnit::Formula { bounds: formula.bounds });
+                    formula_index += 1;
+                    let passthrough = count == 1 && slice[0].get("pdf_formula").is_some_and(|value| !value.is_null());
+                    if !passthrough && (count != signature.characters.len() || slice.iter().zip(&signature.characters).any(|(part, character)| {
+                        let Some(glyph) = part.get("pdf_character").filter(|value| !value.is_null()) else { return true; };
+                        glyph.get("char_unicode").and_then(|value| value.as_str()) != character.2.as_deref()
+                            || glyph.get("pdf_character_id").and_then(|value| value.as_i64()) != character.1
+                            || glyph.get("pdf_style").and_then(|value| value.get("font_id")).and_then(|value| value.as_str()) != character.3.as_deref()
+                            || glyph.get("xobj_id").and_then(|value| value.as_i64()) != character.4
+                            || glyph.get("synthetic_spacing").and_then(|value| value.as_bool()) != character.7
+                    })) { complete = false; }
+                    observed.push(None);
+                } else {
+                    for (offset, part) in slice.iter().enumerate() {
+                        if let Some(glyph) = &composition_glyphs[position + offset] {
+                            result.units.push(PreviewUnit::Glyph(glyph.clone()));
+                            result.glyphs.push(glyph.clone());
+                        } else if let Some(bounds) = composition_spacing[position + offset] {
+                            result.units.push(PreviewUnit::Spacing { bounds });
+                        } else {
+                            result.units.push(PreviewUnit::Unknown);
+                            complete = false;
+                        }
+                        if let Some(text) = part.get("pdf_character").and_then(|value| value.get("char_unicode")).and_then(|value| value.as_str()) {
+                            if inferred_source_space && composition_spacing[position + offset].is_some() && text == " " {
+                                inferred_spacing_positions.push(observed.len());
+                            }
+                            observed.extend(text.chars().map(Some));
+                        } else { complete = false; }
+                    }
+                }
+                position += count;
+            }
+            if position != compositions.len() || formula_index != capture.rendered.len() { complete = false; }
         }
-        Ok(results)
+        if !complete { result.rejections.push(PreviewRejection::CaptureFailed); }
+        match expected {
+            Some(expected) => {
+                let mut observed_index = 0;
+                let mut expected_index = 0;
+                while observed_index < observed.len() {
+                    if observed.get(observed_index) == expected.get(expected_index) {
+                        observed_index += 1;
+                        expected_index += 1;
+                    } else if inferred_spacing_positions.binary_search(&observed_index).is_ok() {
+                        observed_index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if observed_index != observed.len() || expected_index != expected.len() {
+                    result.rejections.push(PreviewRejection::TextMismatch);
+                    result.rejections.push(PreviewRejection::CaptureFailed);
+                }
+            }
+            None => { result.rejections.push(PreviewRejection::TextEvidenceUnavailable); result.rejections.push(PreviewRejection::CaptureFailed); },
+        }
+        }
+        ctx.check_cancelled()?;
+        let capture_failed = captures.values().any(|capture| capture.render_failed)
+            || results.iter().any(|result| result.rejections.contains(&PreviewRejection::CaptureFailed) || result.rejections.contains(&PreviewRejection::TargetMissing));
+        Ok((results, if capture_failed { None } else { Some(fork) }))
     }
 }
 fn width_before(units: &mut [TypesettingUnit], scale: f64) -> Result<f64, StageError> {
@@ -1837,3 +2475,38 @@ fn mode(values: &[f64]) -> Result<f64, StageError> {
 }
 #[cfg(test)]
 mod typesetting_tests;
+
+#[cfg(test)]
+mod render_trial_tests {
+    use super::*;
+
+    #[test]
+    fn failed_later_unit_leaves_formula_objects_uncommitted() {
+        let node = |data| ir::Edge::Inline(std::boxed::Box::new(ir::Node::new(data)));
+        let mut document = ir::Document::from_parts(ir::Node::new(ir::NodeData::Document(ir::DataDocument {
+            page: vec![node(ir::NodeData::Page(ir::DataPage {
+                pdf_curve: vec![node(ir::NodeData::PdfCurve(Default::default()))],
+                pdf_form: vec![node(ir::NodeData::PdfForm(Default::default()))],
+                ..Default::default()
+            }))], ..Default::default()
+        })), Default::default(), Default::default()).unwrap();
+        let formula = {
+            let mut view = document.view::<TypesettingView>();
+            let page = view.document().page_at(&view, 0).unwrap();
+            let curve = page.pdf_curve_at(&view, 0).unwrap().retain(&mut view).unwrap();
+            let form = page.pdf_form_at(&view, 0).unwrap().retain(&mut view).unwrap();
+            TypesettingUnit::from_formula(PdfFormula {
+                pdf_curve: vec![PdfCurve { original: curve, r#box: None, relocation_transform: vec![] }],
+                pdf_form: vec![PdfForm { original: form, r#box: None, relocation_transform: vec![] }],
+                ..Default::default()
+            })
+        };
+        let before = document.artifact().unwrap();
+        let malformed = TypesettingUnit::empty(None, None, Some("A".into()), None, None, Some(10.0), None, None, false);
+        assert!(render_trial(vec![formula.clone(), malformed], true).is_err());
+        assert_eq!(before, document.artifact().unwrap());
+        let retry = render_trial(vec![formula], true).unwrap();
+        assert_eq!((retry.curves.len(), retry.forms.len()), (1, 1));
+        assert_eq!(before, document.artifact().unwrap());
+    }
+}

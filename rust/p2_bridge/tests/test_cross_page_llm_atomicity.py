@@ -9,15 +9,16 @@ from babeldoc import _rust_il
 from babeldoc.format.pdf.document_il import il_version_1 as il
 from babeldoc.rust_run_context import PriorityServiceDispatcher
 from babeldoc.rust_translation_service import RustTranslatorService
+from test_cross_page_llm_direct_atomicity import DirectTranslator
+from test_cross_page_llm_direct_atomicity import formula_texts
 
 LEFT = "Earlier findings were clear. The results demonstrate a substantial improvement across"
 RIGHT = "several independent experiments. Additional observations follow."
 
 
-class Translator:
+class Translator(DirectTranslator):
     def __init__(self):
-        self.cross_page_requests = 0
-        self.fallback_requests = 0
+        super().__init__()
 
     def do_llm_translate(self, text, rate_limit_params=None):
         return None
@@ -32,12 +33,12 @@ class Translator:
         return f"</b{identifier}>"
 
     def llm_translate(self, prompt, rate_limit_params=None):
+        if (rate_limit_params or {}).get("cross_boundary_request"):
+            return super().llm_translate(prompt, rate_limit_params)
         marker = "## Here is the input:"
         if marker not in prompt:
             self.fallback_requests += 1
             return prompt.rsplit("Now translate the following text:", 1)[1].strip()
-        if "## Cross-page continuation" in prompt:
-            self.cross_page_requests += 1
         items = json.loads(prompt.rsplit(marker, 1)[1].strip())
         return json.dumps([{"id": item["id"], "output": item["input"]} for item in items])
 
@@ -129,8 +130,15 @@ def test_success_control(tmp_path):
 def test_formula_application_control(tmp_path):
     document = make_document(True)
     before = document.parser_artifact_hash()
+    original_pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    original_formulas = [formula_texts(page) for page in original_pages]
     service = ApplicationService()
     run(document, tmp_path, service, _rust_il.CancelFlag(), Monitor())
     assert service.translator.cross_page_requests == 0
-    assert json.loads((tmp_path / "translate_tracking.json").read_text(encoding="utf-8"))["cross_page"] == []
+    report = json.loads((tmp_path / "cross_boundary_report.json").read_text(encoding="utf-8"))
+    assert report["baseline_completed"] and report["applied_groups"] == 0
+    assert any(decision["result"] == "no_translatable_pair" for decision in report["decisions"])
+    pages = json.loads(document.parser_artifact_json())["document"]["page"]
+    assert [formula_texts(page) for page in pages] == original_formulas == [["x"], ["x"]]
+    assert (tmp_path / "translate_tracking.json").is_file()
     assert document.parser_artifact_hash() != before
