@@ -621,6 +621,14 @@ def update_page_bbox(doc, page, box, key):
         doc.xref_set_key(page.xref, key, f"[{box.x0} {box.y0} {box.x1} {box.y1}]")
 
 
+class CandidateOutputRollbackError(OSError):
+    def __init__(self, original_error, restore_failures):
+        self.original_error = original_error
+        self.restore_failures = tuple(restore_failures)
+        recovery = "; ".join(f"{target} (baseline backup: {backup})" for target, backup, _error in self.restore_failures)
+        super().__init__(f"Candidate publication failed; baseline output restoration is incomplete: {recovery}")
+
+
 def _read_cross_boundary_report(source: Path, expected_stage: str) -> dict:
     try:
         report = json.loads(source.read_bytes())
@@ -712,7 +720,23 @@ def _persist_cross_boundary_report(
     if error is None and report["status"] == "failed":
         raise RuntimeError("Cross-boundary translation report indicates failure")
 
-    if error is not None and report.get("candidate_state") == "written":
+    if isinstance(error, CandidateOutputRollbackError):
+        reason = "Baseline restoration failed; published outputs may contain both baseline and candidate files"
+        report["candidate_state"] = "rollback_failed"
+        report["applied_groups"] = 0
+        report["publication_failure"] = {
+            "original_error_type": type(error.original_error).__name__,
+            "restore_failures": [
+                {"target": str(target), "backup": str(backup), "error_type": type(failure).__name__, "reason": str(failure)}
+                for target, backup, failure in error.restore_failures
+            ],
+        }
+        report["unresolved"].append({"kind": "publication", "reason": reason, "locations": []})
+        for decision in report["decisions"]:
+            if decision.get("result") == "prepared":
+                decision["result"] = "unknown"
+                decision["reason"] = reason
+    elif error is not None and report.get("candidate_state") == "written":
         _finish_part_boundary_report(report, False, "candidate was not published")
 
     report["stage"] = "output" if output_completed else "translation"
@@ -842,7 +866,7 @@ def _postprocess_outputs(result, config):
     add_metadata(result, config)
     try:
         migrate_toc(config, result)
-    except concurrent.futures.CancelledError:
+    except (OSError, concurrent.futures.CancelledError):
         raise
     except Exception as error:
         logger.error("Failed to migrate TOC from %s: %s", config.input_file, error)
@@ -935,13 +959,17 @@ def _publish_candidate_outputs(pm, baseline, candidate):
             staged.replace(target)
             published.append((target, backup))
         pm.raise_if_cancelled()
-    except BaseException:
+    except BaseException as error:
+        restore_failures = []
         for target, backup in reversed(published):
             try:
                 backup.replace(target)
-            except OSError:
+            except OSError as failure:
                 rollback_failed = True
+                restore_failures.append((target, backup, failure))
                 logger.exception("Could not restore baseline output; backup retained at %s", backup)
+        if restore_failures:
+            raise CandidateOutputRollbackError(error, restore_failures) from error
         raise
     finally:
         for _target, backup, staged in prepared:

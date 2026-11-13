@@ -448,3 +448,98 @@ def test_cancel_during_publish_restores_baseline(tmp_path):
         high_level._publish_candidate_outputs(SimpleNamespace(raise_if_cancelled=cancel), baseline, candidate)
     assert baseline.mono_pdf_path.read_bytes() == b"baseline mono"
     assert baseline.dual_pdf_path.read_bytes() == b"baseline dual"
+
+
+@pytest.mark.parametrize("error", [OSError("toc write failed"), concurrent.futures.CancelledError(), asyncio.CancelledError()])
+def test_postprocess_toc_propagates_io_and_cancellation(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(high_level, "fix_cmap", lambda *_args: None)
+    monkeypatch.setattr(high_level, "add_metadata", lambda *_args: None)
+
+    def fail_toc(*_args):
+        raise error
+
+    monkeypatch.setattr(high_level, "migrate_toc", fail_toc)
+    config = SimpleNamespace(input_file=tmp_path / "source.pdf", deterministic_output=False)
+    with pytest.raises(type(error)) as raised:
+        high_level._postprocess_outputs(SimpleNamespace(), config)
+    assert raised.value is error
+
+
+def test_postprocess_toc_non_io_error_remains_optional(tmp_path, monkeypatch):
+    monkeypatch.setattr(high_level, "fix_cmap", lambda *_args: None)
+    monkeypatch.setattr(high_level, "add_metadata", lambda *_args: None)
+
+    def fail_toc(*_args):
+        raise ValueError("invalid optional toc")
+
+    monkeypatch.setattr(high_level, "migrate_toc", fail_toc)
+    config = SimpleNamespace(input_file=tmp_path / "source.pdf", deterministic_output=False)
+    high_level._postprocess_outputs(SimpleNamespace(), config)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("has_report", [False, True])
+def test_publish_rollback_failure_exposes_recovery_state(tmp_path, monkeypatch, cancel, has_report):
+    from babeldoc.format.pdf.translation_config import TranslateResult
+
+    baseline = TranslateResult(tmp_path / "mono.pdf", tmp_path / "dual.pdf")
+    candidate = TranslateResult(tmp_path / "candidate-mono.pdf", tmp_path / "candidate-dual.pdf")
+    for path, content in ((baseline.mono_pdf_path, b"baseline mono"), (baseline.dual_pdf_path, b"baseline dual"),
+                          (candidate.mono_pdf_path, b"candidate mono"), (candidate.dual_pdf_path, b"candidate dual")):
+        path.write_bytes(content)
+    original_error = asyncio.CancelledError() if cancel else OSError("injected publish failure")
+    restore_error = OSError("injected restoration failure")
+    replace = os.replace
+
+    def fail_restore(source, target):
+        if ".baseline-" in str(source):
+            raise restore_error
+        if not cancel and ".candidate-" in str(source) and Path(target) == baseline.dual_pdf_path:
+            raise original_error
+        return replace(source, target)
+
+    checks = 0
+
+    def check_cancel():
+        nonlocal checks
+        checks += 1
+        if cancel and checks == 3:
+            raise original_error
+
+    monkeypatch.setattr(os, "replace", fail_restore)
+    with pytest.raises(OSError, match="baseline output restoration") as raised:
+        high_level._publish_candidate_outputs(SimpleNamespace(raise_if_cancelled=check_cancel), baseline, candidate)
+    error = raised.value
+    assert isinstance(error, high_level.CandidateOutputRollbackError)
+    assert error.original_error is original_error
+    assert error.__cause__ is original_error
+    assert len(error.restore_failures) == 1
+    target, backup, failure = error.restore_failures[0]
+    assert target == baseline.mono_pdf_path
+    assert backup.read_bytes() == b"baseline mono"
+    assert failure is restore_error
+    assert baseline.mono_pdf_path.read_bytes() == b"candidate mono"
+    assert baseline.dual_pdf_path.read_bytes() == b"baseline dual"
+    source_report = tmp_path / "work-report.json"
+    output_report = tmp_path / "output-report.json"
+    if has_report:
+        source_report.write_text(json.dumps({
+            "version": 2, "status": "complete", "stage": "translation", "candidate_state": "written",
+            "decisions": [{"kind": "page", "result": "prepared"}], "unresolved": [],
+            "prepared_groups": [{"group": "g1", "locations": [{"page": 0, "paragraph": 0}]}],
+        }), encoding="utf-8")
+    config = SimpleNamespace(input_file=tmp_path / "source.pdf", lang_out="zh",
+                             get_working_file_path=lambda _name: source_report,
+                             get_output_file_path=lambda _name: output_report)
+    assert high_level._persist_cross_boundary_report(config, error=error) is has_report
+    report = json.loads(output_report.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["candidate_state"] == "rollback_failed"
+    assert "candidate was not published" not in json.dumps(report)
+    recovery = report["publication_failure"]
+    assert recovery["original_error_type"] == type(original_error).__name__
+    assert recovery["restore_failures"][0]["target"] == str(target)
+    assert recovery["restore_failures"][0]["backup"] == str(backup)
+    assert recovery["restore_failures"][0]["error_type"] == "OSError"
+    if has_report:
+        assert report["decisions"][0]["result"] == "unknown"
