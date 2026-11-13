@@ -2,8 +2,8 @@
 
 This experimental fork is based on BabelDOC commit
 `dd9adc352b957533d05b8cb94e88a7589cc56a35`. It retains upstream's AGPL-3.0
-license and is identified as `0.7.1+pwo.2.crosspage.16`. This is an
-experimental version and is not a released dependency.
+license and is identified as `0.7.1+pwo.2.crosspage.17`. This is an
+experimental fork version, not an upstream release.
 
 The PWO formula-order change prevents formula groups separated by other paragraph content from
 being merged across that content. This avoids changing character order in the
@@ -16,10 +16,12 @@ review. The PWO `0.7.1+pwo.2` paragraph-spacing fix from commit
 extensive local bibliography and link experiments are not
 included in this patch because their coverage and safety are not established.
 
-The optional cross-page experiment identifies conservative candidates and
-validates response structure. Eligible continuations can be translated as a
-complete sentence and redistributed to the original pages. Identified numeric
-continuations that cannot be handled as a whole fail with a review message.
+The optional cross-page and cross-column enhancement starts after ordinary
+translation and output have completed. Eligible continuations are translated as
+complete sentences in isolated candidates and redistributed to the original
+pages or columns. Failed or rejected enhancement groups retain the completed
+ordinary translation and report that the enhancement was not applied. Ordinary
+translation, cancellation and real output errors still fail the job.
 The numeric check compares recognized digit and operator expressions exactly;
 it is not a semantic check of units, written numbers, or other translations.
 Numeric formatting changes or unrecognized notation can require manual review.
@@ -27,6 +29,28 @@ Decimal sentence boundaries are conservative: explicitly signed decimals can
 be recognized, while ambiguous unsigned decimals may be skipped or blocked.
 The option is disabled by default and does not ensure that every continuation
 is detected, translated correctly, or laid out safely.
+
+Candidate responses are matched by explicit IDs and checked for numeric,
+formula, style and layout consistency. Dependent boundaries sharing a paragraph
+are committed together; outputs are verified before replacing baseline files,
+with rollback on publication failure. Automatic glossary suggestions retain
+source context and do not become global mandatory glossary entries. Rotated
+source text and verified spacing are preserved without reordering formulas.
+
+Nine real two-page samples were tested through the installed Windows backend
+with DeepSeek. All produced monolingual and bilingual outputs. Three of eleven
+designated continuation targets were translated together and applied; eight
+retained ordinary translation. This is not a claim that all translation quality
+issues are fixed. Version strings, URLs, bibliography formatting, labels and PDF
+link annotations have known defects deferred to a later version. Chinese words
+can split across pages or columns. Strict numeric, formula and layout guards
+remain in place. See `docs/release-notes/v0.7.1+pwo.2.crosspage.17.md` for scope.
+
+Continuations near figures or captions, or containing formulas and multiple
+styles, may not be identified. Unidentified continuations can be translated
+page by page without a continuation-specific warning. Check both pages and
+their numbers and formatting manually; a missing warning does not establish
+that the sentence was translated as a whole.
 
 Run the focused regression with:
 
